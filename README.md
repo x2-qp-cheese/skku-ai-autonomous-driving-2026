@@ -2,7 +2,7 @@
 
 성균관대 AI 자율주행 경진대회 SW 부문을 위한 Python/Arduino 프로젝트입니다.
 
-현재 목표는 빠르게 실험하되, 대회 직전에 코드가 섞이지 않도록 센서, 인지, 판단, 제어, 미션 로직을 분리하는 것입니다. 기존 `lanedetect.py`는 초기 차선 검출 프로토타입으로 그대로 두고, 새 코드는 `src/skku_autocar/` 아래에 추가했습니다.
+현재 목표는 빠르게 실험하되, 대회 직전에 코드가 섞이지 않도록 센서, 인지, 판단, 제어, 미션 로직을 분리하는 것입니다. 초기 차선 검출 프로토타입은 `scripts/lanedetect.py`에 두고, 재사용 가능한 새 코드는 `src/skku_autocar/` 아래에 추가했습니다.
 
 ## Structure
 
@@ -13,6 +13,7 @@
 - `src/skku_autocar/control/`: 아두이노 시리얼 프로토콜과 제어 명령
 - `firmware/arduino/`: 아두이노 차량 제어 스케치
 - `docs/`: 대회 규칙 요약, 아키텍처, 체크리스트
+- `scripts/`: 실험, 장치 확인, 프로토타입 실행 스크립트
 - `tests/`: 하드웨어 없이 돌릴 수 있는 순수 Python 테스트
 
 ## Setup
@@ -45,3 +46,9 @@ PYTHONPATH=src python3 -m unittest discover -s tests
 3. `firmware/arduino/vehicle_controller/vehicle_controller.ino`의 핀 번호를 실제 배선에 맞게 수정 후 업로드
 4. `src/skku_autocar/perception/lane.py`의 차선 중심 추정값을 실제 트랙 영상으로 보정
 5. 시간측정 주행부터 안정화한 뒤 장애물, 신호등, 수직주차 모드를 추가
+
+기존 차선 검출 프로토타입 실행:
+
+```bash
+python3 scripts/lanedetect.py
+```
