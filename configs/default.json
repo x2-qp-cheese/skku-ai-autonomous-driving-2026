@@ -1,0 +1,39 @@
+{
+  "camera": {
+    "index": 0,
+    "width": 1280,
+    "height": 720,
+    "fourcc": "MJPG"
+  },
+  "lane": {
+    "gray_threshold": 175,
+    "min_contour_area": 700,
+    "roi_bottom_left_x": 0.18,
+    "roi_bottom_right_x": 0.82,
+    "roi_top_left_x": 0.35,
+    "roi_top_right_x": 0.65,
+    "roi_top_y": 0.55
+  },
+  "lidar": {
+    "port": null,
+    "rpm": 660,
+    "front_angle_min": 330,
+    "front_angle_max": 30,
+    "stop_distance_mm": 300
+  },
+  "serial": {
+    "arduino_port": null,
+    "baudrate": 115200,
+    "timeout_s": 0.1
+  },
+  "control": {
+    "base_speed": 90,
+    "max_speed": 160,
+    "max_steering": 120,
+    "lane_kp": 85.0,
+    "lane_lost_brake": true
+  },
+  "mission": {
+    "mode": "time_trial"
+  }
+}
