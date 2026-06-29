@@ -31,13 +31,13 @@ MAX_LANE_PARTS = 4
 # 화면 전체가 아니라 중앙 하단 도로 부분만 검사
 # 필요 없는 벽, 의자, 커튼 쪽을 제거하기 위한 영역
 
-ROI_BOTTOM_LEFT_X = 0.18
-ROI_BOTTOM_RIGHT_X = 0.82
+ROI_BOTTOM_LEFT_X = 0
+ROI_BOTTOM_RIGHT_X = 1
 
-ROI_TOP_LEFT_X = 0.35
-ROI_TOP_RIGHT_X = 0.65
+ROI_TOP_LEFT_X = 0.1
+ROI_TOP_RIGHT_X = 0.9
 
-ROI_TOP_Y = 0.55
+ROI_TOP_Y = 0.6
 
 
 def make_roi_mask(frame_shape):

@@ -22,12 +22,12 @@
     "stop_distance_mm": 300
   },
   "serial": {
-    "arduino_port": null,
+    "arduino_port": "COM6",
     "baudrate": 115200,
     "timeout_s": 0.1
   },
   "control": {
-    "base_speed": 90,
+    "base_speed": 60,
     "max_speed": 160,
     "max_steering": 120,
     "lane_kp": 85.0,
