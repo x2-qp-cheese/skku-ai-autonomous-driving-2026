@@ -1,163 +1,321 @@
-#!/usr/bin/env python3
-# scripts/drive.py
-# 차선 인식 기반 주행 (자체 완결형)
-#   카메라 -> 차선 검출 -> 조향/속도 계산 -> 시리얼로 아두이노에 전송
-#   펌웨어(vehicle_controller.ino)와 1:1 호환: "DRIVE <speed> <steer>\n" / "STOP\n"
-#
-# 실행:  (가상환경 활성화 후, 레포 루트에서)
-#   python scripts/drive.py
-# 종료:  영상 창에서 q
-#
-# 필요 패키지: opencv-python, numpy, pyserial  (requirements.txt에 포함)
-
-import json
-import sys
-import time
-from pathlib import Path
-
 import cv2
 import numpy as np
+import time
 import serial
 
-CONFIG_PATH = Path(__file__).resolve().parent.parent / "configs" / "default.json"
+# =========================================================
+# 시리얼 (아두이노 메가) 설정
+# =========================================================
+
+SERIAL_PORT = "COM6"
+SERIAL_BAUD = 115200
+
+# =========================================================
+# 주행 제어 파라미터
+# =========================================================
+
+# 기본 전진 속도. 90이 바닥에서 차를 못 미는 것 같으면 천천히 올려보기.
+# (210~220에서 드라이버가 탔으니 절대 거기 근처로는 가지 말 것)
+BASE_SPEED = 110
+
+# 곡선/조향 클 때 감속 하한. 너무 낮으면 바닥에서 안 움직임.
+MIN_SPEED = 90
+
+MAX_STEER = 100
+STEER_GAIN = 0.35
+STEER_SIGN = 1.0
+STEER_SMOOTH = 0.5
+LOST_FRAMES_BEFORE_STOP = 8
+
+# =========================================================
+# 카메라 설정
+# =========================================================
+
+CAMERA_INDEX = 1
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 360
+
+# =========================================================
+# 차선 검출 설정
+# =========================================================
+
+# --- top-hat (빛 반사 제거 핵심) ---
+# 이 커널보다 '두꺼운' 밝은 영역(바닥 반사 덩어리)은 제거되고,
+# 이보다 얇은 밝은 선(차선)만 남는다.
+# 차선이 통째로 사라지면 값을 키우고(예: 35), 반사가 덜 지워지면 줄인다(예: 15).
+TOPHAT_KERNEL_SIZE = 25
+
+# top-hat 결과를 이진화하는 임계값. 차선이 잘 안 잡히면 낮추고, 잡티 많으면 높임.
+TOPHAT_THRESHOLD = 30
+
+# --- 컨투어 크기 필터 ---
+MIN_CONTOUR_AREA = 250
+MAX_LANE_PARTS = 4
+
+# --- 모양 필터 (반사 덩어리 제거 핵심) ---
+# 차선은 '가늘고 길다'. 길이/폭 비율이 이 값 이상인 것만 차선으로 인정.
+# 반사 덩어리는 뭉툭해서 비율이 낮아 걸러진다.
+# 너무 빡세서 차선까지 지워지면 1.8 정도로 낮추기.
+MIN_ELONGATION = 2.2
+
+# =========================================================
+# ROI 설정
+# =========================================================
+
+ROI_BOTTOM_LEFT_X = 0
+ROI_BOTTOM_RIGHT_X = 1
+ROI_TOP_LEFT_X = 0.1
+ROI_TOP_RIGHT_X = 0.9
+ROI_TOP_Y = 0.6
 
 
-def load_config(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def make_roi_mask(h, w, lane):
-    """사다리꼴 관심영역(ROI) 마스크 생성"""
-    pts = np.array([[
-        (int(w * lane["roi_bottom_left_x"]),  h),
-        (int(w * lane["roi_top_left_x"]),     int(h * lane["roi_top_y"])),
-        (int(w * lane["roi_top_right_x"]),    int(h * lane["roi_top_y"])),
-        (int(w * lane["roi_bottom_right_x"]), h),
-    ]], dtype=np.int32)
+def make_roi_mask(frame_shape):
+    h, w = frame_shape[:2]
+    roi_points = np.array([
+        [
+            (int(w * ROI_BOTTOM_LEFT_X), h),
+            (int(w * ROI_BOTTOM_RIGHT_X), h),
+            (int(w * ROI_TOP_RIGHT_X), int(h * ROI_TOP_Y)),
+            (int(w * ROI_TOP_LEFT_X), int(h * ROI_TOP_Y))
+        ]
+    ], dtype=np.int32)
     mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillPoly(mask, pts, 255)
-    return mask
+    cv2.fillPoly(mask, roi_points, 255)
+    return mask, roi_points
 
 
-def detect_lane_offset(frame, lane, roi_mask):
-    """차선 중심의 좌우 치우침을 반환.
-    반환: (offset, binary)
-      offset: -1.0 ~ +1.0  (양수 = 차선 중심이 화면 오른쪽 -> 오른쪽으로 조향)
-              차선을 못 찾으면 None
+def detect_lane(frame):
+    """
+    빛 반사에 강한 차선 검출.
+    1. grayscale + blur
+    2. white top-hat 으로 넓은 반사 영역 제거, 얇은 밝은 선만 강조
+    3. 이진화
+    4. ROI 적용
+    5. 작은 노이즈 정리
     """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, lane["gray_threshold"], 255, cv2.THRESH_BINARY)
-    binary = cv2.bitwise_and(binary, roi_mask)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    big = [c for c in contours if cv2.contourArea(c) >= lane["min_contour_area"]]
+    # --- 핵심: white top-hat ---
+    th_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (TOPHAT_KERNEL_SIZE, TOPHAT_KERNEL_SIZE)
+    )
+    tophat = cv2.morphologyEx(blurred, cv2.MORPH_TOPHAT, th_kernel)
 
-    h, w = gray.shape
-    cx_img = w / 2.0
-    if not big:
-        return None, binary
+    # top-hat 결과 이진화 (넓은 반사는 이미 거의 0으로 죽어 있음)
+    _, binary_mask = cv2.threshold(
+        tophat, TOPHAT_THRESHOLD, 255, cv2.THRESH_BINARY
+    )
 
-    xs = []
-    for c in big:
-        M = cv2.moments(c)
-        if M["m00"] > 0:
-            xs.append(M["m10"] / M["m00"])
-    if not xs:
-        return None, binary
+    # ROI
+    roi_mask, roi_points = make_roi_mask(frame.shape)
+    lane_mask = cv2.bitwise_and(binary_mask, roi_mask)
 
-    lane_center = sum(xs) / len(xs)
-    offset = (lane_center - cx_img) / cx_img   # -1 ~ +1
-    return offset, binary
+    # 작은 노이즈 정리 + 끊긴 선 연결
+    kernel = np.ones((3, 3), np.uint8)
+    lane_mask = cv2.morphologyEx(lane_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    lane_mask = cv2.morphologyEx(lane_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
 
+    return lane_mask, roi_points
+
+
+def select_lane_contours(lane_mask):
+    """
+    크기 + 모양(가늘고 긴 것만)으로 컨투어를 거른다.
+    반사 덩어리는 뭉툭해서 elongation 필터에서 떨어진다.
+    """
+    contours, _ = cv2.findContours(
+        lane_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    valid_contours = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < MIN_CONTOUR_AREA:
+            continue
+
+        # 최소 회전 사각형으로 진짜 길쭉함 측정 (기울어진 차선도 OK)
+        (cx, cy), (rw, rh), angle = cv2.minAreaRect(contour)
+        long_side = max(rw, rh)
+        short_side = min(rw, rh)
+        if short_side < 1:
+            continue
+
+        elongation = long_side / short_side
+        if elongation < MIN_ELONGATION:
+            # 뭉툭한 반사 덩어리 -> 버림
+            continue
+
+        valid_contours.append(contour)
+
+    valid_contours.sort(key=cv2.contourArea, reverse=True)
+    return valid_contours[:MAX_LANE_PARTS]
+
+
+def compute_lane_center_x(lane_contours):
+    if not lane_contours:
+        return None
+
+    total_area = 0.0
+    weighted_x = 0.0
+    for contour in lane_contours:
+        M = cv2.moments(contour)
+        if M["m00"] == 0:
+            continue
+        cx = M["m10"] / M["m00"]
+        area = cv2.contourArea(contour)
+        weighted_x += cx * area
+        total_area += area
+
+    if total_area == 0:
+        return None
+    return weighted_x / total_area
+
+
+# =========================================================
+# 시리얼 헬퍼
+# =========================================================
+
+def open_serial():
+    ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
+    time.sleep(2.0)
+    start = time.time()
+    while time.time() - start < 3.0:
+        line = ser.readline().decode(errors="ignore").strip()
+        if line:
+            print("[ARDUINO]", line)
+        if "READY" in line:
+            break
+    return ser
+
+
+def send_drive(ser, speed, steer):
+    speed = int(max(0, min(255, speed)))
+    steer = int(max(-MAX_STEER, min(MAX_STEER, steer)))
+    ser.write(f"DRIVE {speed} {steer}\n".encode())
+
+
+def send_stop(ser):
+    ser.write(b"STOP\n")
+
+
+# =========================================================
+# 메인 주행 루프
+# =========================================================
 
 def main():
-    cfg = load_config(CONFIG_PATH)
-    cam, lane = cfg["camera"], cfg["lane"]
-    ser_cfg, ctl = cfg["serial"], cfg["control"]
-
-    port = ser_cfg["arduino_port"]
-    if not port:
-        print('ERROR: configs/default.json 의 serial.arduino_port 를 "COM6" 으로 설정하세요.')
-        sys.exit(1)
-
-    # 1) 시리얼 연결 (아두이노는 연결 시 리셋되므로 잠깐 대기)
-    ser = serial.Serial(port, ser_cfg["baudrate"], timeout=ser_cfg["timeout_s"])
-    time.sleep(2.0)
-    ser.reset_input_buffer()
-    print(f"[serial] {port} @ {ser_cfg['baudrate']} 연결됨")
-
-    # 2) 카메라 (Windows는 CAP_DSHOW가 빠르게 열림)
-    cap = cv2.VideoCapture(cam["index"], cv2.CAP_DSHOW)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  cam["width"])
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cam["height"])
-    if cam.get("fourcc"):
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*cam["fourcc"]))
-    if not cap.isOpened():
-        print("ERROR: 카메라를 열 수 없습니다. camera.index 를 확인하세요.")
-        ser.close()
-        sys.exit(1)
-
-    base_speed   = int(ctl["base_speed"])
-    max_steering = int(ctl["max_steering"])
-    kp           = float(ctl["lane_kp"])
-    lost_brake   = bool(ctl["lane_lost_brake"])
-
-    def send(line):
-        ser.write(line.encode("ascii"))
-
-    roi_mask = None
-    print("[run] 주행 시작 — 영상 창에서 q 누르면 정지/종료")
     try:
-        send("PING\n")
+        ser = open_serial()
+        print("시리얼 연결 완료:", SERIAL_PORT)
+    except Exception as e:
+        print("시리얼 연결 실패:", e)
+        print("COM6가 맞는지, 시리얼 모니터/다른 프로그램이 점유 중인지 확인하세요.")
+        return
+
+    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+
+    if not cap.isOpened():
+        print("카메라를 열 수 없습니다. CAMERA_INDEX를 0, 1, 2로 바꿔보세요.")
+        send_stop(ser)
+        ser.close()
+        return
+
+    prev_time = time.time()
+    smoothed_steer = 0.0
+    lost_count = 0
+    driving = False
+    print("스페이스바: 주행 시작/정지 토글  |  q: 종료")
+
+    try:
         while True:
-            ok, frame = cap.read()
-            if not ok:
-                send("STOP\n")
-                continue
+            ret, frame = cap.read()
+            if not ret:
+                print("프레임을 읽지 못했습니다.")
+                break
 
-            h, w = frame.shape[:2]
-            if roi_mask is None or roi_mask.shape != (h, w):
-                roi_mask = make_roi_mask(h, w, lane)
+            frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
 
-            offset, dbg = detect_lane_offset(frame, lane, roi_mask)
+            lane_mask, roi_points = detect_lane(frame)
+            lane_contours = select_lane_contours(lane_mask)
+            lane_center_x = compute_lane_center_x(lane_contours)
 
-            if offset is None:
-                # 차선 분실
-                if lost_brake:
-                    send("STOP\n")
-                    speed, steer = 0, 0
+            result = frame.copy()
+            cv2.polylines(result, roi_points, True, (255, 0, 0), 2)
+            for c in lane_contours:
+                cv2.drawContours(result, [c], -1, (0, 255, 0), 3)
+
+            frame_center_x = FRAME_WIDTH / 2.0
+
+            if lane_center_x is not None:
+                lost_count = 0
+                error = lane_center_x - frame_center_x
+                raw_steer = STEER_SIGN * STEER_GAIN * error
+                smoothed_steer = (
+                    STEER_SMOOTH * smoothed_steer
+                    + (1 - STEER_SMOOTH) * raw_steer
+                )
+                steer_cmd = int(max(-MAX_STEER, min(MAX_STEER, smoothed_steer)))
+                speed_cmd = int(
+                    BASE_SPEED
+                    - (BASE_SPEED - MIN_SPEED) * (abs(steer_cmd) / MAX_STEER)
+                )
+
+                cv2.line(result,
+                         (int(lane_center_x), FRAME_HEIGHT),
+                         (int(lane_center_x), int(FRAME_HEIGHT * ROI_TOP_Y)),
+                         (0, 0, 255), 2)
+                cv2.line(result,
+                         (int(frame_center_x), FRAME_HEIGHT),
+                         (int(frame_center_x), int(FRAME_HEIGHT * ROI_TOP_Y)),
+                         (255, 255, 0), 1)
+
+                if driving:
+                    send_drive(ser, speed_cmd, steer_cmd)
+                status = f"DRIVE s={speed_cmd} st={steer_cmd}"
+            else:
+                lost_count += 1
+                if driving and lost_count >= LOST_FRAMES_BEFORE_STOP:
+                    send_stop(ser)
                     status = "LANE LOST -> STOP"
                 else:
-                    speed, steer = base_speed, 0
-                    send(f"DRIVE {speed} {steer}\n")
-                    status = "LANE LOST -> keep straight"
-            else:
-                # P 제어: 치우친 만큼 비례해서 조향
-                steer = int(kp * offset)
-                steer = max(-max_steering, min(max_steering, steer))
-                speed = base_speed
-                send(f"DRIVE {speed} {steer}\n")
-                status = f"offset={offset:+.2f}  steer={steer:+d}  speed={speed}"
+                    status = f"LANE LOST ({lost_count})"
 
-            # ---- 디버그 화면 ----
-            vis = frame.copy()
-            cv2.line(vis, (w // 2, 0), (w // 2, h), (0, 255, 0), 1)
-            cv2.putText(vis, status, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            cv2.imshow("drive", vis)
-            cv2.imshow("lane_mask", dbg)
+            mode = "RUN" if driving else "PAUSE"
+            color = (0, 255, 0) if driving else (0, 0, 255)
+            cv2.putText(result, mode, (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+            cv2.putText(result, status, (20, 75),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            now = time.time()
+            fps = 1.0 / (now - prev_time) if now > prev_time else 0.0
+            prev_time = now
+            cv2.putText(result, f"FPS: {fps:.1f}", (20, 110),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+            cv2.imshow("Drive", result)
+            cv2.imshow("ROI Lane Mask", lane_mask)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
                 break
-            time.sleep(0.02)  # 약 50Hz (펌웨어 안전 타임아웃 500ms보다 충분히 빠름)
+            elif key == ord(" "):
+                driving = not driving
+                if not driving:
+                    send_stop(ser)
+                    smoothed_steer = 0.0
+                print("주행:", "ON" if driving else "OFF")
+
     finally:
-        send("STOP\n")
-        time.sleep(0.1)
+        send_stop(ser)
+        time.sleep(0.2)
+        ser.close()
         cap.release()
         cv2.destroyAllWindows()
-        ser.close()
-        print("[exit] STOP 전송 후 종료")
+        print("정지 명령 전송 후 종료.")
 
 
 if __name__ == "__main__":

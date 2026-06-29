@@ -102,9 +102,10 @@ void handleCommand(const String& line) {
 }
 
 // 두 뒷바퀴를 같은 속도/방향으로 구동 (조향은 앞쪽 조향모터가 담당)
+// 배선상 전진/후진이 반대로 연결되어 있어 부호를 반전합니다.
 void applyDrive(int value) {
-  motor(RIGHT_IN1, RIGHT_IN2, value);
-  motor(LEFT_IN1,  LEFT_IN2,  value);
+  motor(RIGHT_IN1, RIGHT_IN2, -value);
+  motor(LEFT_IN1,  LEFT_IN2,  -value);
 }
 
 // 조향: 목표 steer -> 목표 pot값 -> A4 읽어서 P제어로 그 위치까지만 이동
