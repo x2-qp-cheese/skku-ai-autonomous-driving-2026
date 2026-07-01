@@ -22,13 +22,10 @@ def main() -> int:
                 print("failed to read frame")
                 return 1
             result = detector.detect(frame)
-            overlay = frame.copy()
-            cv2.polylines(overlay, result.roi_points, True, (255, 0, 0), 2)
-            for contour in result.contours:
-                cv2.drawContours(overlay, [contour], -1, (0, 255, 0), 3)
+
             cv2.putText(
-                overlay,
-                "offset=%.3f confidence=%.2f" % (
+                frame,
+                "offset=%.3f  confidence=%.2f" % (
                     result.estimate.center_offset_norm,
                     result.estimate.confidence,
                 ),
@@ -38,10 +35,13 @@ def main() -> int:
                 (0, 255, 255),
                 2,
             )
-            cv2.imshow("camera lane check", overlay)
-            cv2.imshow("lane mask", result.lane_mask)
+            cv2.imshow("camera (original)", frame)
+            cv2.imshow("binary (color+edge)", result.binary)
+            cv2.imshow("lane viz (BEV + sliding window)", result.lane_viz)
+
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
+
     cv2.destroyAllWindows()
     return 0
 

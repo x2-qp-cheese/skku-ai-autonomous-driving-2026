@@ -1,0 +1,55 @@
+{
+  "camera": {
+    "index": 0,
+    "width": 640,
+    "height": 480,
+    "fourcc": "MJPG"
+  },
+  "lane": {
+    "gray_threshold": 175,
+    "min_contour_area": 700,
+    "roi_bottom_left_x": 0.18,
+    "roi_bottom_right_x": 0.82,
+    "roi_top_left_x": 0.35,
+    "roi_top_right_x": 0.65,
+    "roi_top_y": 0.55,
+    "white_l_min": 200,
+    "white_s_max": 80,
+    "canny_low": 50,
+    "canny_high": 150,
+    "bev_src_bottom_left_x": 0.15,
+    "bev_src_bottom_right_x": 0.85,
+    "bev_src_top_left_x": 0.42,
+    "bev_src_top_right_x": 0.58,
+    "bev_src_top_y": 0.62,
+    "bev_src_bottom_y": 0.93,
+    "bev_dst_left_x": 0.25,
+    "bev_dst_right_x": 0.75,
+    "n_windows": 9,
+    "window_margin": 60,
+    "min_pix": 30,
+    "poly_deg": 2
+  },
+  "lidar": {
+    "port": null,
+    "rpm": 660,
+    "front_angle_min": 330,
+    "front_angle_max": 30,
+    "stop_distance_mm": 300
+  },
+  "serial": {
+    "arduino_port": null,
+    "baudrate": 115200,
+    "timeout_s": 0.1
+  },
+  "control": {
+    "base_speed": 60,
+    "max_speed": 160,
+    "max_steering": 120,
+    "lane_kp": 85.0,
+    "lane_lost_brake": true
+  },
+  "mission": {
+    "mode": "time_trial"
+  }
+}

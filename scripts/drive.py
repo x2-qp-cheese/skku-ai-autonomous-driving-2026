@@ -7,7 +7,7 @@ import serial
 # 시리얼 (아두이노 메가) 설정
 # =========================================================
 
-SERIAL_PORT = "COM6"
+SERIAL_PORT = "COM4"
 SERIAL_BAUD = 115200
 
 # =========================================================
@@ -16,13 +16,13 @@ SERIAL_BAUD = 115200
 
 # 기본 전진 속도. 90이 바닥에서 차를 못 미는 것 같으면 천천히 올려보기.
 # (210~220에서 드라이버가 탔으니 절대 거기 근처로는 가지 말 것)
-BASE_SPEED = 110
+BASE_SPEED = 70
 
 # 곡선/조향 클 때 감속 하한. 너무 낮으면 바닥에서 안 움직임.
 MIN_SPEED = 90
 
-MAX_STEER = 100
-STEER_GAIN = 0.35
+MAX_STEER = 130
+STEER_GAIN = 2
 STEER_SIGN = 1.0
 STEER_SMOOTH = 0.5
 LOST_FRAMES_BEFORE_STOP = 8
@@ -64,9 +64,9 @@ MIN_ELONGATION = 2.2
 
 ROI_BOTTOM_LEFT_X = 0
 ROI_BOTTOM_RIGHT_X = 1
-ROI_TOP_LEFT_X = 0.1
-ROI_TOP_RIGHT_X = 0.9
-ROI_TOP_Y = 0.6
+ROI_TOP_LEFT_X = 0.15
+ROI_TOP_RIGHT_X = 0.85
+ROI_TOP_Y = 0.45
 
 
 def make_roi_mask(frame_shape):
@@ -156,20 +156,37 @@ def compute_lane_center_x(lane_contours):
     if not lane_contours:
         return None
 
-    total_area = 0.0
-    weighted_x = 0.0
+    centers = []
     for contour in lane_contours:
         M = cv2.moments(contour)
         if M["m00"] == 0:
             continue
         cx = M["m10"] / M["m00"]
         area = cv2.contourArea(contour)
-        weighted_x += cx * area
-        total_area += area
+        centers.append((cx, area))
 
-    if total_area == 0:
+    if not centers:
         return None
-    return weighted_x / total_area
+
+    frame_cx = FRAME_WIDTH / 2.0
+    left = [(cx, a) for cx, a in centers if cx < frame_cx]
+    right = [(cx, a) for cx, a in centers if cx >= frame_cx]
+
+    def group_center(group):
+        total = sum(a for _, a in group)
+        if total == 0:
+            return None
+        return sum(cx * a for cx, a in group) / total
+
+    left_x = group_center(left)
+    right_x = group_center(right)
+
+    if left_x is not None and right_x is not None:
+        return (left_x + right_x) / 2.0
+    elif left_x is not None:
+        return left_x
+    else:
+        return right_x
 
 
 # =========================================================
