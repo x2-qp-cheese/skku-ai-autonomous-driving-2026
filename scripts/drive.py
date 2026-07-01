@@ -16,13 +16,13 @@ SERIAL_BAUD = 115200
 
 # 기본 전진 속도. 90이 바닥에서 차를 못 미는 것 같으면 천천히 올려보기.
 # (210~220에서 드라이버가 탔으니 절대 거기 근처로는 가지 말 것)
-BASE_SPEED = 110
+BASE_SPEED = 50
 
 # 곡선/조향 클 때 감속 하한. 너무 낮으면 바닥에서 안 움직임.
 MIN_SPEED = 90
 
-MAX_STEER = 100
-STEER_GAIN = 0.35
+MAX_STEER = 150
+STEER_GAIN = 0.85
 STEER_SIGN = 1.0
 STEER_SMOOTH = 0.5
 LOST_FRAMES_BEFORE_STOP = 8
@@ -31,7 +31,7 @@ LOST_FRAMES_BEFORE_STOP = 8
 # 카메라 설정
 # =========================================================
 
-CAMERA_INDEX = 1
+CAMERA_INDEX = 0
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 360
 
@@ -64,9 +64,9 @@ MIN_ELONGATION = 2.2
 
 ROI_BOTTOM_LEFT_X = 0
 ROI_BOTTOM_RIGHT_X = 1
-ROI_TOP_LEFT_X = 0.1
-ROI_TOP_RIGHT_X = 0.9
-ROI_TOP_Y = 0.6
+ROI_TOP_LEFT_X = 0.2
+ROI_TOP_RIGHT_X = 0.8
+ROI_TOP_Y = 0.5
 
 
 def make_roi_mask(frame_shape):
@@ -319,4 +319,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()  
