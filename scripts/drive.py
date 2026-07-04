@@ -36,6 +36,10 @@ LOST_FRAMES_BEFORE_STOP = 8
 CAMERA_INDEX = 0
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 360
+SHOW_RAW_MASK = False
+DRIVE_WINDOW = "Drive"
+LANE_MASK_WINDOW = "ROI Lane Mask"
+RAW_MASK_WINDOW = "Raw ROI Mask"
 
 # =========================================================
 # 차선 검출 설정
@@ -48,35 +52,49 @@ FRAME_HEIGHT = 360
 TOPHAT_KERNEL_SIZE = 25
 
 # top-hat 결과를 이진화하는 임계값. 차선이 잘 안 잡히면 낮추고, 잡티 많으면 높임.
-TOPHAT_THRESHOLD = 30
+TOPHAT_THRESHOLD = 20
+WHITE_L_MIN = 185
+WHITE_S_MAX = 75
+BRIGHT_THRESHOLD = 180
+BRIGHT_PERCENTILE = 92
+BRIGHT_MARGIN = 12
+STRICT_BRIGHT_PERCENTILE = 97
+MAX_ROI_WHITE_RATIO = 0.18
 
 # --- 컨투어 크기 필터 ---
-MIN_CONTOUR_AREA = 250
-MAX_LANE_PARTS = 4
+MIN_CONTOUR_AREA = 120
+MAX_LANE_PARTS = 2
 
 # --- 모양 필터 (반사 덩어리 제거 핵심) ---
 # 차선은 '가늘고 길다'. 길이/폭 비율이 이 값 이상인 것만 차선으로 인정.
 # 반사 덩어리는 뭉툭해서 비율이 낮아 걸러진다.
 # 너무 빡세서 차선까지 지워지면 1.8 정도로 낮추기.
-MIN_ELONGATION = 2.2
+MIN_ELONGATION = 1.6
+MIN_CONTOUR_HEIGHT = 25
+MIN_CONTOUR_BOTTOM_Y = 0.55
+MAX_FILL_RATIO = 0.96
+MAX_ANGLE_FROM_VERTICAL = 78.0
+LANE_LOOKAHEAD_Y = 0.82
+ASSUMED_HALF_LANE_WIDTH = 0.25
 
 # =========================================================
 # ROI 설정
 # =========================================================
 
-ROI_BOTTOM_LEFT_X = 0
-ROI_BOTTOM_RIGHT_X = 1
-ROI_TOP_LEFT_X = 0.15
-ROI_TOP_RIGHT_X = 0.85
-ROI_TOP_Y = 0.45
+ROI_BOTTOM_LEFT_X = 0.08
+ROI_BOTTOM_RIGHT_X = 0.92
+ROI_BOTTOM_Y = 0.96
+ROI_TOP_LEFT_X = 0.28
+ROI_TOP_RIGHT_X = 0.72
+ROI_TOP_Y = 0.55
 
 
 def make_roi_mask(frame_shape):
     h, w = frame_shape[:2]
     roi_points = np.array([
         [
-            (int(w * ROI_BOTTOM_LEFT_X), h),
-            (int(w * ROI_BOTTOM_RIGHT_X), h),
+            (int(w * ROI_BOTTOM_LEFT_X), int(h * ROI_BOTTOM_Y)),
+            (int(w * ROI_BOTTOM_RIGHT_X), int(h * ROI_BOTTOM_Y)),
             (int(w * ROI_TOP_RIGHT_X), int(h * ROI_TOP_Y)),
             (int(w * ROI_TOP_LEFT_X), int(h * ROI_TOP_Y))
         ]
@@ -90,13 +108,14 @@ def detect_lane(frame):
     """
     빛 반사에 강한 차선 검출.
     1. grayscale + blur
-    2. white top-hat 으로 넓은 반사 영역 제거, 얇은 밝은 선만 강조
-    3. 이진화
+    2. white top-hat + HLS 흰색 필터로 흰 차선 후보 생성
+    3. 밝기 조건을 같이 걸어 어두운 잡음 제거
     4. ROI 적용
     5. 작은 노이즈 정리
     """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    roi_mask, roi_points = make_roi_mask(frame.shape)
 
     # --- 핵심: white top-hat ---
     th_kernel = cv2.getStructuringElement(
@@ -104,14 +123,44 @@ def detect_lane(frame):
     )
     tophat = cv2.morphologyEx(blurred, cv2.MORPH_TOPHAT, th_kernel)
 
-    # top-hat 결과 이진화 (넓은 반사는 이미 거의 0으로 죽어 있음)
-    _, binary_mask = cv2.threshold(
+    _, tophat_mask = cv2.threshold(
         tophat, TOPHAT_THRESHOLD, 255, cv2.THRESH_BINARY
     )
 
-    # ROI
-    roi_mask, roi_points = make_roi_mask(frame.shape)
+    hls = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
+    white_mask = cv2.inRange(
+        hls,
+        np.array([0, WHITE_L_MIN, 0], dtype=np.uint8),
+        np.array([180, 255, WHITE_S_MAX], dtype=np.uint8),
+    )
+
+    roi_values = blurred[roi_mask > 0]
+    if len(roi_values) > 0:
+        dynamic_bright = int(np.percentile(roi_values, BRIGHT_PERCENTILE)) + BRIGHT_MARGIN
+        bright_threshold = min(245, max(BRIGHT_THRESHOLD, dynamic_bright))
+    else:
+        bright_threshold = BRIGHT_THRESHOLD
+
+    _, bright_mask = cv2.threshold(
+        blurred, bright_threshold, 255, cv2.THRESH_BINARY
+    )
+    color_mask = cv2.bitwise_and(white_mask, bright_mask)
+    binary_mask = cv2.bitwise_or(tophat_mask, color_mask)
+
     lane_mask = cv2.bitwise_and(binary_mask, roi_mask)
+
+    roi_area = max(1, cv2.countNonZero(roi_mask))
+    if cv2.countNonZero(lane_mask) / float(roi_area) > MAX_ROI_WHITE_RATIO:
+        strict_bright = int(np.percentile(roi_values, STRICT_BRIGHT_PERCENTILE)) if len(roi_values) > 0 else 230
+        strict_bright = min(250, max(bright_threshold, strict_bright))
+        _, strict_bright_mask = cv2.threshold(
+            blurred, strict_bright, 255, cv2.THRESH_BINARY
+        )
+        strict_color_mask = cv2.bitwise_and(white_mask, strict_bright_mask)
+        lane_mask = cv2.bitwise_and(
+            cv2.bitwise_or(tophat_mask, strict_color_mask),
+            roi_mask,
+        )
 
     # 작은 노이즈 정리 + 끊긴 선 연결
     kernel = np.ones((3, 3), np.uint8)
@@ -123,20 +172,32 @@ def detect_lane(frame):
 
 def select_lane_contours(lane_mask):
     """
-    크기 + 모양(가늘고 긴 것만)으로 컨투어를 거른다.
-    반사 덩어리는 뭉툭해서 elongation 필터에서 떨어진다.
+    크기 + 모양 + 방향으로 컨투어를 거른다.
+    흰색 잡음 중 차선처럼 길고, 아래쪽 ROI에 걸치고, 세로 방향 성분이 큰 것만 남긴다.
     """
     contours, _ = cv2.findContours(
         lane_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
 
-    valid_contours = []
+    candidates = []
+    frame_h, frame_w = lane_mask.shape[:2]
+    frame_cx = frame_w / 2.0
+
     for contour in contours:
         area = cv2.contourArea(contour)
         if area < MIN_CONTOUR_AREA:
             continue
 
-        # 최소 회전 사각형으로 진짜 길쭉함 측정 (기울어진 차선도 OK)
+        x, y, w, h = cv2.boundingRect(contour)
+        if h < MIN_CONTOUR_HEIGHT:
+            continue
+        if y + h < frame_h * MIN_CONTOUR_BOTTOM_Y:
+            continue
+
+        fill_ratio = area / float(max(1, w * h))
+        if fill_ratio > MAX_FILL_RATIO:
+            continue
+
         (cx, cy), (rw, rh), angle = cv2.minAreaRect(contour)
         long_side = max(rw, rh)
         short_side = min(rw, rh)
@@ -145,13 +206,57 @@ def select_lane_contours(lane_mask):
 
         elongation = long_side / short_side
         if elongation < MIN_ELONGATION:
-            # 뭉툭한 반사 덩어리 -> 버림
             continue
 
-        valid_contours.append(contour)
+        line = cv2.fitLine(contour, cv2.DIST_L2, 0, 0.01, 0.01)
+        vx = float(line[0][0])
+        vy = float(line[1][0])
+        angle_from_vertical = np.degrees(np.arctan2(abs(vx), abs(vy)))
+        if angle_from_vertical > MAX_ANGLE_FROM_VERTICAL:
+            continue
 
-    valid_contours.sort(key=cv2.contourArea, reverse=True)
-    return valid_contours[:MAX_LANE_PARTS]
+        bottom_weight = (y + h) / float(frame_h)
+        side_weight = abs(cx - frame_cx) / frame_cx
+        score = area * elongation * bottom_weight * (1.0 + side_weight)
+        candidates.append((score, cx, contour))
+
+    if not candidates:
+        return []
+
+    left = [item for item in candidates if item[1] < frame_cx]
+    right = [item for item in candidates if item[1] >= frame_cx]
+    selected = []
+    for group in (left, right):
+        if group:
+            selected.append(max(group, key=lambda item: item[0])[2])
+
+    if not selected:
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        selected = [item[2] for item in candidates[:MAX_LANE_PARTS]]
+
+    return selected[:MAX_LANE_PARTS]
+
+
+def make_selected_lane_mask(mask_shape, lane_contours):
+    filtered = np.zeros(mask_shape, dtype=np.uint8)
+    if lane_contours:
+        cv2.drawContours(filtered, lane_contours, -1, 255, thickness=cv2.FILLED)
+    return filtered
+
+
+def contour_x_at_y(contour, target_y):
+    points = contour.reshape(-1, 2)
+    if len(points) == 0:
+        return None
+
+    distances = np.abs(points[:, 1] - target_y)
+    near_band = max(8, int(FRAME_HEIGHT * 0.04))
+    near_points = points[distances <= near_band]
+    if len(near_points) == 0:
+        nearest_count = min(8, len(points))
+        near_points = points[np.argsort(distances)[:nearest_count]]
+
+    return float(np.mean(near_points[:, 0]))
 
 
 def compute_lane_center_x(lane_contours):
@@ -159,11 +264,11 @@ def compute_lane_center_x(lane_contours):
         return None
 
     centers = []
+    target_y = FRAME_HEIGHT * LANE_LOOKAHEAD_Y
     for contour in lane_contours:
-        M = cv2.moments(contour)
-        if M["m00"] == 0:
+        cx = contour_x_at_y(contour, target_y)
+        if cx is None:
             continue
-        cx = M["m10"] / M["m00"]
         area = cv2.contourArea(contour)
         centers.append((cx, area))
 
@@ -186,9 +291,9 @@ def compute_lane_center_x(lane_contours):
     if left_x is not None and right_x is not None:
         return (left_x + right_x) / 2.0
     elif left_x is not None:
-        return left_x
+        return left_x + FRAME_WIDTH * ASSUMED_HALF_LANE_WIDTH
     else:
-        return right_x
+        return right_x - FRAME_WIDTH * ASSUMED_HALF_LANE_WIDTH
 
 
 # =========================================================
@@ -248,6 +353,21 @@ def send_stop(ser):
     ser.write(b"STOP\n")
 
 
+def setup_display_windows():
+    cv2.namedWindow(DRIVE_WINDOW, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(DRIVE_WINDOW, FRAME_WIDTH, FRAME_HEIGHT)
+    cv2.moveWindow(DRIVE_WINDOW, 40, 80)
+
+    cv2.namedWindow(LANE_MASK_WINDOW, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(LANE_MASK_WINDOW, FRAME_WIDTH, FRAME_HEIGHT)
+    cv2.moveWindow(LANE_MASK_WINDOW, FRAME_WIDTH + 80, 80)
+
+    if SHOW_RAW_MASK:
+        cv2.namedWindow(RAW_MASK_WINDOW, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(RAW_MASK_WINDOW, FRAME_WIDTH, FRAME_HEIGHT)
+        cv2.moveWindow(RAW_MASK_WINDOW, FRAME_WIDTH + 80, FRAME_HEIGHT + 140)
+
+
 # =========================================================
 # 메인 주행 루프
 # =========================================================
@@ -281,6 +401,7 @@ def main():
     smoothed_steer = 0.0
     lost_count = 0
     driving = False
+    setup_display_windows()
     print("스페이스바: 주행 시작/정지 토글  |  q: 종료")
 
     try:
@@ -294,6 +415,7 @@ def main():
 
             lane_mask, roi_points = detect_lane(frame)
             lane_contours = select_lane_contours(lane_mask)
+            selected_lane_mask = make_selected_lane_mask(lane_mask.shape, lane_contours)
             lane_center_x = compute_lane_center_x(lane_contours)
 
             result = frame.copy()
@@ -350,8 +472,10 @@ def main():
             cv2.putText(result, f"FPS: {fps:.1f}", (20, 110),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-            cv2.imshow("Drive", result)
-            cv2.imshow("ROI Lane Mask", lane_mask)
+            cv2.imshow(DRIVE_WINDOW, result)
+            cv2.imshow(LANE_MASK_WINDOW, selected_lane_mask)
+            if SHOW_RAW_MASK:
+                cv2.imshow(RAW_MASK_WINDOW, lane_mask)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
