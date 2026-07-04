@@ -1,6 +1,7 @@
 from ultralytics import YOLO
 import numpy as np
 import cv2
+import sys
 import time
 
 CLASS_CENTER = 0
@@ -41,7 +42,12 @@ def compute_lane_center(left_x, center_x, right_x, frame_width, lane_width_px=No
 def main():
     model = YOLO('best_v2.pt')
 
-    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+    if sys.platform.startswith("win"):
+        cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+    elif sys.platform == "darwin" and hasattr(cv2, "CAP_AVFOUNDATION"):
+        cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_AVFOUNDATION)
+    else:
+        cap = cv2.VideoCapture(CAMERA_INDEX)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))

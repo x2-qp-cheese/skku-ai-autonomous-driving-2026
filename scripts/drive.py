@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import sys
 import time
 import serial
 
@@ -7,7 +8,8 @@ import serial
 # 시리얼 (아두이노 메가) 설정
 # =========================================================
 
-SERIAL_PORT = "COM4"
+WINDOWS_SERIAL_PORT = "COM4"
+SERIAL_PORT = WINDOWS_SERIAL_PORT if sys.platform.startswith("win") else None
 SERIAL_BAUD = 115200
 
 # =========================================================
@@ -31,7 +33,7 @@ LOST_FRAMES_BEFORE_STOP = 8
 # 카메라 설정
 # =========================================================
 
-CAMERA_INDEX = 1
+CAMERA_INDEX = 0
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 360
 
@@ -193,8 +195,38 @@ def compute_lane_center_x(lane_contours):
 # 시리얼 헬퍼
 # =========================================================
 
+def find_serial_port():
+    try:
+        from serial.tools import list_ports
+    except ImportError:
+        return None
+
+    preferred_ports = []
+    fallback_ports = []
+    for port in list_ports.comports():
+        device = port.device
+        if sys.platform == "darwin" and not device.startswith("/dev/cu."):
+            continue
+
+        fallback_ports.append(device)
+        details = "%s %s %s" % (device, port.description, port.hwid)
+        details = details.lower()
+        if any(token in details for token in ("arduino", "usbmodem", "usbserial", "ch340")):
+            preferred_ports.append(device)
+
+    if preferred_ports:
+        return preferred_ports[0]
+    if fallback_ports:
+        return fallback_ports[0]
+    return None
+
+
 def open_serial():
-    ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
+    port = SERIAL_PORT or find_serial_port()
+    if not port:
+        raise RuntimeError("아두이노 시리얼 포트를 찾지 못했습니다. scripts/list_serial_ports.py로 포트를 확인하세요.")
+
+    ser = serial.Serial(port, SERIAL_BAUD, timeout=1)
     time.sleep(2.0)
     start = time.time()
     while time.time() - start < 3.0:
@@ -223,13 +255,18 @@ def send_stop(ser):
 def main():
     try:
         ser = open_serial()
-        print("시리얼 연결 완료:", SERIAL_PORT)
+        print("시리얼 연결 완료:", ser.port)
     except Exception as e:
         print("시리얼 연결 실패:", e)
-        print("COM6가 맞는지, 시리얼 모니터/다른 프로그램이 점유 중인지 확인하세요.")
+        print("포트 설정과 시리얼 모니터/다른 프로그램 점유 여부를 확인하세요.")
         return
 
-    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+    if sys.platform.startswith("win"):
+        cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+    elif sys.platform == "darwin" and hasattr(cv2, "CAP_AVFOUNDATION"):
+        cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_AVFOUNDATION)
+    else:
+        cap = cv2.VideoCapture(CAMERA_INDEX)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))

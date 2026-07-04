@@ -22,7 +22,7 @@
     "stop_distance_mm": 300
   },
   "serial": {
-    "arduino_port": "COM6",
+    "arduino_port": null,
     "baudrate": 115200,
     "timeout_s": 0.1
   },
