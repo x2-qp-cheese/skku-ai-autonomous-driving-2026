@@ -4,6 +4,7 @@ import argparse
 import logging
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -81,6 +82,12 @@ def run(args: argparse.Namespace) -> int:
         LOG.info("serial disabled: dry video/control preview mode")
 
     cap = open_camera(cv2, args.camera, args.width, args.height, args.fourcc)
+    ok, first_frame = cap.read()
+    if not ok:
+        cap.release()
+        raise RuntimeError("camera frame read failed")
+
+    recorder = DriveRecorder(cv2, args, first_frame.shape)
     running = False
     last_command_at = 0.0
     last_log_at = 0.0
@@ -89,13 +96,22 @@ def run(args: argparse.Namespace) -> int:
     command = ControlCommand.stop("paused")
 
     LOG.info("model=%s device=%s camera=%s", model_path, segmenter.device, args.camera)
+    if recorder.enabled:
+        LOG.info("recording raw video: %s", recorder.raw_video_path)
+        if recorder.debug_video_path is not None:
+            LOG.info("recording debug video: %s", recorder.debug_video_path)
     LOG.info("space: start/stop toggle | q or esc: quit")
 
+    pending_frame = first_frame
     try:
         while True:
-            ok, frame = cap.read()
-            if not ok:
-                raise RuntimeError("camera frame read failed")
+            if pending_frame is None:
+                ok, frame = cap.read()
+                if not ok:
+                    raise RuntimeError("camera frame read failed")
+            else:
+                frame = pending_frame
+                pending_frame = None
 
             now = time.monotonic()
             dt = max(1e-6, now - last_frame_at)
@@ -111,6 +127,7 @@ def run(args: argparse.Namespace) -> int:
                 last_command_at = now
 
             display = draw_debug(cv2, frame, mask_result, lane, command, running, fps)
+            recorder.write(frame, display)
             cv2.imshow("YOLO Drive", display)
             if args.show_mask and mask_result is not None:
                 cv2.imshow("YOLO Lane Mask", mask_result.mask)
@@ -128,6 +145,7 @@ def run(args: argparse.Namespace) -> int:
                 if not running and vehicle is not None:
                     vehicle.stop("paused")
     finally:
+        recorder.close()
         if vehicle is not None:
             try:
                 try:
@@ -169,6 +187,11 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument("--command-rate", type=float, default=20.0)
     parser.add_argument("--log-interval", type=float, default=0.5)
     parser.add_argument("--show-mask", action="store_true")
+    parser.add_argument("--record", choices=("on", "off"), default="off")
+    parser.add_argument("--record-dir", default="data/raw/drive_recordings")
+    parser.add_argument("--record-fps", type=float, default=30.0)
+    parser.add_argument("--record-fourcc", default="mp4v")
+    parser.add_argument("--record-debug", choices=("on", "off"), default="off")
     return parser.parse_args(argv)
 
 
@@ -192,6 +215,62 @@ def resolve_model_path(value: str) -> Path:
 
 def project_root() -> Path:
     return Path(__file__).resolve().parents[3]
+
+
+class DriveRecorder:
+    def __init__(self, cv2: Any, args: argparse.Namespace, frame_shape: tuple):
+        self.enabled = args.record == "on"
+        self.raw_writer = None
+        self.debug_writer = None
+        self.raw_video_path: Optional[Path] = None
+        self.debug_video_path: Optional[Path] = None
+        self.frames = 0
+
+        if not self.enabled:
+            return
+
+        session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = Path(args.record_dir).expanduser()
+        if not output_dir.is_absolute():
+            output_dir = project_root() / output_dir
+        session_dir = output_dir / session_id
+        session_dir.mkdir(parents=True, exist_ok=True)
+
+        height, width = frame_shape[:2]
+        fps = args.record_fps
+        fourcc = cv2.VideoWriter_fourcc(*args.record_fourcc)
+
+        self.raw_video_path = session_dir / ("%s_raw.mp4" % session_id)
+        self.raw_writer = cv2.VideoWriter(str(self.raw_video_path), fourcc, fps, (width, height))
+        if not self.raw_writer.isOpened():
+            raise RuntimeError("failed to open raw recorder: %s" % self.raw_video_path)
+
+        if args.record_debug == "on":
+            self.debug_video_path = session_dir / ("%s_debug.mp4" % session_id)
+            self.debug_writer = cv2.VideoWriter(str(self.debug_video_path), fourcc, fps, (width, height))
+            if not self.debug_writer.isOpened():
+                self.raw_writer.release()
+                raise RuntimeError("failed to open debug recorder: %s" % self.debug_video_path)
+
+    def write(self, raw_frame: Any, debug_frame: Any) -> None:
+        if not self.enabled:
+            return
+        self.raw_writer.write(raw_frame)
+        if self.debug_writer is not None:
+            self.debug_writer.write(debug_frame)
+        self.frames += 1
+
+    def close(self) -> None:
+        if self.raw_writer is not None:
+            self.raw_writer.release()
+            self.raw_writer = None
+        if self.debug_writer is not None:
+            self.debug_writer.release()
+            self.debug_writer = None
+        if self.enabled:
+            LOG.info("recorded frames=%d raw=%s", self.frames, self.raw_video_path)
+            if self.debug_video_path is not None:
+                LOG.info("recorded debug=%s", self.debug_video_path)
 
 
 def open_camera(cv2: Any, camera: str, width: int, height: int, fourcc: str) -> Any:

@@ -23,6 +23,20 @@ python3 scripts/drive.py
 python3 scripts/drive.py --no-serial --show-mask
 ```
 
+주행과 동시에 학습용 raw 카메라 영상을 저장:
+
+```bash
+python3 scripts/drive.py --device mps --record on
+```
+
+디버그 overlay 영상도 함께 저장:
+
+```bash
+python3 scripts/drive.py --device mps --record on --record-debug on
+```
+
+학습용으로는 `_raw.mp4`를 사용한다. `_debug.mp4`는 판단이 어떻게 되었는지 사람이 확인하는 용도다.
+
 ## 장치 선택
 
 기본값은 `--device auto`다.

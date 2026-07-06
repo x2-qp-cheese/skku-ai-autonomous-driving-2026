@@ -48,6 +48,14 @@ python3 scripts/drive.py
 
 macOS Apple Silicon에서는 기본값 `--device auto`가 PyTorch MPS를 감지하면 `mps`를 사용합니다. Windows에서 NVIDIA CUDA가 가능하면 CUDA 장치를 사용하고, 둘 다 아니면 CPU로 실행합니다.
 
+주행하면서 학습용 raw 카메라 영상 저장:
+
+```bash
+python3 scripts/drive.py --device mps --record on
+```
+
+저장 위치는 기본적으로 `data/raw/drive_recordings/<timestamp>/<timestamp>_raw.mp4`입니다. YOLO overlay가 들어간 확인용 영상까지 같이 저장하려면 `--record-debug on`을 추가합니다.
+
 ## Immediate Milestones
 
 1. `scripts/camera_check.py`로 카메라 번호, 해상도, ROI 확인
