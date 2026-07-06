@@ -11,30 +11,33 @@
 ## Data Flow
 
 ```text
-camera frame        lidar scan
-     |                  |
-     v                  v
-lane detector     obstacle filter
-     |                  |
-     +--------+---------+
-              v
-        mission planner
-              |
-              v
-       ControlCommand
-              |
-              v
-        Arduino serial
-              |
-              v
-      drive and steering motors
+camera frame
+     |
+     v
+YOLO segmentation
+     |
+     v
+mask center geometry
+     |
+     v
+YOLO lane follower
+     |
+     v
+ControlCommand
+     |
+     v
+Arduino serial
+     |
+     v
+drive and steering motors
 ```
 
 ## Module Boundaries
 
 - `sensors`: hardware IO only. No mission decisions.
-- `perception`: converts raw sensor data into lane, obstacle, or traffic-light estimates.
-- `planning`: chooses speed and steering from perception outputs and mission mode.
+- `perception`: runs the trained YOLO segmentation model and returns a mask.
+- `estimation`: converts the YOLO mask into target center, lateral error, and heading error.
+- `planning`: chooses speed and steering from the YOLO-derived geometry.
 - `control`: serial protocol and actuator command formatting.
 - `firmware`: receives simple serial commands and applies them to motor pins.
 

@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+.DS_Store
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -22,3 +23,6 @@ data/calibration/*
 *.mp4
 *.mov
 *.mkv
+
+trained_model/*.pt
+!trained_model/.gitkeep
