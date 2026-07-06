@@ -247,20 +247,41 @@ class ArduinoLink:
             if "READY" in line:
                 break
 
-    def drive(self, command: DriveCommand) -> None:
+    def _write(self, data: bytes, label: str) -> bool:
+        if self.serial is None:
+            return False
+        port = self.port
+        try:
+            self.serial.write(data)
+            self._drain_responses()
+            return True
+        except (OSError, serial.SerialException) as exc:
+            print(f"시리얼 쓰기 실패({label}, {port}): {exc}")
+            self.close()
+            return False
+
+    def _drain_responses(self) -> None:
         if self.serial is None:
             return
+        while self.serial.in_waiting > 0:
+            line = self.serial.readline().decode(errors="ignore").strip()
+            if line and not line.startswith("OK "):
+                print("[ARDUINO]", line)
+
+    def drive(self, command: DriveCommand) -> bool:
         speed = int(max(0, min(255, command.speed)))
         steer = int(max(-self.control.max_steer, min(self.control.max_steer, command.steer)))
-        self.serial.write(f"DRIVE {speed} {steer}\n".encode())
+        return self._write(f"DRIVE {speed} {steer}\n".encode(), "DRIVE")
 
-    def stop(self) -> None:
-        if self.serial is not None:
-            self.serial.write(b"STOP\n")
+    def stop(self) -> bool:
+        return self._write(b"STOP\n", "STOP")
 
     def close(self) -> None:
         if self.serial is not None:
-            self.serial.close()
+            try:
+                self.serial.close()
+            except (OSError, serial.SerialException) as exc:
+                print(f"시리얼 닫기 실패({self.port}): {exc}")
             self.serial = None
 
 
@@ -947,10 +968,15 @@ def main() -> None:
                         speed=CONTROL.hold_speed,
                         steer=int(max(-CONTROL.hold_max_steer, min(CONTROL.hold_max_steer, command.steer))),
                     )
-                if driving:
-                    arduino.drive(command)
+                if driving and not arduino.drive(command):
+                    print("시리얼 연결이 끊겨 주행을 종료합니다. USB/전원 연결을 확인하세요.")
+                    driving = False
+                    break
             elif driving and track.lost_frames >= CONTROL.lost_frames_before_stop:
-                arduino.stop()
+                if not arduino.stop():
+                    print("시리얼 연결이 끊겨 주행을 종료합니다. USB/전원 연결을 확인하세요.")
+                    driving = False
+                    break
 
             now = time.time()
             fps = 1.0 / (now - prev_time) if now > prev_time else 0.0
@@ -967,18 +993,22 @@ def main() -> None:
             if key == ord(" "):
                 driving = not driving
                 if not driving:
-                    arduino.stop()
+                    if not arduino.stop():
+                        print("시리얼 연결 없이 주행 상태를 해제합니다.")
                     controller.reset()
                     tracker.reset()
                 print("주행:", "ON" if driving else "OFF")
 
     finally:
-        arduino.stop()
+        stopped = arduino.stop()
         time.sleep(0.2)
         arduino.close()
         camera.release()
         cv2.destroyAllWindows()
-        print("정지 명령 전송 후 종료.")
+        if stopped:
+            print("정지 명령 전송 후 종료.")
+        else:
+            print("시리얼 연결 없이 종료.")
 
 
 if __name__ == "__main__":
