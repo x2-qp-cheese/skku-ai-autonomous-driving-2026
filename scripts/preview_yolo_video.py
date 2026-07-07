@@ -43,6 +43,7 @@ def main() -> int:
             lookahead_y_ratio=args.lookahead,
             sample_top_y_ratio=args.sample_top,
             sample_bottom_y_ratio=args.sample_bottom,
+            vehicle_center_x_offset_ratio=args.vehicle_center_offset,
         )
     )
     follower = YoloLaneFollower(
@@ -52,10 +53,20 @@ def main() -> int:
             min_curve_speed=args.min_curve_speed,
             max_steering=args.max_steering,
             steering_rate_limit=args.steering_rate_limit,
+            min_steering_rate_limit=args.min_steering_rate_limit,
+            steering_release_rate_limit=args.steering_release_rate_limit,
             kp_lateral=args.kp_lateral,
             kd_lateral=args.kd_lateral,
             kp_heading=args.kp_heading,
             kd_heading=args.kd_heading,
+            speed_curve_slowdown=args.speed_curve_slowdown,
+            straight_steering_scale=args.straight_steering_scale,
+            curve_steering_scale=args.curve_steering_scale,
+            center_recovery_error_threshold=args.center_recovery_error_threshold,
+            center_recovery_steering_boost=args.center_recovery_steering_boost,
+            center_recovery_min_steering=args.center_recovery_min_steering,
+            center_recovery_rate_limit=args.center_recovery_rate_limit,
+            center_recovery_max_speed=args.center_recovery_max_speed,
         )
     )
 
@@ -145,16 +156,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--progress", type=int, default=30)
     parser.add_argument("--speed", type=int, default=105)
     parser.add_argument("--max-speed", type=int, default=170)
-    parser.add_argument("--min-curve-speed", type=int, default=85)
+    parser.add_argument("--min-curve-speed", type=int, default=60)
     parser.add_argument("--max-steering", type=int, default=120)
-    parser.add_argument("--steering-rate-limit", type=int, default=120)
-    parser.add_argument("--kp-lateral", type=float, default=95.0)
-    parser.add_argument("--kd-lateral", type=float, default=28.0)
-    parser.add_argument("--kp-heading", type=float, default=35.0)
-    parser.add_argument("--kd-heading", type=float, default=10.0)
+    parser.add_argument("--steering-rate-limit", type=int, default=110)
+    parser.add_argument("--min-steering-rate-limit", type=int, default=40)
+    parser.add_argument("--steering-release-rate-limit", type=int, default=22)
+    parser.add_argument("--kp-lateral", type=float, default=190.0)
+    parser.add_argument("--kd-lateral", type=float, default=45.0)
+    parser.add_argument("--kp-heading", type=float, default=12.0)
+    parser.add_argument("--kd-heading", type=float, default=4.0)
+    parser.add_argument("--speed-curve-slowdown", type=int, default=70)
+    parser.add_argument("--straight-steering-scale", type=float, default=0.45)
+    parser.add_argument("--curve-steering-scale", type=float, default=1.45)
+    parser.add_argument("--center-recovery-error-threshold", type=float, default=0.14)
+    parser.add_argument("--center-recovery-steering-boost", type=float, default=2.0)
+    parser.add_argument("--center-recovery-min-steering", type=int, default=85)
+    parser.add_argument("--center-recovery-rate-limit", type=int, default=120)
+    parser.add_argument("--center-recovery-max-speed", type=int, default=50)
     parser.add_argument("--lookahead", type=float, default=0.72)
     parser.add_argument("--sample-top", type=float, default=0.45)
     parser.add_argument("--sample-bottom", type=float, default=0.92)
+    parser.add_argument(
+        "--vehicle-center-offset",
+        type=float,
+        default=0.0,
+        help="vehicle center x offset as frame width ratio; positive makes centered targets steer left",
+    )
     return parser.parse_args()
 
 

@@ -9,6 +9,7 @@ class LaneGeometryConfig:
     lookahead_y_ratio: float = 0.72
     sample_top_y_ratio: float = 0.45
     sample_bottom_y_ratio: float = 0.92
+    vehicle_center_x_offset_ratio: float = 0.0
     band_height_ratio: float = 0.035
     min_mask_area_ratio: float = 0.001
     center_smooth_alpha: float = 0.35
@@ -38,7 +39,7 @@ class MaskLaneGeometryEstimator:
         import numpy as np
 
         height, width = frame_shape[:2]
-        vehicle_center_x = width / 2.0
+        vehicle_center_x = self._vehicle_center_x(width)
         target_y = height * self.config.lookahead_y_ratio
 
         if mask is None:
@@ -112,6 +113,10 @@ class MaskLaneGeometryEstimator:
         # y grows downward in images, so a right-bending path has a negative slope.
         normalized = -slope_x_per_y * (height / max(1.0, width / 2.0))
         return self._clip(normalized, -1.0, 1.0)
+
+    def _vehicle_center_x(self, width: int) -> float:
+        center = width * (0.5 + self.config.vehicle_center_x_offset_ratio)
+        return self._clip(center, 0.0, float(width - 1))
 
     def _smooth_center(self, value: float) -> float:
         alpha = self.config.center_smooth_alpha
