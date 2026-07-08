@@ -29,11 +29,11 @@ const int STEER_POT = A4;
 
 // ================= 조향 캘리브레이션 (반드시 실측 후 수정!) =================
 // 시동 끄고 바퀴를 손으로 [정중앙/왼쪽끝/오른쪽끝] 에 두고 "POT" 명령으로 A4값을 읽어 채우세요.
-int   STEER_CENTER_POT = 472;   // 바퀴가 정확히 직진일 때의 A4값 (실측)
+int   STEER_CENTER_POT = 484;   // 바퀴가 정확히 직진일 때의 A4값 (실측)
 int   STEER_LEFT_POT   = 572;   // 바퀴가 왼쪽 끝일 때의 A4값 (실측)
 int   STEER_RIGHT_POT  = 399;   // 바퀴가 오른쪽 끝일 때의 A4값 (실측)
-const int   STEER_INPUT_MAX = 120;  // PC가 보내는 steer 절대 최대값 (= config의 max_steering)
-const int   STEER_DEADBAND  = 8;    // 이 오차 이내면 정지 (조향 떨림 방지)
+const int   STEER_INPUT_MAX = 150;  // PC가 보내는 steer 절대 최대값 (= config의 max_steering)
+const int   STEER_DEADBAND  = 4;    // 이 오차 이내면 정지 (조향 떨림 방지)
 const float STEER_KP        = 2.5;  // 조향 위치 P 게인 (떨면 낮추고, 느리면 올리기)
 const int   STEER_MAX_PWM   = 255;  // 조향 모터 최대 출력 제한
 const int   STEER_MIN_PWM   = 90;   // 데드존 밖에서 모터를 움직이기 위한 최소 출력 (끝까지 못 가는 문제 보정)
