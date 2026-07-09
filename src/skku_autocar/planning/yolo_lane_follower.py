@@ -31,6 +31,7 @@ class YoloLaneFollowerConfig:
     center_recovery_min_steering: int = 85
     center_recovery_rate_limit: int = 120
     center_recovery_max_speed: int = 50
+    lane_lost_hold_frames: int = 20
 
 
 class YoloLaneFollower:
@@ -40,11 +41,12 @@ class YoloLaneFollower:
         self._last_lateral_error: Optional[float] = None
         self._last_heading_error: Optional[float] = None
         self._curve_strength = 0.0
+        self._last_command: Optional[ControlCommand] = None
+        self._lane_lost_frames = 0
 
     def plan(self, lane: LaneGeometry) -> ControlCommand:
         if not lane.found or lane.confidence < self.config.min_confidence:
-            self.reset()
-            return ControlCommand.stop("lane_lost:%s" % lane.reason)
+            return self._hold_last_direction(lane)
 
         raw_curve_strength = self._curve_strength_from(lane)
         curve_strength = self._smooth_curve_strength(raw_curve_strength)
@@ -74,13 +76,34 @@ class YoloLaneFollower:
         self._last_steering = steering
         self._last_lateral_error = lane.lateral_error_norm
         self._last_heading_error = heading_error
-        return ControlCommand(speed=speed, steering=steering, brake=False, reason="yolo_lane_follow")
+        command = ControlCommand(speed=speed, steering=steering, brake=False, reason="yolo_lane_follow")
+        self._last_command = command
+        self._lane_lost_frames = 0
+        return command
+
+    def _hold_last_direction(self, lane: LaneGeometry) -> ControlCommand:
+        # Road not detected (e.g. a crosswalk covering the lane markings):
+        # keep the last steering/speed so the car maintains its current
+        # heading instead of jittering or stopping. Fall back to a full stop
+        # once the lane has stayed lost for too long.
+        if self._last_command is None or self._lane_lost_frames >= self.config.lane_lost_hold_frames:
+            self.reset()
+            return ControlCommand.stop("lane_lost:%s" % lane.reason)
+        self._lane_lost_frames += 1
+        return ControlCommand(
+            speed=self._last_command.speed,
+            steering=self._last_command.steering,
+            brake=False,
+            reason="lane_lost_hold:%s" % lane.reason,
+        )
 
     def reset(self) -> None:
         self._last_steering = 0
         self._last_lateral_error = None
         self._last_heading_error = None
         self._curve_strength = 0.0
+        self._last_command = None
+        self._lane_lost_frames = 0
 
     @staticmethod
     def _derivative(value: float, previous: Optional[float]) -> float:

@@ -74,6 +74,7 @@ def run(args: argparse.Namespace) -> int:
             center_recovery_min_steering=args.center_recovery_min_steering,
             center_recovery_rate_limit=args.center_recovery_rate_limit,
             center_recovery_max_speed=args.center_recovery_max_speed,
+            lane_lost_hold_frames=args.lane_lost_hold_frames,
         )
     )
 
@@ -204,6 +205,12 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument("--center-recovery-min-steering", type=int, default=85)
     parser.add_argument("--center-recovery-rate-limit", type=int, default=120)
     parser.add_argument("--center-recovery-max-speed", type=int, default=50)
+    parser.add_argument(
+        "--lane-lost-hold-frames",
+        type=int,
+        default=20,
+        help="keep the last steering/speed for up to this many frames when the lane is not detected (e.g. crosswalks) before stopping",
+    )
     parser.add_argument("--lookahead", type=float, default=0.72)
     parser.add_argument("--sample-top", type=float, default=0.45)
     parser.add_argument("--sample-bottom", type=float, default=0.92)
