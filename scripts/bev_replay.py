@@ -54,6 +54,9 @@ def main(argv=None) -> int:
     transformer = BevTransformer(BevConfig())
     estimator = BevLaneGeometryEstimator(BevLaneConfig(lookahead_y_ratio=args.lookahead))
 
+    if args.save:
+        return export_video(cv2, args, segmenter, transformer, estimator)
+
     frames, release, is_static = open_source(cv2, args)
     print("model=%s device=%s" % (model_path, segmenter.device))
     print("keys: space=pause/play  n=step  r=restart  q/esc=quit")
@@ -107,7 +110,66 @@ def parse_args(argv):
     parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument("--delay", type=int, default=30, help="ms between frames during playback")
     parser.add_argument("--show-bev-mask", action="store_true", help="show the raw warped mask instead of a black canvas")
+    parser.add_argument("--save", action="store_true", help="non-interactive: run the whole clip and write a debug video (no GUI)")
+    parser.add_argument("--out-dir", default="data/processed", help="output directory for --save")
+    parser.add_argument("--fps", type=float, default=0.0, help="output fps for --save (0 = copy source fps)")
     return parser.parse_args(argv)
+
+
+def export_video(cv2, args, segmenter, transformer, estimator) -> int:
+    ext = Path(args.source).suffix.lower()
+    if ext in IMAGE_EXTS or args.source.isdigit():
+        raise RuntimeError("--save expects a video file source: %s" % args.source)
+
+    cap = cv2.VideoCapture(args.source)
+    if not cap.isOpened():
+        raise RuntimeError("could not open source: %s" % args.source)
+    if args.start_frame > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, args.start_frame)
+
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    out_fps = args.fps if args.fps > 0 else (src_fps if src_fps > 0 else 30.0)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+    out_dir = ROOT / args.out_dir if not Path(args.out_dir).is_absolute() else Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / ("%s_centerline.mp4" % Path(args.source).stem)
+
+    out_w, out_h = transformer.out_size
+    writer = None
+    index = 0
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            mask_result = segmenter.segment(frame)
+            bev_mask = transformer.warp_mask(mask_result.mask) if mask_result is not None else None
+            lane = estimator.estimate(bev_mask)
+
+            left = draw_original(cv2, frame, transformer, mask_result, lane, estimator)
+            right = draw_bev(cv2, transformer, bev_mask, lane, estimator, args.show_bev_mask)
+            h, w = left.shape[:2]
+            scale = out_h / h
+            left = cv2.resize(left, (int(w * scale), out_h))
+            combined = cv2.hconcat([left, right])
+
+            if writer is None:
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                writer = cv2.VideoWriter(str(out_path), fourcc, out_fps, (combined.shape[1], combined.shape[0]))
+                if not writer.isOpened():
+                    raise RuntimeError("failed to open video writer: %s" % out_path)
+            writer.write(combined)
+            index += 1
+            if index % 60 == 0:
+                pct = (" (%d%%)" % int(100 * index / total)) if total else ""
+                print("processed %d/%s frames%s" % (index, total or "?", pct))
+    finally:
+        cap.release()
+        if writer is not None:
+            writer.release()
+    print("saved %d frames -> %s (%.1f fps)" % (index, out_path, out_fps))
+    return 0
 
 
 def open_source(cv2, args):

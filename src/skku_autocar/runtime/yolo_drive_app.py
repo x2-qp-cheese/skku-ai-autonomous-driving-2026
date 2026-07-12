@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ..control.serial_vehicle import SerialVehicleClient, SerialVehicleConfig
+from ..estimation.bev_lane import BevLaneConfig, BevLaneGeometryEstimator
 from ..estimation.lane_geometry import LaneGeometry, LaneGeometryConfig, MaskLaneGeometryEstimator
+from ..perception.bev import BevConfig, BevTransformer
 from ..perception.yolo_lane import YoloLaneConfig, YoloLaneMask, YoloLaneSegmenter
 from ..planning.yolo_lane_follower import YoloLaneFollower, YoloLaneFollowerConfig
 from ..types import ControlCommand
@@ -53,6 +55,22 @@ def run(args: argparse.Namespace) -> int:
             vehicle_center_x_offset_ratio=args.vehicle_center_offset,
         )
     )
+    # BEV lane pipeline (same logic as scripts/bev_tune.py / bev_replay.py):
+    # warp the YOLO mask to bird's-eye view, then fit the road-following
+    # centerline there so the target direction respects road curvature.
+    transformer = BevTransformer(BevConfig()) if args.bev else None
+    bev_estimator = (
+        BevLaneGeometryEstimator(
+            BevLaneConfig(
+                lookahead_y_ratio=args.bev_lookahead,
+                vehicle_center_x_offset_ratio=args.vehicle_center_offset,
+                center_smooth_alpha=args.bev_center_smooth,
+                heading_smooth_alpha=args.bev_heading_smooth,
+            )
+        )
+        if args.bev
+        else None
+    )
     follower = YoloLaneFollower(
         YoloLaneFollowerConfig(
             base_speed=args.speed,
@@ -95,6 +113,9 @@ def run(args: argparse.Namespace) -> int:
         LOG.info("serial disabled: dry video/control preview mode")
 
     cap = open_camera(cv2, args.camera, args.width, args.height, args.fourcc)
+    # A video-file source (not a live camera index) should loop for review instead
+    # of erroring out at the end of the clip.
+    is_video_file = not str(args.camera).isdigit()
     ok, first_frame = cap.read()
     if not ok:
         cap.release()
@@ -120,6 +141,9 @@ def run(args: argparse.Namespace) -> int:
         while True:
             if pending_frame is None:
                 ok, frame = cap.read()
+                if not ok and is_video_file:  # loop the clip for review
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ok, frame = cap.read()
                 if not ok:
                     raise RuntimeError("camera frame read failed")
             else:
@@ -132,18 +156,28 @@ def run(args: argparse.Namespace) -> int:
             last_frame_at = now
 
             mask_result = segmenter.segment(frame)
-            lane = estimator.estimate(mask_result.mask if mask_result else None, frame.shape)
+            bev_mask = None
+            if transformer is not None:
+                bev_mask = transformer.warp_mask(mask_result.mask) if mask_result else None
+                lane = bev_estimator.estimate(bev_mask)
+            else:
+                lane = estimator.estimate(mask_result.mask if mask_result else None, frame.shape)
             command = follower.plan(lane) if running else ControlCommand.stop("paused")
 
             if vehicle is not None and now - last_command_at >= 1.0 / args.command_rate:
                 vehicle.send(command)
                 last_command_at = now
 
-            display = draw_debug(cv2, frame, mask_result, lane, command, running, fps)
+            display = draw_debug(cv2, frame, mask_result, lane, command, running, fps, transformer, bev_estimator)
             recorder.write(frame, display)
             cv2.imshow("YOLO Drive", display)
-            if args.show_mask and mask_result is not None:
-                cv2.imshow("YOLO Lane Mask", mask_result.mask)
+            if args.show_mask:
+                # In BEV mode show the warped (bird's-eye) road mask so the road is
+                # separated in top-down view; otherwise fall back to the frame mask.
+                if bev_mask is not None:
+                    cv2.imshow("BEV Lane Mask", draw_bev_mask_debug(cv2, bev_mask, lane))
+                elif mask_result is not None:
+                    cv2.imshow("YOLO Lane Mask", mask_result.mask)
 
             if now - last_log_at >= args.log_interval:
                 log_status(mask_result, lane, command, running, fps, segmenter.device)
@@ -211,6 +245,24 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         default=20,
         help="keep the last steering/speed for up to this many frames when the lane is not detected (e.g. crosswalks) before stopping",
     )
+    # BEV lane pipeline (default on): warp the mask to bird's-eye view and fit the
+    # road-following centerline there, same as scripts/bev_tune.py.
+    parser.add_argument("--bev", dest="bev", action="store_true", default=True, help="use the BEV centerline pipeline (default)")
+    parser.add_argument("--no-bev", dest="bev", action="store_false", help="use the legacy frame-plane lane estimator instead")
+    parser.add_argument("--bev-lookahead", type=float, default=BevLaneConfig.lookahead_y_ratio, help="BEV row ratio where lateral error is measured")
+    parser.add_argument(
+        "--bev-center-smooth",
+        type=float,
+        default=BevLaneConfig.center_smooth_alpha,
+        help="BEV lane-center EMA factor (0..1). 1.0 = no smoothing (target dot sits on the raw line, fast/jittery), lower = smoother/laggier",
+    )
+    parser.add_argument(
+        "--bev-heading-smooth",
+        type=float,
+        default=BevLaneConfig.heading_smooth_alpha,
+        help="BEV heading EMA factor (0..1). 1.0 = no smoothing, lower = smoother",
+    )
+    # Legacy frame-plane estimator params (used only with --no-bev).
     parser.add_argument("--lookahead", type=float, default=0.72)
     parser.add_argument("--sample-top", type=float, default=0.45)
     parser.add_argument("--sample-bottom", type=float, default=0.92)
@@ -227,7 +279,13 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument("--record-dir", default="data/raw/drive_recordings")
     parser.add_argument("--record-fps", type=float, default=30.0)
     parser.add_argument("--record-fourcc", default="mp4v")
-    parser.add_argument("--record-debug", choices=("on", "off"), default="off")
+    parser.add_argument(
+        "--record-debug",
+        choices=("on", "off", "auto"),
+        default="auto",
+        help="save the annotated debug screen. auto=follow --record (on when --record on), on=always, off=never",
+    )
+    parser.add_argument("--debug-dir", default="data/processed", help="output dir for the debug screen video")
     return parser.parse_args(argv)
 
 
@@ -255,7 +313,15 @@ def project_root() -> Path:
 
 class DriveRecorder:
     def __init__(self, cv2: Any, args: argparse.Namespace, frame_shape: tuple):
-        self.enabled = args.record == "on"
+        # Raw and debug (annotated) recording are independent so the debug overlay
+        # with the on-screen parameter values can be captured to data/processed for
+        # real-time tuning even without saving the large raw clip.
+        # --record on saves the raw clip AND auto-saves the annotated debug screen
+        # to data/processed (for reviewing/tuning). --record-debug on saves only the
+        # debug screen. --record-debug off force-disables it even with --record on.
+        self.raw_enabled = args.record == "on"
+        self.debug_enabled = args.record_debug == "on" or (self.raw_enabled and args.record_debug == "auto")
+        self.enabled = self.raw_enabled or self.debug_enabled
         self.raw_writer = None
         self.debug_writer = None
         self.raw_video_path: Optional[Path] = None
@@ -266,32 +332,38 @@ class DriveRecorder:
             return
 
         session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = Path(args.record_dir).expanduser()
-        if not output_dir.is_absolute():
-            output_dir = project_root() / output_dir
-        session_dir = output_dir / session_id
-        session_dir.mkdir(parents=True, exist_ok=True)
-
         height, width = frame_shape[:2]
         fps = args.record_fps
         fourcc = cv2.VideoWriter_fourcc(*args.record_fourcc)
 
-        self.raw_video_path = session_dir / ("%s_raw.mp4" % session_id)
-        self.raw_writer = cv2.VideoWriter(str(self.raw_video_path), fourcc, fps, (width, height))
-        if not self.raw_writer.isOpened():
-            raise RuntimeError("failed to open raw recorder: %s" % self.raw_video_path)
+        if self.raw_enabled:
+            raw_dir = self._resolve(args.record_dir) / session_id
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            self.raw_video_path = raw_dir / ("%s_raw.mp4" % session_id)
+            self.raw_writer = cv2.VideoWriter(str(self.raw_video_path), fourcc, fps, (width, height))
+            if not self.raw_writer.isOpened():
+                raise RuntimeError("failed to open raw recorder: %s" % self.raw_video_path)
 
-        if args.record_debug == "on":
-            self.debug_video_path = session_dir / ("%s_debug.mp4" % session_id)
+        if self.debug_enabled:
+            debug_dir = self._resolve(args.debug_dir)
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            self.debug_video_path = debug_dir / ("%s_debug.mp4" % session_id)
             self.debug_writer = cv2.VideoWriter(str(self.debug_video_path), fourcc, fps, (width, height))
             if not self.debug_writer.isOpened():
-                self.raw_writer.release()
+                if self.raw_writer is not None:
+                    self.raw_writer.release()
                 raise RuntimeError("failed to open debug recorder: %s" % self.debug_video_path)
+
+    @staticmethod
+    def _resolve(value: str) -> Path:
+        path = Path(value).expanduser()
+        return path if path.is_absolute() else project_root() / path
 
     def write(self, raw_frame: Any, debug_frame: Any) -> None:
         if not self.enabled:
             return
-        self.raw_writer.write(raw_frame)
+        if self.raw_writer is not None:
+            self.raw_writer.write(raw_frame)
         if self.debug_writer is not None:
             self.debug_writer.write(debug_frame)
         self.frames += 1
@@ -304,9 +376,10 @@ class DriveRecorder:
             self.debug_writer.release()
             self.debug_writer = None
         if self.enabled:
-            LOG.info("recorded frames=%d raw=%s", self.frames, self.raw_video_path)
+            if self.raw_video_path is not None:
+                LOG.info("recorded frames=%d raw=%s", self.frames, self.raw_video_path)
             if self.debug_video_path is not None:
-                LOG.info("recorded debug=%s", self.debug_video_path)
+                LOG.info("recorded frames=%d debug=%s", self.frames, self.debug_video_path)
 
 
 def open_camera(cv2: Any, camera: str, width: int, height: int, fourcc: str) -> Any:
@@ -334,6 +407,8 @@ def draw_debug(
     command: ControlCommand,
     running: bool,
     fps: float,
+    transformer: Any = None,
+    bev_estimator: Any = None,
 ) -> Any:
     display = frame.copy()
     if mask_result is not None:
@@ -342,11 +417,23 @@ def draw_debug(
         display = cv2.addWeighted(overlay, 0.28, display, 0.72, 0)
 
     height, width = display.shape[:2]
-    cv2.line(display, (int(lane.vehicle_center_x), height), (int(lane.vehicle_center_x), 0), (255, 255, 0), 1)
-    if lane.found:
-        target = (int(lane.center_x), int(lane.target_y))
-        cv2.circle(display, target, 7, (0, 0, 255), -1)
-        cv2.line(display, (int(lane.vehicle_center_x), height - 1), target, (0, 0, 255), 2)
+    if transformer is not None and bev_estimator is not None:
+        # BEV mode: lane geometry is in BEV pixel coords. The camera is centered,
+        # so the vehicle axis is the frame midline. Draw a single line joining the
+        # center axis (car, bottom) to the target point mapped back from BEV.
+        cv2.line(display, (width // 2, height), (width // 2, 0), (255, 255, 0), 1)
+        if lane.found:
+            target = transformer.bev_to_frame([(lane.center_x, lane.target_y)], (height, width))[0]
+            tp = (int(target[0]), int(target[1]))
+            cv2.line(display, (width // 2, height - 1), tp, (0, 0, 255), 2)
+            cv2.circle(display, tp, 9, (255, 255, 255), -1)
+            cv2.circle(display, tp, 6, (0, 0, 255), -1)
+    else:
+        cv2.line(display, (int(lane.vehicle_center_x), height), (int(lane.vehicle_center_x), 0), (255, 255, 0), 1)
+        if lane.found:
+            target = (int(lane.center_x), int(lane.target_y))
+            cv2.circle(display, target, 7, (0, 0, 255), -1)
+            cv2.line(display, (int(lane.vehicle_center_x), height - 1), target, (0, 0, 255), 2)
 
     status = "RUN" if running else "PAUSE"
     color = (0, 255, 0) if running else (0, 180, 255)
@@ -374,6 +461,26 @@ def draw_debug(
             cv2.LINE_AA,
         )
     return display
+
+
+def draw_bev_mask_debug(cv2: Any, bev_mask: Any, lane: LaneGeometry) -> Any:
+    """Binary BEV road mask (white=road) with the vehicle center axis, a single
+    line joining it to the target point, and the tracked target dot."""
+    canvas = cv2.cvtColor(bev_mask, cv2.COLOR_GRAY2BGR)
+    h, w = canvas.shape[:2]
+
+    # vehicle center axis (forward is up), cyan
+    cx = int(lane.vehicle_center_x) if lane is not None else w // 2
+    cv2.line(canvas, (cx, 0), (cx, h), (255, 255, 0), 1)
+
+    if lane is not None and lane.found:
+        target = (int(lane.center_x), int(lane.target_y))
+        # single line connecting the center axis (car, bottom) to the target point
+        cv2.line(canvas, (cx, h - 1), target, (0, 0, 255), 2)
+        # tracked target point: red dot with a white outline for visibility
+        cv2.circle(canvas, target, 7, (255, 255, 255), -1)
+        cv2.circle(canvas, target, 5, (0, 0, 255), -1)
+    return canvas
 
 
 def log_status(

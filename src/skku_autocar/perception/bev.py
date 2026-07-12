@@ -17,10 +17,14 @@ class BevConfig:
     scripts/bev_tune.py and paste the result here (or into configs).
     """
 
-    src_top_left: Tuple[float, float] = (0.42, 0.62)
-    src_top_right: Tuple[float, float] = (0.58, 0.62)
-    src_bottom_right: Tuple[float, float] = (0.95, 0.95)
-    src_bottom_left: Tuple[float, float] = (0.05, 0.95)
+    # Tuned on data/raw/20260709_120821_raw.mp4 (1280x720, low car-mounted cam).
+    # Symmetric about x=0.5 so the vehicle forward axis maps to the BEV center;
+    # top edge sits just below the road vanishing point (~y=0.45) for lookahead,
+    # bottom edge spans the full near-field ground just above the car body.
+    src_top_left: Tuple[float, float] = (0.20, 0.40)
+    src_top_right: Tuple[float, float] = (0.80, 0.40)
+    src_bottom_right: Tuple[float, float] = (1.00, 0.88)
+    src_bottom_left: Tuple[float, float] = (0.00, 0.88)
 
     # Output BEV canvas size in pixels.
     out_width: int = 480
