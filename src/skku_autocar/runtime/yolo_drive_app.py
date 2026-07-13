@@ -9,10 +9,11 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ..control.serial_vehicle import SerialVehicleClient, SerialVehicleConfig
+from ..estimation.bev_corridor import BevCorridorConfig, BevCorridorLaneEstimator, warp_class_masks
 from ..estimation.bev_lane import BevLaneConfig, BevLaneGeometryEstimator
 from ..estimation.lane_geometry import LaneGeometry, LaneGeometryConfig, MaskLaneGeometryEstimator
 from ..perception.bev import BevConfig, BevTransformer
-from ..perception.yolo_lane import YoloLaneConfig, YoloLaneMask, YoloLaneSegmenter
+from ..perception.yolo_lane import YoloClassMasks, YoloLaneConfig, YoloLaneMask, YoloLaneSegmenter
 from ..planning.yolo_lane_follower import YoloLaneFollower, YoloLaneFollowerConfig
 from ..types import ControlCommand
 
@@ -53,12 +54,17 @@ def run(args: argparse.Namespace) -> int:
     # BEV lane pipeline (same logic as scripts/bev_tune.py / bev_replay.py):
     # warp the YOLO mask to bird's-eye view, then fit the road-following
     # centerline there so the target direction respects road curvature.
-    transformer = BevTransformer(BevConfig()) if args.bev else None
+    # --bev-corridor (Plan A) warps per-class masks first and builds the corridor
+    # in BEV instead of frame space; it needs the same transformer.
+    transformer = BevTransformer(BevConfig()) if (args.bev or args.bev_corridor) else None
     bev_lane_config = build_bev_lane_config(args) if args.bev else None
     bev_estimator = (
         BevLaneGeometryEstimator(bev_lane_config)
         if args.bev
         else None
+    )
+    corridor_estimator = (
+        BevCorridorLaneEstimator(build_bev_corridor_config(args)) if args.bev_corridor else None
     )
     follower_config = build_follower_config(args)
     follower = YoloLaneFollower(follower_config)
@@ -124,13 +130,20 @@ def run(args: argparse.Namespace) -> int:
             fps = 0.9 * fps + 0.1 * (1.0 / dt) if fps else 1.0 / dt
             last_frame_at = now
 
-            mask_result = segmenter.segment(frame)
             bev_mask = None
-            if transformer is not None:
-                bev_mask = transformer.warp_mask(mask_result.mask) if mask_result else None
-                lane = bev_estimator.estimate(bev_mask)
+            if corridor_estimator is not None:
+                class_masks = segmenter.segment_class_masks(frame)
+                bev = warp_class_masks(transformer, class_masks)
+                lane = corridor_estimator.estimate(bev)
+                bev_mask = fuse_masks([*bev.center, *bev.side, *bev.lane, *bev.crosswalk])
+                mask_result = corridor_mask_result(class_masks, corridor_estimator, frame.shape)
             else:
-                lane = estimator.estimate(mask_result.mask if mask_result else None, frame.shape)
+                mask_result = segmenter.segment(frame)
+                if transformer is not None:
+                    bev_mask = transformer.warp_mask(mask_result.mask) if mask_result else None
+                    lane = bev_estimator.estimate(bev_mask)
+                else:
+                    lane = estimator.estimate(mask_result.mask if mask_result else None, frame.shape)
             planned_command = follower.plan(lane) if running else ControlCommand.stop("paused")
             command = command_filter.apply(mask_result, lane, planned_command, running)
 
@@ -138,7 +151,7 @@ def run(args: argparse.Namespace) -> int:
                 vehicle.send(command)
                 last_command_at = now
 
-            display = draw_debug(cv2, frame, mask_result, lane, command, running, fps, transformer, bev_estimator)
+            display = draw_debug(cv2, frame, mask_result, lane, command, running, fps, transformer, bev_estimator or corridor_estimator)
             recorder.write(frame, display)
             cv2.imshow("YOLO Drive", display)
             if args.show_mask:
@@ -197,6 +210,54 @@ def build_bev_lane_config(args: argparse.Namespace) -> BevLaneConfig:
         heading_gain=args.bev_heading_gain,
         center_smooth_alpha=args.bev_center_smooth,
         heading_smooth_alpha=args.bev_heading_smooth,
+    )
+
+
+def build_bev_corridor_config(args: argparse.Namespace) -> BevCorridorConfig:
+    defaults = BevCorridorConfig()
+    return BevCorridorConfig(
+        lane_width_px=args.corridor_lane_width_px,
+        lookahead_y_ratio=_first_set(args.bev_lookahead, args.lookahead, defaults.lookahead_y_ratio),
+        vehicle_center_x_offset_ratio=args.vehicle_center_offset,
+        heading_gain=args.bev_heading_gain,
+        center_smooth_alpha=args.bev_center_smooth,
+        heading_smooth_alpha=args.bev_heading_smooth,
+    )
+
+
+def fuse_masks(masks: list) -> Any:
+    """OR a list of binary masks into one, for debug overlays. None if empty."""
+    import numpy as np
+
+    fused = None
+    for mask in masks:
+        arr = np.asarray(mask)
+        fused = arr.copy() if fused is None else np.maximum(fused, arr)
+    return fused
+
+
+def corridor_mask_result(
+    class_masks: YoloClassMasks,
+    estimator: BevCorridorLaneEstimator,
+    frame_shape: tuple,
+) -> Optional[YoloLaneMask]:
+    """Wrap the corridor result as a YoloLaneMask so the existing safety filter,
+    overlay and logging keep working unchanged. The class_name carries the
+    corridor tier's name (which contains "virtual" on tiers 2/3), so
+    CommandSafetyFilter's virtual-lane guard still triggers."""
+    if not class_masks.found:
+        return None
+    frame_mask = fuse_masks([*class_masks.center, *class_masks.side, *class_masks.lane, *class_masks.crosswalk])
+    if frame_mask is None:
+        return None
+    conf = class_masks.center_conf or class_masks.side_conf or class_masks.lane_conf or class_masks.crosswalk_conf
+    return YoloLaneMask(
+        mask=frame_mask,
+        confidence=float(conf),
+        class_id=-1,
+        class_name=estimator.last_class_name,
+        device=class_masks.device,
+        inference_ms=class_masks.inference_ms,
     )
 
 
@@ -615,6 +676,22 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     # road-following centerline there, same as scripts/bev_tune.py.
     parser.add_argument("--bev", dest="bev", action="store_true", default=True, help="use the BEV centerline pipeline (default)")
     parser.add_argument("--no-bev", dest="bev", action="store_false", help="use the legacy frame-plane lane estimator instead")
+    # Plan A: build the corridor in BEV from per-class masks instead of frame space.
+    # When on, it takes over the lane stage (the frame-space corridor and the
+    # plain --bev estimator are bypassed).
+    parser.add_argument(
+        "--bev-corridor",
+        dest="bev_corridor",
+        action="store_true",
+        default=False,
+        help="use the BEV corridor pipeline (Plan A): warp per-class masks first, fit center/side lines and build the corridor in BEV",
+    )
+    parser.add_argument(
+        "--corridor-lane-width-px",
+        type=float,
+        default=BevCorridorConfig.lane_width_px,
+        help="[--bev-corridor] BEV lane width (px) between the center line and the outer side line; measure once with scripts/bev_replay.py --corridor",
+    )
     parser.add_argument(
         "--bev-lookahead",
         type=float,

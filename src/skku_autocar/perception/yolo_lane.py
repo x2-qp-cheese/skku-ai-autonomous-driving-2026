@@ -14,6 +14,7 @@ class YoloLaneConfig:
     device: str = "auto"
     center_classes: Tuple[str, ...] = ("lane-center", "center")
     side_classes: Tuple[str, ...] = ("lane-side", "side")
+    crosswalk_classes: Tuple[str, ...] = ("crosswalk", "cross-walk", "zebra")
     lane_classes: Tuple[str, ...] = (
         "lane",
         "line",
@@ -37,6 +38,31 @@ class YoloLaneMask:
     class_name: str
     device: str
     inference_ms: float
+
+
+@dataclass(frozen=True)
+class YoloClassMasks:
+    """Per-class frame-space masks WITHOUT any corridor geometry applied.
+
+    Plan A warps these into BEV first and builds the corridor there, so the raw
+    class masks are all this stage produces. Side instances are kept separate
+    (a tuple, not ORed) so left/right side lines can be fitted independently.
+    """
+
+    center: Tuple[Any, ...] = ()
+    side: Tuple[Any, ...] = ()
+    lane: Tuple[Any, ...] = ()
+    crosswalk: Tuple[Any, ...] = ()
+    center_conf: float = 0.0
+    side_conf: float = 0.0
+    lane_conf: float = 0.0
+    crosswalk_conf: float = 0.0
+    device: str = "cpu"
+    inference_ms: float = 0.0
+
+    @property
+    def found(self) -> bool:
+        return bool(self.center or self.side or self.lane or self.crosswalk)
 
 
 def select_yolo_device(preferred: str = "auto") -> str:
@@ -91,6 +117,21 @@ class YoloLaneSegmenter:
             result = self._predict(frame)
         return self._best_mask(result, frame.shape[:2])
 
+    def segment_class_masks(self, frame: Any) -> YoloClassMasks:
+        """Plan A entry point: return per-class masks with no corridor applied.
+
+        Same MPS->CPU fallback as segment(); the caller warps these into BEV and
+        runs BevCorridorLaneEstimator.
+        """
+        try:
+            result = self._predict(frame)
+        except Exception:
+            if self.device != "mps":
+                raise
+            self.device = "cpu"
+            result = self._predict(frame)
+        return self._class_masks(result, frame.shape[:2])
+
     def _predict(self, frame: Any) -> Any:
         results = self.model.predict(
             source=frame,
@@ -101,15 +142,21 @@ class YoloLaneSegmenter:
         )
         return results[0]
 
-    def _best_mask(self, result: Any, frame_hw: Tuple[int, int]) -> Optional[YoloLaneMask]:
+    def _build_candidates(self, result: Any, frame_hw: Tuple[int, int]) -> Tuple[list, Any]:
+        """Extract per-detection candidates shared by the frame-space corridor
+        path (_best_mask) and the Plan A per-class path (_class_masks).
+
+        Each candidate tuple is:
+          (kind, score, index, mask, area, class_id, class_name, confidence)
+        """
         masks = getattr(result, "masks", None)
         if masks is None or getattr(masks, "data", None) is None:
-            return None
+            return [], None
 
         mask_tensors = masks.data
         count = len(mask_tensors)
         if count == 0:
-            return None
+            return [], None
 
         classes, confidences = self._box_metadata(result, count)
         total_area = float(frame_hw[0] * frame_hw[1])
@@ -126,9 +173,14 @@ class YoloLaneSegmenter:
             kind = self._class_kind(class_name)
             if kind is None:
                 continue
-            score = float(confidences[index]) * (area / total_area)
-            candidates.append((kind, score, index, mask, area, class_id, class_name))
+            confidence = float(confidences[index])
+            score = confidence * (area / total_area)
+            candidates.append((kind, score, index, mask, area, class_id, class_name, confidence))
 
+        return candidates, confidences
+
+    def _best_mask(self, result: Any, frame_hw: Tuple[int, int]) -> Optional[YoloLaneMask]:
+        candidates, confidences = self._build_candidates(result, frame_hw)
         if not candidates:
             return None
 
@@ -136,16 +188,45 @@ class YoloLaneSegmenter:
         if selected is None:
             return None
         index = selected["index"]
-        speed = getattr(result, "speed", {}) or {}
-        inference_ms = float(speed.get("inference", 0.0))
         return YoloLaneMask(
             mask=selected["mask"],
             confidence=float(confidences[index]),
             class_id=selected["class_id"],
             class_name=selected["class_name"],
             device=self.device,
-            inference_ms=inference_ms,
+            inference_ms=self._inference_ms(result),
         )
+
+    def _class_masks(self, result: Any, frame_hw: Tuple[int, int]) -> YoloClassMasks:
+        candidates, _ = self._build_candidates(result, frame_hw)
+
+        def group(kind: str) -> Tuple[Tuple[Any, ...], float]:
+            items = [c for c in candidates if c[0] == kind]
+            masks = tuple(c[3] for c in items)
+            conf = max((c[7] for c in items), default=0.0)
+            return masks, conf
+
+        center, center_conf = group("center")
+        side, side_conf = group("side")
+        lane, lane_conf = group("lane")
+        crosswalk, crosswalk_conf = group("crosswalk")
+        return YoloClassMasks(
+            center=center,
+            side=side,
+            lane=lane,
+            crosswalk=crosswalk,
+            center_conf=center_conf,
+            side_conf=side_conf,
+            lane_conf=lane_conf,
+            crosswalk_conf=crosswalk_conf,
+            device=self.device,
+            inference_ms=self._inference_ms(result),
+        )
+
+    @staticmethod
+    def _inference_ms(result: Any) -> float:
+        speed = getattr(result, "speed", {}) or {}
+        return float(speed.get("inference", 0.0))
 
     def _to_frame_mask(self, mask_tensor: Any, frame_hw: Tuple[int, int]) -> Any:
         import cv2
@@ -187,6 +268,9 @@ class YoloLaneSegmenter:
 
     def _class_kind(self, class_name: str) -> Optional[str]:
         lowered = class_name.lower()
+        # Crosswalk is checked first so it is never absorbed by a lane class.
+        if any(token in lowered for token in self.config.crosswalk_classes):
+            return "crosswalk"
         if any(token in lowered for token in self.config.center_classes):
             return "center"
         if any(token in lowered for token in self.config.side_classes):
