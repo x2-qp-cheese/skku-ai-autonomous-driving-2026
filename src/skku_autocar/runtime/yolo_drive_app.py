@@ -45,56 +45,24 @@ def run(args: argparse.Namespace) -> int:
             confidence=args.conf,
             image_size=args.imgsz,
             device=args.device,
+            fallback_lane_width_ratio=args.fallback_lane_width_ratio,
         )
     )
-    estimator = MaskLaneGeometryEstimator(
-        LaneGeometryConfig(
-            lookahead_y_ratio=args.lookahead,
-            sample_top_y_ratio=args.sample_top,
-            sample_bottom_y_ratio=args.sample_bottom,
-            vehicle_center_x_offset_ratio=args.vehicle_center_offset,
-        )
-    )
+    legacy_lane_config = build_legacy_lane_config(args)
+    estimator = MaskLaneGeometryEstimator(legacy_lane_config)
     # BEV lane pipeline (same logic as scripts/bev_tune.py / bev_replay.py):
     # warp the YOLO mask to bird's-eye view, then fit the road-following
     # centerline there so the target direction respects road curvature.
     transformer = BevTransformer(BevConfig()) if args.bev else None
+    bev_lane_config = build_bev_lane_config(args) if args.bev else None
     bev_estimator = (
-        BevLaneGeometryEstimator(
-            BevLaneConfig(
-                lookahead_y_ratio=args.bev_lookahead,
-                vehicle_center_x_offset_ratio=args.vehicle_center_offset,
-                center_smooth_alpha=args.bev_center_smooth,
-                heading_smooth_alpha=args.bev_heading_smooth,
-            )
-        )
+        BevLaneGeometryEstimator(bev_lane_config)
         if args.bev
         else None
     )
-    follower = YoloLaneFollower(
-        YoloLaneFollowerConfig(
-            base_speed=args.speed,
-            max_speed=args.max_speed,
-            min_curve_speed=args.min_curve_speed,
-            max_steering=args.max_steering,
-            steering_rate_limit=args.steering_rate_limit,
-            min_steering_rate_limit=args.min_steering_rate_limit,
-            steering_release_rate_limit=args.steering_release_rate_limit,
-            kp_lateral=args.kp_lateral,
-            kd_lateral=args.kd_lateral,
-            kp_heading=args.kp_heading,
-            kd_heading=args.kd_heading,
-            speed_curve_slowdown=args.speed_curve_slowdown,
-            straight_steering_scale=args.straight_steering_scale,
-            curve_steering_scale=args.curve_steering_scale,
-            center_recovery_error_threshold=args.center_recovery_error_threshold,
-            center_recovery_steering_boost=args.center_recovery_steering_boost,
-            center_recovery_min_steering=args.center_recovery_min_steering,
-            center_recovery_rate_limit=args.center_recovery_rate_limit,
-            center_recovery_max_speed=args.center_recovery_max_speed,
-            lane_lost_hold_frames=args.lane_lost_hold_frames,
-        )
-    )
+    follower_config = build_follower_config(args)
+    follower = YoloLaneFollower(follower_config)
+    command_filter = CommandSafetyFilter(args)
 
     vehicle = None
     if not args.no_serial:
@@ -130,6 +98,7 @@ def run(args: argparse.Namespace) -> int:
     command = ControlCommand.stop("paused")
 
     LOG.info("model=%s device=%s camera=%s", model_path, segmenter.device, args.camera)
+    log_effective_config(args, bev_lane_config, legacy_lane_config, follower_config)
     if recorder.enabled:
         LOG.info("recording raw video: %s", recorder.raw_video_path)
         if recorder.debug_video_path is not None:
@@ -162,7 +131,8 @@ def run(args: argparse.Namespace) -> int:
                 lane = bev_estimator.estimate(bev_mask)
             else:
                 lane = estimator.estimate(mask_result.mask if mask_result else None, frame.shape)
-            command = follower.plan(lane) if running else ControlCommand.stop("paused")
+            planned_command = follower.plan(lane) if running else ControlCommand.stop("paused")
+            command = command_filter.apply(mask_result, lane, planned_command, running)
 
             if vehicle is not None and now - last_command_at >= 1.0 / args.command_rate:
                 vehicle.send(command)
@@ -206,12 +176,312 @@ def run(args: argparse.Namespace) -> int:
     return 0
 
 
+def build_legacy_lane_config(args: argparse.Namespace) -> LaneGeometryConfig:
+    defaults = LaneGeometryConfig()
+    return LaneGeometryConfig(
+        lookahead_y_ratio=_first_set(args.lookahead, defaults.lookahead_y_ratio),
+        sample_top_y_ratio=_first_set(args.sample_top, defaults.sample_top_y_ratio),
+        sample_bottom_y_ratio=_first_set(args.sample_bottom, defaults.sample_bottom_y_ratio),
+        vehicle_center_x_offset_ratio=args.vehicle_center_offset,
+    )
+
+
+def build_bev_lane_config(args: argparse.Namespace) -> BevLaneConfig:
+    defaults = BevLaneConfig()
+    return BevLaneConfig(
+        lookahead_y_ratio=_first_set(args.bev_lookahead, args.lookahead, defaults.lookahead_y_ratio),
+        sample_top_y_ratio=_first_set(args.bev_sample_top, args.sample_top, defaults.sample_top_y_ratio),
+        sample_bottom_y_ratio=_first_set(args.bev_sample_bottom, args.sample_bottom, defaults.sample_bottom_y_ratio),
+        num_samples=args.bev_num_samples,
+        vehicle_center_x_offset_ratio=args.vehicle_center_offset,
+        heading_gain=args.bev_heading_gain,
+        center_smooth_alpha=args.bev_center_smooth,
+        heading_smooth_alpha=args.bev_heading_smooth,
+    )
+
+
+def build_follower_config(args: argparse.Namespace) -> YoloLaneFollowerConfig:
+    return YoloLaneFollowerConfig(
+        base_speed=args.speed,
+        max_speed=args.max_speed,
+        min_curve_speed=args.min_curve_speed,
+        max_steering=args.max_steering,
+        steering_rate_limit=args.steering_rate_limit,
+        min_steering_rate_limit=args.min_steering_rate_limit,
+        steering_release_rate_limit=args.steering_release_rate_limit,
+        kp_lateral=args.kp_lateral,
+        kd_lateral=args.kd_lateral,
+        kp_heading=args.kp_heading,
+        kd_heading=args.kd_heading,
+        speed_curve_slowdown=args.speed_curve_slowdown,
+        lateral_priority_threshold=args.lateral_priority_threshold,
+        curve_strength_alpha=args.curve_strength_alpha,
+        straight_steering_scale=args.straight_steering_scale,
+        curve_steering_scale=args.curve_steering_scale,
+        center_recovery_error_threshold=args.center_recovery_error_threshold,
+        center_recovery_steering_boost=args.center_recovery_steering_boost,
+        center_recovery_min_steering=args.center_recovery_min_steering,
+        center_recovery_rate_limit=args.center_recovery_rate_limit,
+        center_recovery_max_speed=args.center_recovery_max_speed,
+        center_lock_enabled=args.center_lock == "on",
+        center_lock_error_threshold=args.center_lock_error_threshold,
+        center_lock_min_steering=args.center_lock_min_steering,
+        lane_lost_hold_frames=args.lane_lost_hold_frames,
+        lane_lost_steering_release_rate_limit=args.lane_lost_steering_release_rate_limit,
+    )
+
+
+def log_effective_config(
+    args: argparse.Namespace,
+    bev_lane_config: Optional[BevLaneConfig],
+    legacy_lane_config: LaneGeometryConfig,
+    follower_config: YoloLaneFollowerConfig,
+) -> None:
+    if args.bev and bev_lane_config is not None:
+        LOG.info(
+            "lane pipeline=bev lookahead=%.2f sample=%.2f..%.2f vehicle_offset=%.3f center_smooth=%.2f heading_smooth=%.2f heading_gain=%.2f",
+            bev_lane_config.lookahead_y_ratio,
+            bev_lane_config.sample_top_y_ratio,
+            bev_lane_config.sample_bottom_y_ratio,
+            bev_lane_config.vehicle_center_x_offset_ratio,
+            bev_lane_config.center_smooth_alpha,
+            bev_lane_config.heading_smooth_alpha,
+            bev_lane_config.heading_gain,
+        )
+    else:
+        LOG.info(
+            "lane pipeline=legacy lookahead=%.2f sample=%.2f..%.2f vehicle_offset=%.3f",
+            legacy_lane_config.lookahead_y_ratio,
+            legacy_lane_config.sample_top_y_ratio,
+            legacy_lane_config.sample_bottom_y_ratio,
+            legacy_lane_config.vehicle_center_x_offset_ratio,
+        )
+
+    lane_lost_release = follower_config.lane_lost_steering_release_rate_limit
+    if lane_lost_release is None:
+        lane_lost_release = max(
+            follower_config.min_steering_rate_limit,
+            follower_config.steering_release_rate_limit,
+        )
+    LOG.info(
+        "control speed=%d min_curve=%d max=%d max_steer=%d kp_lat=%.1f kd_lat=%.1f kp_head=%.1f kd_head=%.1f scale=%.2f..%.2f lateral_priority=%.2f curve_alpha=%.2f center_lock=%s threshold=%.2f min=%d lane_lost_release=%d/frame",
+        follower_config.base_speed,
+        follower_config.min_curve_speed,
+        follower_config.max_speed,
+        follower_config.max_steering,
+        follower_config.kp_lateral,
+        follower_config.kd_lateral,
+        follower_config.kp_heading,
+        follower_config.kd_heading,
+        follower_config.straight_steering_scale,
+        follower_config.curve_steering_scale,
+        follower_config.lateral_priority_threshold,
+        follower_config.curve_strength_alpha,
+        "on" if follower_config.center_lock_enabled else "off",
+        follower_config.center_lock_error_threshold,
+        follower_config.center_lock_min_steering,
+        lane_lost_release,
+    )
+    LOG.info(
+        "safety fixed_speed=%s virtual_max_steer=%d virtual_speed_cap=%d virtual_warmup=%d virtual_blend=%.2f virtual_step=%d virtual_center_lock_scale=%.2f virtual_min_reliable=%d virtual_bootstrap_speed_cap=%d lane_lost_speed_cap=%d",
+        args.fixed_speed,
+        args.virtual_lane_max_steering,
+        args.virtual_lane_speed_cap,
+        args.virtual_lane_warmup_frames,
+        args.virtual_lane_steering_blend,
+        args.virtual_lane_max_steering_step,
+        args.virtual_lane_center_lock_scale,
+        args.virtual_lane_min_reliable_frames,
+        args.virtual_lane_bootstrap_speed_cap,
+        args.lane_lost_speed_cap,
+    )
+
+
+def _first_set(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    raise ValueError("at least one default value is required")
+
+
+class CommandSafetyFilter:
+    def __init__(self, args: argparse.Namespace):
+        self.fixed_speed = args.fixed_speed == "on"
+        self.fixed_speed_value = args.speed
+        self.virtual_lane_max_steering = args.virtual_lane_max_steering
+        self.virtual_lane_speed_cap = args.virtual_lane_speed_cap
+        self.virtual_lane_warmup_frames = args.virtual_lane_warmup_frames
+        self.virtual_lane_steering_blend = args.virtual_lane_steering_blend
+        self.virtual_lane_max_steering_step = args.virtual_lane_max_steering_step
+        self.virtual_lane_center_lock_scale = args.virtual_lane_center_lock_scale
+        self.virtual_lane_min_reliable_frames = args.virtual_lane_min_reliable_frames
+        self.virtual_lane_bootstrap_speed_cap = args.virtual_lane_bootstrap_speed_cap
+        self.lane_lost_speed_cap = args.lane_lost_speed_cap
+        self._last_reliable_command: Optional[ControlCommand] = None
+        self._last_filtered_command: Optional[ControlCommand] = None
+        self._virtual_frames = 0
+        self._reliable_frames = 0
+
+    def apply(
+        self,
+        mask_result: Optional[YoloLaneMask],
+        lane: LaneGeometry,
+        command: ControlCommand,
+        running: bool,
+    ) -> ControlCommand:
+        if not running:
+            self.reset()
+            return command
+
+        virtual = self._is_virtual_mask(mask_result)
+        if virtual:
+            self._virtual_frames += 1
+            guarded = self._guard_virtual_command(command)
+            self._last_filtered_command = guarded
+            return guarded
+
+        self._virtual_frames = 0
+        if not lane.found:
+            guarded = self._guard_lane_lost_command(command)
+            self._last_filtered_command = guarded
+            return guarded
+
+        guarded = self._force_fixed_speed(command)
+        self._reliable_frames += 1
+        self._last_reliable_command = guarded
+        self._last_filtered_command = guarded
+        return guarded
+
+    def reset(self) -> None:
+        self._last_reliable_command = None
+        self._last_filtered_command = None
+        self._virtual_frames = 0
+        self._reliable_frames = 0
+
+    def _guard_virtual_command(self, command: ControlCommand) -> ControlCommand:
+        if self._reliable_frames < self.virtual_lane_min_reliable_frames:
+            return self._guard_virtual_bootstrap_command(command)
+
+        reason = command.reason
+        command = self._scale_virtual_center_lock(command)
+        steering = command.steering
+        reason = command.reason
+        if (
+            self._last_reliable_command is not None
+            and self._virtual_frames <= self.virtual_lane_warmup_frames
+        ):
+            steering = self._last_reliable_command.steering
+            reason = self._append_reason(reason, "virtual_hold")
+        elif self._last_reliable_command is not None:
+            steering = self._blend_steering(self._last_reliable_command.steering, steering)
+            reason = self._append_reason(reason, "virtual_blend")
+        steering = self._limit_steering_step(steering)
+        steering = self._clip_abs(steering, self.virtual_lane_max_steering)
+        speed = self._cap_or_fix_speed(command.speed, self.virtual_lane_speed_cap)
+        return ControlCommand(
+            speed=speed,
+            steering=steering,
+            brake=command.brake,
+            reason=self._append_reason(reason, "virtual_cap"),
+        )
+
+    def _guard_virtual_bootstrap_command(self, command: ControlCommand) -> ControlCommand:
+        if self._last_reliable_command is None:
+            return ControlCommand.stop("virtual_bootstrap:no_reliable")
+        speed = self._cap_or_fix_speed(
+            min(command.speed, self._last_reliable_command.speed),
+            self.virtual_lane_bootstrap_speed_cap,
+        )
+        return ControlCommand(
+            speed=speed,
+            steering=self._last_reliable_command.steering,
+            brake=False,
+            reason=self._append_reason(command.reason, "virtual_bootstrap"),
+        )
+
+    def _scale_virtual_center_lock(self, command: ControlCommand) -> ControlCommand:
+        if "center_lock" not in command.reason:
+            return command
+        scale = max(0.0, min(1.0, float(self.virtual_lane_center_lock_scale)))
+        if scale >= 1.0:
+            return command
+        return ControlCommand(
+            speed=command.speed,
+            steering=int(round(command.steering * scale)),
+            brake=command.brake,
+            reason=self._append_reason(command.reason, "virtual_center_lock_scale"),
+        )
+
+    def _guard_lane_lost_command(self, command: ControlCommand) -> ControlCommand:
+        if command.brake:
+            return command
+        return ControlCommand(
+            speed=self._cap_or_fix_speed(command.speed, self.lane_lost_speed_cap),
+            steering=command.steering,
+            brake=command.brake,
+            reason=self._append_reason(command.reason, "lane_lost_speed_cap"),
+        )
+
+    def _force_fixed_speed(self, command: ControlCommand) -> ControlCommand:
+        if not self.fixed_speed or command.brake:
+            return command
+        return ControlCommand(
+            speed=self.fixed_speed_value,
+            steering=command.steering,
+            brake=command.brake,
+            reason=self._append_reason(command.reason, "fixed_speed"),
+        )
+
+    def _cap_or_fix_speed(self, speed: int, cap: int) -> int:
+        if self.fixed_speed:
+            return self.fixed_speed_value
+        return min(speed, cap)
+
+    def _blend_steering(self, reference: int, target: int) -> int:
+        blend = max(0.0, min(1.0, float(self.virtual_lane_steering_blend)))
+        return int(round(reference * (1.0 - blend) + target * blend))
+
+    def _limit_steering_step(self, steering: int) -> int:
+        if self._last_filtered_command is None or self.virtual_lane_max_steering_step <= 0:
+            return steering
+        previous = self._last_filtered_command.steering
+        delta = steering - previous
+        limit = self.virtual_lane_max_steering_step
+        if delta > limit:
+            return previous + limit
+        if delta < -limit:
+            return previous - limit
+        return steering
+
+    @staticmethod
+    def _is_virtual_mask(mask_result: Optional[YoloLaneMask]) -> bool:
+        if mask_result is None:
+            return False
+        return "virtual" in mask_result.class_name
+
+    @staticmethod
+    def _clip_abs(value: int, limit: int) -> int:
+        if limit <= 0:
+            return 0
+        return max(-limit, min(limit, int(value)))
+
+    @staticmethod
+    def _append_reason(reason: str, suffix: str) -> str:
+        return "%s:%s" % (reason, suffix) if reason else suffix
+
+
 def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="YOLOv8 segmentation autonomous driving runtime")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="trained YOLO segmentation model path")
     parser.add_argument("--device", default="auto", help="auto, mps, cpu, 0, cuda, ...")
     parser.add_argument("--conf", type=float, default=0.35, help="YOLO confidence threshold")
     parser.add_argument("--imgsz", type=int, default=640, help="YOLO inference image size")
+    parser.add_argument(
+        "--fallback-lane-width-ratio",
+        type=float,
+        default=YoloLaneConfig.fallback_lane_width_ratio,
+        help="image-width ratio used to create a virtual missing lane boundary; lower is safer when one lane line is missing",
+    )
     parser.add_argument("--camera", default="0", help="camera index or video path")
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
@@ -221,6 +491,12 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument("--ready-timeout", type=float, default=3.0)
     parser.add_argument("--no-serial", action="store_true", help="run without Arduino output")
     parser.add_argument("--speed", type=int, default=105)
+    parser.add_argument(
+        "--fixed-speed",
+        choices=("on", "off"),
+        default="off",
+        help="force every non-brake driving command to --speed after steering safety filters",
+    )
     parser.add_argument("--max-speed", type=int, default=170)
     parser.add_argument("--min-curve-speed", type=int, default=60)
     parser.add_argument("--max-steering", type=int, default=120)
@@ -232,6 +508,18 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument("--kp-heading", type=float, default=12.0)
     parser.add_argument("--kd-heading", type=float, default=4.0)
     parser.add_argument("--speed-curve-slowdown", type=int, default=70)
+    parser.add_argument(
+        "--lateral-priority-threshold",
+        type=float,
+        default=0.10,
+        help="ignore conflicting heading only when lateral error is above this threshold",
+    )
+    parser.add_argument(
+        "--curve-strength-alpha",
+        type=float,
+        default=0.35,
+        help="curve strength smoothing alpha; lower keeps curve state longer",
+    )
     parser.add_argument("--straight-steering-scale", type=float, default=0.45)
     parser.add_argument("--curve-steering-scale", type=float, default=1.45)
     parser.add_argument("--center-recovery-error-threshold", type=float, default=0.14)
@@ -240,16 +528,111 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument("--center-recovery-rate-limit", type=int, default=120)
     parser.add_argument("--center-recovery-max-speed", type=int, default=50)
     parser.add_argument(
+        "--center-lock",
+        choices=("on", "off"),
+        default="off",
+        help="force at least --center-lock-min-steering toward lane center when lateral error exceeds --center-lock-error-threshold",
+    )
+    parser.add_argument(
+        "--center-lock-error-threshold",
+        type=float,
+        default=0.05,
+        help="normalized lateral error that activates center-lock steering",
+    )
+    parser.add_argument(
+        "--center-lock-min-steering",
+        type=int,
+        default=90,
+        help="minimum absolute steering while center-lock is active",
+    )
+    parser.add_argument(
         "--lane-lost-hold-frames",
         type=int,
         default=20,
         help="keep the last steering/speed for up to this many frames when the lane is not detected (e.g. crosswalks) before stopping",
     )
+    parser.add_argument(
+        "--lane-lost-steering-release-rate-limit",
+        type=int,
+        default=None,
+        help="during lane-lost hold, release cached steering toward 0 by this many units/frame; default=max(min-steering-rate-limit, steering-release-rate-limit), 0 keeps the old cached steering",
+    )
+    parser.add_argument(
+        "--lane-lost-speed-cap",
+        type=int,
+        default=180,
+        help="cap speed while the planner is holding a lane-lost command",
+    )
+    parser.add_argument(
+        "--virtual-lane-max-steering",
+        type=int,
+        default=90,
+        help="cap absolute steering when YOLO uses a virtual lane fallback",
+    )
+    parser.add_argument(
+        "--virtual-lane-speed-cap",
+        type=int,
+        default=180,
+        help="cap speed when YOLO uses a virtual lane fallback",
+    )
+    parser.add_argument(
+        "--virtual-lane-warmup-frames",
+        type=int,
+        default=3,
+        help="for the first N consecutive virtual-lane frames, reuse the last reliable steering before applying the virtual cap",
+    )
+    parser.add_argument(
+        "--virtual-lane-steering-blend",
+        type=float,
+        default=0.20,
+        help="after warmup, blend virtual-lane steering with the last reliable steering. 0=ignore virtual steering, 1=trust raw virtual steering",
+    )
+    parser.add_argument(
+        "--virtual-lane-max-steering-step",
+        type=int,
+        default=20,
+        help="max steering change per frame while in virtual-lane fallback; 0 disables this guard",
+    )
+    parser.add_argument(
+        "--virtual-lane-center-lock-scale",
+        type=float,
+        default=0.25,
+        help="scale center-lock steering while using virtual-lane fallback; virtual lanes are guessed, so keep this below 1.0 for safety",
+    )
+    parser.add_argument(
+        "--virtual-lane-min-reliable-frames",
+        type=int,
+        default=3,
+        help="require this many real non-virtual lane frames before trusting virtual-lane steering; before that, hold the last reliable command",
+    )
+    parser.add_argument(
+        "--virtual-lane-bootstrap-speed-cap",
+        type=int,
+        default=150,
+        help="speed cap while virtual-lane steering is blocked because there are not enough reliable real-lane frames yet",
+    )
     # BEV lane pipeline (default on): warp the mask to bird's-eye view and fit the
     # road-following centerline there, same as scripts/bev_tune.py.
     parser.add_argument("--bev", dest="bev", action="store_true", default=True, help="use the BEV centerline pipeline (default)")
     parser.add_argument("--no-bev", dest="bev", action="store_false", help="use the legacy frame-plane lane estimator instead")
-    parser.add_argument("--bev-lookahead", type=float, default=BevLaneConfig.lookahead_y_ratio, help="BEV row ratio where lateral error is measured")
+    parser.add_argument(
+        "--bev-lookahead",
+        type=float,
+        default=None,
+        help="BEV row ratio where lateral error is measured; defaults to --lookahead when provided, otherwise BEV default",
+    )
+    parser.add_argument(
+        "--bev-sample-top",
+        type=float,
+        default=None,
+        help="BEV scan band top ratio; defaults to --sample-top when provided, otherwise BEV default",
+    )
+    parser.add_argument(
+        "--bev-sample-bottom",
+        type=float,
+        default=None,
+        help="BEV scan band bottom ratio; defaults to --sample-bottom when provided, otherwise BEV default",
+    )
     parser.add_argument(
         "--bev-center-smooth",
         type=float,
@@ -262,10 +645,27 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         default=BevLaneConfig.heading_smooth_alpha,
         help="BEV heading EMA factor (0..1). 1.0 = no smoothing, lower = smoother",
     )
+    parser.add_argument("--bev-heading-gain", type=float, default=BevLaneConfig.heading_gain)
+    parser.add_argument("--bev-num-samples", type=int, default=BevLaneConfig.num_samples)
     # Legacy frame-plane estimator params (used only with --no-bev).
-    parser.add_argument("--lookahead", type=float, default=0.72)
-    parser.add_argument("--sample-top", type=float, default=0.45)
-    parser.add_argument("--sample-bottom", type=float, default=0.92)
+    parser.add_argument(
+        "--lookahead",
+        type=float,
+        default=None,
+        help="lookahead row ratio. In BEV mode this is also used unless --bev-lookahead is set",
+    )
+    parser.add_argument(
+        "--sample-top",
+        type=float,
+        default=None,
+        help="sample band top ratio. In BEV mode this is also used unless --bev-sample-top is set",
+    )
+    parser.add_argument(
+        "--sample-bottom",
+        type=float,
+        default=None,
+        help="sample band bottom ratio. In BEV mode this is also used unless --bev-sample-bottom is set",
+    )
     parser.add_argument(
         "--vehicle-center-offset",
         type=float,

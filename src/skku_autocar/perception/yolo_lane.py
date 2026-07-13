@@ -23,7 +23,7 @@ class YoloLaneConfig:
         "driveable",
     )
     min_mask_area_ratio: float = 0.001
-    fallback_lane_width_ratio: float = 0.32
+    fallback_lane_width_ratio: float = 0.24
     min_lane_width_ratio: float = 0.12
     max_lane_width_ratio: float = 0.58
     lane_width_smooth_alpha: float = 0.35
