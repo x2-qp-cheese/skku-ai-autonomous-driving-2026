@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 from ..types import ControlCommand
 
@@ -16,10 +16,12 @@ class TrafficLightConfig:
     min_color_ratio: float = 0.01
     dominance_ratio: float = 1.35
     confirm_frames: int = 3
+    red_confirm_frames: Optional[int] = None
+    contact_confirm_frames: int = 2
+    contact_hold_frames: int = 5
     # Virtual front-contact line in frame coordinates. A confirmed RED is remembered
-    # as soon as it is seen, but braking starts only when the bottom of the light
-    # mask reaches this y ratio. This lets the car enter the approach section and
-    # stop at its near boundary instead of stopping at the first distant detection.
+    # as soon as it is seen, but braking starts only when the bottom of the supplied
+    # contact mask reaches this y ratio. The drive runtime supplies crosswalk masks.
     stop_line_y_ratio: float = 0.82
 
 
@@ -50,53 +52,87 @@ class TrafficLightController:
         self._pending = "unknown"
         self._pending_frames = 0
         self._stop_latched = False
+        self._previous_contact_bottom: Optional[float] = None
+        self._contact_crossing_armed = False
+        self._contact_above_frames = 0
+        self._contact_hold_frames = 0
 
-    def update(self, frame: Any, masks: Iterable[Any]) -> TrafficLightObservation:
+    def update(
+        self,
+        frame: Any,
+        masks: Iterable[Any],
+        contact_masks: Optional[Iterable[Any]] = None,
+    ) -> TrafficLightObservation:
         import cv2
         import numpy as np
 
-        union = None
-        for mask in masks:
-            layer = np.asarray(mask)
-            if layer.ndim == 3:
-                layer = layer[:, :, 0]
-            layer = layer > 0
-            union = layer if union is None else (union | layer)
+        union = self._union_masks(masks)
+        contact_union = union if contact_masks is None else self._union_masks(contact_masks)
+        detected = union is not None and bool(union.any())
+        candidate = "unknown"
+        red_pixels = 0
+        green_pixels = 0
+        mask_pixels = 0
 
-        if union is None or not bool(union.any()):
+        if not detected:
             self._reset_pending()
-            return TrafficLightObservation(
-                state=self.state,
-                stop_latched=self._stop_latched,
-            )
+        else:
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            hue = hsv[:, :, 0]
+            saturation = hsv[:, :, 1]
+            value = hsv[:, :, 2]
+            vivid = union & (saturation >= self.config.min_saturation) & (value >= self.config.min_value)
 
-        rows = np.flatnonzero(union.any(axis=1))
-        frame_height = int(union.shape[0])
-        denominator = max(1, frame_height - 1)
-        mask_bottom_y_ratio = float(rows[-1]) / float(denominator)
+            # OpenCV hue is 0..179. Red wraps around zero; green occupies roughly
+            # 35..95. Yellow is intentionally neither, so it cannot release RED.
+            red = vivid & ((hue <= 12) | (hue >= 168))
+            green = vivid & (hue >= 35) & (hue <= 95)
+            red_pixels = int(red.sum())
+            green_pixels = int(green.sum())
+            mask_pixels = int(union.sum())
+            candidate = self._candidate(red_pixels, green_pixels, mask_pixels)
+            self._advance(candidate)
 
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        hue = hsv[:, :, 0]
-        saturation = hsv[:, :, 1]
-        value = hsv[:, :, 2]
-        vivid = union & (saturation >= self.config.min_saturation) & (value >= self.config.min_value)
+        contact_detected = contact_union is not None and bool(contact_union.any())
+        mask_bottom_y_ratio = 0.0
+        threshold = min(1.0, max(0.0, self.config.stop_line_y_ratio))
+        crossed_contact_line = False
+        if contact_detected:
+            rows = np.flatnonzero(contact_union.any(axis=1))
+            denominator = max(1, int(contact_union.shape[0]) - 1)
+            mask_bottom_y_ratio = float(rows[-1]) / float(denominator)
+            if self._previous_contact_bottom is not None:
+                crossed_contact_line = self._previous_contact_bottom < threshold <= mask_bottom_y_ratio
+            if crossed_contact_line:
+                self._contact_crossing_armed = True
+                self._contact_above_frames = 1
+            elif self._contact_crossing_armed and mask_bottom_y_ratio >= threshold:
+                self._contact_above_frames += 1
+            elif mask_bottom_y_ratio < threshold:
+                self._contact_crossing_armed = False
+                self._contact_above_frames = 0
+            self._previous_contact_bottom = mask_bottom_y_ratio
+        else:
+            self._previous_contact_bottom = None
+            self._contact_crossing_armed = False
+            self._contact_above_frames = 0
 
-        # OpenCV hue is 0..179. Red wraps around zero; green occupies roughly
-        # 35..95. Yellow is intentionally neither, so it cannot release RED.
-        red = vivid & ((hue <= 12) | (hue >= 168))
-        green = vivid & (hue >= 35) & (hue <= 95)
-        red_pixels = int(red.sum())
-        green_pixels = int(green.sum())
-        mask_pixels = int(union.sum())
-        candidate = self._candidate(red_pixels, green_pixels, mask_pixels)
-        self._advance(candidate)
-        contact = mask_bottom_y_ratio >= min(1.0, max(0.0, self.config.stop_line_y_ratio))
+        if (
+            self._contact_crossing_armed
+            and self._contact_above_frames >= max(1, self.config.contact_confirm_frames)
+        ):
+            self._contact_hold_frames = max(1, self.config.contact_hold_frames)
+            self._contact_crossing_armed = False
+            self._contact_above_frames = 0
+        contact = self._contact_hold_frames > 0
+        if self._contact_hold_frames > 0:
+            self._contact_hold_frames -= 1
         if self.state == "green":
             self._stop_latched = False
         elif self.state == "red" and contact:
             self._stop_latched = True
         return TrafficLightObservation(
-            detected=True,
+            detected=detected,
             candidate=candidate,
             state=self.state,
             red_pixels=red_pixels,
@@ -106,6 +142,19 @@ class TrafficLightController:
             contact=contact,
             stop_latched=self._stop_latched,
         )
+
+    @staticmethod
+    def _union_masks(masks: Iterable[Any]) -> Any:
+        import numpy as np
+
+        union = None
+        for mask in masks:
+            layer = np.asarray(mask)
+            if layer.ndim == 3:
+                layer = layer[:, :, 0]
+            layer = layer > 0
+            union = layer if union is None else (union | layer)
+        return union
 
     def apply(self, command: ControlCommand, running: bool) -> ControlCommand:
         if running and self.state == "red" and self._stop_latched:
@@ -133,7 +182,10 @@ class TrafficLightController:
             self._pending_frames = 1
         else:
             self._pending_frames += 1
-        if self._pending_frames >= max(1, self.config.confirm_frames):
+        required_frames = self.config.confirm_frames
+        if candidate == "red" and self.config.red_confirm_frames is not None:
+            required_frames = self.config.red_confirm_frames
+        if self._pending_frames >= max(1, required_frames):
             self.state = candidate
             self._reset_pending()
 

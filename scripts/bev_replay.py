@@ -101,6 +101,8 @@ class ReplayPipeline:
                     crosswalk_lane_width_px=args.crosswalk_lane_width_px,
                     crosswalk_center_smooth_alpha=args.crosswalk_center_smooth,
                     crosswalk_max_center_jump_px=args.crosswalk_max_center_jump,
+                    crosswalk_option=args.crosswalk_option,
+                    crosswalk_right_offset_px=args.crosswalk_right_offset_px,
                     virtual_hold=args.virtual_hold == "on",
                     vehicle_width_px=args.vehicle_width_px,
                     virtual_hold_max_frames=args.virtual_hold_max_frames,
@@ -337,6 +339,12 @@ def parse_args(argv):
     parser.add_argument("--crosswalk-max-center-jump", type=float,
                         default=BevCorridorConfig.crosswalk_max_center_jump_px,
                         help="[--corridor] reject+coast a crosswalk frame whose center_x jumps more than this many BEV px")
+    parser.add_argument("--crosswalk-option", choices=("a", "b"),
+                        default=BevCorridorConfig.crosswalk_option,
+                        help="[--corridor] a=center-line virtual corridor, b=right-boundary fixed offset")
+    parser.add_argument("--crosswalk-right-offset-px", type=float,
+                        default=BevCorridorConfig.crosswalk_right_offset_px,
+                        help="[--corridor] option B target distance left of the detected right boundary")
     # [--corridor] vehicle-width virtual-lane hold: when all lane evidence is gone
     # and coasting is exhausted, hold a straight vehicle-width virtual lane and
     # keep the car centered instead of braking.

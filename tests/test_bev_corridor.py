@@ -71,6 +71,30 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
         self.assertTrue(outlier.reason.startswith("coast:center_jump"))
         self.assertEqual(estimator.last_class_name, "coast")
 
+    def test_crosswalk_option_b_follows_right_boundary_offset(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lane_width_px=60.0,
+                crosswalk_option="b",
+                crosswalk_right_offset_px=30.0,
+                center_smooth_alpha=1.0,
+                crosswalk_center_smooth_alpha=1.0,
+                vehicle_center_x_offset_ratio=0.0,
+            )
+        )
+
+        lane = estimator.estimate(BevClassMasks(
+            side=[line_mask(160)],
+            crosswalk=[crosswalk_mask()],
+            side_conf=1.0,
+            shape=(100, 200),
+        ))
+
+        self.assertTrue(lane.found)
+        self.assertAlmostEqual(lane.center_x, 131.5, delta=0.2)
+        self.assertEqual(lane.reason, "corridor_tier3")
+        self.assertEqual(estimator.last_class_name, "crosswalk-right-side-b")
+
 
 if __name__ == "__main__":
     unittest.main()

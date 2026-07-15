@@ -64,6 +64,9 @@ def run(args: argparse.Namespace) -> int:
             min_color_ratio=args.light_min_color_ratio,
             dominance_ratio=args.light_dominance_ratio,
             confirm_frames=args.light_confirm_frames,
+            red_confirm_frames=args.light_red_confirm_frames,
+            contact_confirm_frames=args.light_contact_confirm_frames,
+            contact_hold_frames=args.light_contact_hold_frames,
             stop_line_y_ratio=args.light_stop_line_y,
         )
     )
@@ -138,7 +141,12 @@ def run(args: argparse.Namespace) -> int:
             mask_result = corridor_mask_result(class_masks, corridor_estimator, frame.shape)
             planned_command = follower.plan(lane) if running else ControlCommand.stop("paused")
             command = command_filter.apply(mask_result, lane, planned_command, running)
-            light_observation = traffic_light.update(frame, light_masks)
+            stop_crosswalk_masks = (
+                class_masks.crosswalk
+                if class_masks.crosswalk_conf >= args.light_crosswalk_min_conf
+                else ()
+            )
+            light_observation = traffic_light.update(frame, light_masks, stop_crosswalk_masks)
             if args.traffic_light == "on":
                 command = traffic_light.apply(command, running)
 
@@ -210,6 +218,8 @@ def build_bev_corridor_config(args: argparse.Namespace) -> BevCorridorConfig:
         crosswalk_lane_width_px=args.corridor_crosswalk_lane_width_px,
         crosswalk_center_smooth_alpha=args.corridor_crosswalk_center_smooth,
         crosswalk_max_center_jump_px=args.corridor_crosswalk_max_center_jump,
+        crosswalk_option=args.corridor_crosswalk_option,
+        crosswalk_right_offset_px=args.corridor_crosswalk_right_offset_px,
     )
 
 
@@ -542,6 +552,30 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         help="compare red/green pixels inside YOLO 'light' masks and latch stop on red until green is confirmed",
     )
     parser.add_argument("--light-confirm-frames", type=int, default=TrafficLightConfig.confirm_frames)
+    parser.add_argument(
+        "--light-red-confirm-frames",
+        type=int,
+        default=TrafficLightConfig.red_confirm_frames,
+        help="red-only confirmation frames; defaults to --light-confirm-frames when omitted",
+    )
+    parser.add_argument(
+        "--light-crosswalk-min-conf",
+        type=float,
+        default=0.70,
+        help="minimum crosswalk confidence used for traffic-light stop contact",
+    )
+    parser.add_argument(
+        "--light-contact-hold-frames",
+        type=int,
+        default=TrafficLightConfig.contact_hold_frames,
+        help="frames to retain a crosswalk lower-edge crossing while waiting for confirmed red",
+    )
+    parser.add_argument(
+        "--light-contact-confirm-frames",
+        type=int,
+        default=TrafficLightConfig.contact_confirm_frames,
+        help="consecutive frames required below the stop line after the crosswalk lower edge crosses it",
+    )
     parser.add_argument("--light-min-saturation", type=int, default=TrafficLightConfig.min_saturation)
     parser.add_argument("--light-min-value", type=int, default=TrafficLightConfig.min_value)
     parser.add_argument("--light-min-color-pixels", type=int, default=TrafficLightConfig.min_color_pixels)
@@ -551,7 +585,7 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         "--light-stop-line-y",
         type=float,
         default=TrafficLightConfig.stop_line_y_ratio,
-        help="frame y ratio of the virtual vehicle/light contact line; confirmed RED brakes only when the light mask bottom reaches this line",
+        help="frame y ratio of the virtual crosswalk contact line; confirmed RED brakes when the crosswalk mask bottom reaches this line",
     )
     parser.add_argument("--camera", default="0", help="camera index or video path")
     parser.add_argument("--width", type=int, default=1280)
@@ -768,6 +802,18 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         help="[--bev-corridor] reject and coast a crosswalk frame whose center_x jumps more than this many BEV px",
     )
     parser.add_argument(
+        "--corridor-crosswalk-option",
+        choices=("a", "b"),
+        default=BevCorridorConfig.crosswalk_option,
+        help="[--bev-corridor] a=center-line virtual corridor, b=detected right boundary with fixed inward offset",
+    )
+    parser.add_argument(
+        "--corridor-crosswalk-right-offset-px",
+        type=float,
+        default=BevCorridorConfig.crosswalk_right_offset_px,
+        help="[--bev-corridor] option B target distance leftward from the detected right boundary in BEV pixels",
+    )
+    parser.add_argument(
         "--bev-lookahead",
         type=float,
         default=None,
@@ -972,7 +1018,7 @@ def draw_debug(
     cv2.line(display, (0, stop_y), (width - 1, stop_y), (0, 80, 255), 2)
     cv2.putText(
         display,
-        "LIGHT STOP CONTACT",
+        "CROSSWALK STOP CONTACT",
         (max(8, width - 270), max(22, stop_y - 8)),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.55,
@@ -1016,7 +1062,7 @@ def draw_debug(
     ]
     if light_observation is not None:
         lines.append(
-            "light=%s candidate=%s red=%d green=%d bottom=%.3f contact=%s stop=%s" % (
+            "light=%s candidate=%s red=%d green=%d crosswalk_bottom=%.3f contact=%s stop=%s" % (
                 light_observation.state.upper(),
                 light_observation.candidate,
                 light_observation.red_pixels,

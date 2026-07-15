@@ -109,6 +109,10 @@ class BevCorridorConfig:
     # driving keeps its responsive values.
     crosswalk_center_smooth_alpha: float = 0.15
     crosswalk_max_center_jump_px: float = 30.0
+    # Crosswalk option A follows the center line with a virtual right boundary.
+    # Option B follows a detected right boundary at a fixed inward BEV offset.
+    crosswalk_option: str = "a"
+    crosswalk_right_offset_px: float = 90.0
     # A real lane line is thin at every BEV row; rows spanning wider than this
     # (ratio of BEV width) are dropped from a single line's fit, so a stray wide
     # blob (e.g. a mislabeled crosswalk stripe leaking into center/side) can't
@@ -314,6 +318,18 @@ class BevCorridorLaneEstimator:
         vehicle_center_x: float,
         target_y: float,
     ):
+        # Crosswalk option B: the right boundary normally remains visible while
+        # zebra markings obscure the center line. Drive a fixed distance inward
+        # from that real boundary instead of caching the pre-crosswalk curve.
+        if self._crosswalk_active and self.config.crosswalk_option.lower() == "b":
+            right = self._select_crosswalk_right_side(side_fits, vehicle_center_x, target_y)
+            if right is not None:
+                offset_px = max(0.0, self.config.crosswalk_right_offset_px)
+                centerline = self._offset(right, -offset_px)
+                centerline["points"] = self._line_points(centerline)
+                left = self._offset(right, -2.0 * offset_px)
+                return centerline, left, right, 3, "crosswalk-right-side-b", bev.side_conf
+
         # Tier 1: center line + a real right-side line.
         if center_fit is not None and side_fits:
             center_x = self._x_at(center_fit, target_y)
@@ -393,6 +409,20 @@ class BevCorridorLaneEstimator:
             return None
         # Nearest line to the right of the center line = the boundary of our lane.
         return min(candidates, key=lambda item: item[0])[1]
+
+    def _select_crosswalk_right_side(
+        self,
+        side_fits: List[dict],
+        vehicle_center_x: float,
+        target_y: float,
+    ) -> Optional[dict]:
+        candidates = [
+            fit for fit in side_fits
+            if self._x_at(fit, target_y) >= vehicle_center_x
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda fit: self._x_at(fit, target_y))
 
     # ------------------------------------------------------------------
     # crosswalk detection
