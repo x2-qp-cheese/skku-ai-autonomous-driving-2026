@@ -50,10 +50,25 @@ class BevCorridorConfig:
     sample_bottom_y_ratio: float = 0.98
     num_samples: int = 24
     band_height_ratio: float = 0.02
+    # Quadratic. An S-curve (inflection) never appears whole in this low camera's
+    # BEV window -- only single left/right curves do -- so degree 2 is enough and
+    # is more rigid/stable on sparse dashed lines than a cubic. (Raise with
+    # --poly-degree only if a real S ever fits in one BEV frame.)
     poly_degree: int = 2
     min_line_area_ratio: float = 0.0003
 
-    vehicle_center_x_offset_ratio: float = 0.0
+    # The camera is mounted slightly left of the car's true centerline, so the
+    # true vehicle center sits a bit RIGHT of the frame center. Measured off the
+    # last good run (blue vehicle-axis marker at frame x-ratio ~0.585), so the
+    # lateral-error reference is width*(0.5 + 0.085). Positive = shift the vehicle
+    # center right (a centered road then reads as slightly left -> steers left).
+    # Tune with --vehicle-center-offset.
+    vehicle_center_x_offset_ratio: float = 0.085
+    # Where the driving centerline sits between the two lane boundaries:
+    # 0.0 = on the center line (innermost), 0.5 = midpoint (geometric center),
+    # 1.0 = on the outer side line. Raise above 0.5 if the car rides too far inside
+    # (toward the infield); lower it to hug the center line.
+    centerline_bias: float = 0.5
     heading_gain: float = 1.6
     center_smooth_alpha: float = 0.4
     heading_smooth_alpha: float = 0.4
@@ -61,6 +76,15 @@ class BevCorridorConfig:
     # The outer side line must sit at least this far right of the center line at
     # the lookahead row to be accepted as the right boundary.
     side_min_gap_px: float = 20.0
+
+    # Anchor the driving centerline on the (usually most reliable) center line,
+    # offset by half the SMOOTHED lane width, instead of the raw midpoint of the
+    # center and side lines. This keeps the centerline from inheriting the side
+    # line's frame-to-frame jitter and makes the tier-1 -> tier-2 transition
+    # seamless (both become center + W/2), removing a common source of the target
+    # point "jumping". False = raw midpoint (tracks the true width better but
+    # jitters more).
+    center_anchor: bool = True
 
     # Crosswalk handling. YOLO's crosswalk pixels are their own class, so they are
     # already kept out of the center/side line fits; a lane line partly covered by
@@ -73,6 +97,18 @@ class BevCorridorConfig:
     # last_crosswalk_visible flag, and the optional halt).
     crosswalk_halt: bool = False
     crosswalk_min_area_ratio: float = 0.02
+    # While a crosswalk is in view, the zebra stripes make the measured lane width
+    # unreliable, so build the corridor's virtual centerline from a FIXED lane
+    # width (BEV px between the center line and the outer side line) instead of the
+    # live-measured one.
+    crosswalk_lane_width_px: float = 155.0
+    # Keep following the real lanes through the crosswalk but
+    # damp the zebra/pedestrian jitter that swings the target -- smooth the center
+    # harder (lower alpha = laggier/steadier) and reject smaller center-x jumps
+    # (coast on the last good geometry) ONLY while a crosswalk is in view. Normal
+    # driving keeps its responsive values.
+    crosswalk_center_smooth_alpha: float = 0.15
+    crosswalk_max_center_jump_px: float = 30.0
     # A real lane line is thin at every BEV row; rows spanning wider than this
     # (ratio of BEV width) are dropped from a single line's fit, so a stray wide
     # blob (e.g. a mislabeled crosswalk stripe leaking into center/side) can't
@@ -90,6 +126,27 @@ class BevCorridorConfig:
     max_center_jump_px: float = 80.0
     max_coast_frames: int = 5
     coast_confidence_decay: float = 0.8
+
+    # Vehicle-width virtual-lane hold (last resort). When NO lane evidence is left
+    # (all tiers fail) and coasting on the last good geometry is exhausted, instead
+    # of immediately declaring the lane lost (which brakes the car), synthesize a
+    # straight virtual lane one vehicle-width wide and keep the car centered in it.
+    # The centerline is anchored on the last known lane center and eased back toward
+    # the vehicle axis so the car straightens out rather than freezing a mid-curve
+    # bias. It is held for at most virtual_hold_max_frames, after which the lane is
+    # truly lost (and the follower/safety layer stops the car). The reason/class name
+    # contains "virtual" so the drive-time safety guard caps its speed/steering.
+    virtual_hold: bool = True
+    # BEV pixel width of the car; the virtual lane boundaries are drawn at
+    # +/- vehicle_width_px/2 around the held center. Center-holding does not depend
+    # on this value (it only shapes the drawn corridor), so a rough estimate is fine.
+    vehicle_width_px: float = 120.0
+    virtual_hold_max_frames: int = 45
+    virtual_hold_confidence: float = 0.3
+    # Per-frame easing of the held center toward the vehicle axis (0 = freeze at the
+    # last lane center, 1 = snap straight to center). A small value straightens the
+    # car out gradually while blind.
+    virtual_hold_recenter_alpha: float = 0.05
 
 
 @dataclass
@@ -146,6 +203,14 @@ class BevCorridorLaneEstimator:
         self._last_raw_center_x: Optional[float] = None
         self._last_overlays: Tuple[list, list, list] = ([], [], [])
 
+        # Vehicle-width virtual-lane hold state.
+        self._virtual_hold_frames: int = 0
+        self._virtual_center_x: Optional[float] = None
+
+        # True while a crosswalk is in view: build the corridor from the fixed
+        # crosswalk_lane_width_px instead of the (zebra-contaminated) measured width.
+        self._crosswalk_active: bool = False
+
     # ------------------------------------------------------------------
     def estimate(self, bev: BevClassMasks) -> LaneGeometry:
         import numpy as np  # noqa: F401  (kept for import-cost parity / clarity)
@@ -173,6 +238,13 @@ class BevCorridorLaneEstimator:
             self._reset_temporal()
             return self._lost(bev.shape, "crosswalk")
 
+        # Through a crosswalk (not halting), build the virtual centerline from the
+        # fixed crosswalk_lane_width_px rather than the zebra-contaminated measured
+        # width, so the car stays centered on a stable guessed lane.
+        self._crosswalk_active = self.last_crosswalk_visible
+        if self._crosswalk_active:
+            self.last_lane_width_px = self.config.crosswalk_lane_width_px
+
         center_fit = self._fit_line(bev.center, bev.shape)
         side_fits = [f for f in (self._fit_line([m], bev.shape) for m in bev.side) if f]
 
@@ -192,6 +264,8 @@ class BevCorridorLaneEstimator:
             return self._coast_or_lost(bev.shape, "center_jump")
 
         self._coast_frames = 0
+        self._virtual_hold_frames = 0
+        self._virtual_center_x = None
         self._last_raw_center_x = raw_center_x
         self.last_class_name = class_name
         self.last_tier = tier
@@ -222,6 +296,7 @@ class BevCorridorLaneEstimator:
             heading_error=heading_error,
             confidence=confidence,
             reason="corridor_tier%d" % tier,
+            height=float(height),
         )
         self._last_lane = lane
         return lane
@@ -244,24 +319,38 @@ class BevCorridorLaneEstimator:
             center_x = self._x_at(center_fit, target_y)
             right = self._select_right_side(side_fits, center_x, target_y)
             if right is not None:
-                measured = self._x_at(right, target_y) - center_x
-                width_px = self._update_width(measured)
-                midline = self._midline(center_fit, right)
+                if self._crosswalk_active:
+                    # Through a crosswalk: trust the center line but build the
+                    # centerline from the fixed crosswalk width, not the measured
+                    # (zebra-contaminated) gap. Show the virtual boundary too.
+                    width_px = self.config.crosswalk_lane_width_px
+                    right_boundary = self._offset(center_fit, width_px)
+                    name = "crosswalk-virtual-center"
+                else:
+                    width_px = self._update_width(self._x_at(right, target_y) - center_x)
+                    # centerline = center line offset by half the smoothed width;
+                    # the real side line only refines the width (via _update_width)
+                    # so its jitter does not reach the centerline. Overlay still
+                    # shows the real detected side.
+                    right_boundary = self._offset(center_fit, width_px) if self.config.center_anchor else right
+                    name = "center+right-side"
+                midline = self._midline(center_fit, right_boundary)
                 if midline is not None:
-                    return midline, center_fit, right, 1, "center+right-side", bev.center_conf
+                    return midline, center_fit, right_boundary, 1, name, bev.center_conf
 
         # Tier 2: center line only -> virtual parallel right boundary.
         if center_fit is not None:
-            width_px = self._lane_width()
+            width_px = self._corridor_lane_width()
             right = self._offset(center_fit, width_px)
             midline = self._midline(center_fit, right)
             if midline is not None:
-                return midline, center_fit, right, 2, "center+virtual-right-side", bev.center_conf
+                name = "crosswalk-virtual-center" if self._crosswalk_active else "center+virtual-right-side"
+                return midline, center_fit, right, 2, name, bev.center_conf
 
         # Tier 3: side line only -> place the center line one lane width away.
         if side_fits:
             nearest = min(side_fits, key=lambda f: abs(self._x_at(f, target_y) - vehicle_center_x))
-            width_px = self._lane_width()
+            width_px = self._corridor_lane_width()
             side_x = self._x_at(nearest, target_y)
             if side_x >= vehicle_center_x:
                 # treat as the right boundary: center line is to its left.
@@ -387,7 +476,10 @@ class BevCorridorLaneEstimator:
         if y1 - y0 < 1.0:
             return None
         ys = np.linspace(y0, y1, self.config.num_samples)
-        xc = 0.5 * (np.polyval(a["fit"], ys) + np.polyval(b["fit"], ys))
+        # a = center/left boundary, b = outer/right boundary. bias 0.5 = midpoint;
+        # >0.5 pulls the driving line toward the outer line (less inside).
+        bias = self._clip(self.config.centerline_bias, 0.0, 1.0)
+        xc = (1.0 - bias) * np.polyval(a["fit"], ys) + bias * np.polyval(b["fit"], ys)
         degree = min(self.config.poly_degree, len(ys) - 1)
         fit = np.polyfit(ys, xc, degree)
         points = [(float(x), float(y)) for x, y in zip(xc, ys)]
@@ -429,6 +521,14 @@ class BevCorridorLaneEstimator:
             return self._lane_width_px
         return self.config.lane_width_px
 
+    def _corridor_lane_width(self) -> float:
+        """Lane width to build virtual boundaries from: a fixed value through a
+        crosswalk (zebra makes the measured width unreliable), else the remembered
+        one."""
+        if self._crosswalk_active:
+            return self.config.crosswalk_lane_width_px
+        return self._lane_width()
+
     def _update_width(self, measured: float) -> float:
         if not (self.config.min_lane_width_px <= measured <= self.config.max_lane_width_px):
             return self._lane_width()
@@ -455,32 +555,106 @@ class BevCorridorLaneEstimator:
     def _is_center_jump(self, raw_center_x: float) -> bool:
         if self._last_raw_center_x is None:
             return False
-        return abs(raw_center_x - self._last_raw_center_x) > self.config.max_center_jump_px
+        max_jump = (
+            self.config.crosswalk_max_center_jump_px
+            if self._crosswalk_active
+            else self.config.max_center_jump_px
+        )
+        return abs(raw_center_x - self._last_raw_center_x) > max_jump
 
     def _coast_or_lost(self, bev_shape: Tuple[int, int], reason: str) -> LaneGeometry:
         had_last = self._last_lane is not None
-        if not had_last or self._coast_frames >= self.config.max_coast_frames:
-            self._reset_temporal()
-            self.last_class_name = "none"
-            self.last_tier = 0
-            return self._lost(bev_shape, ("lost:%s" % reason) if had_last else reason)
+        # 1) Coast on the last good geometry for a few frames (momentary YOLO miss).
+        if had_last and self._coast_frames < self.config.max_coast_frames:
+            self._coast_frames += 1
+            prev = self._last_lane
+            self.last_class_name = "coast"
+            # keep the last good line visible while coasting.
+            self.last_centerline_bev, self.last_center_line_bev, self.last_right_line_bev = self._last_overlays
+            confidence = prev.confidence * (self.config.coast_confidence_decay ** self._coast_frames)
+            return LaneGeometry(
+                found=True,
+                center_x=prev.center_x,
+                vehicle_center_x=prev.vehicle_center_x,
+                target_y=prev.target_y,
+                lateral_error_px=prev.lateral_error_px,
+                lateral_error_norm=prev.lateral_error_norm,
+                heading_error=prev.heading_error,
+                confidence=self._clip(confidence, 0.0, 1.0),
+                reason="coast:%s(%d)" % (reason, self._coast_frames),
+                height=prev.height,
+            )
 
-        self._coast_frames += 1
-        prev = self._last_lane
-        self.last_class_name = "coast"
-        # keep the last good line visible while coasting.
-        self.last_centerline_bev, self.last_center_line_bev, self.last_right_line_bev = self._last_overlays
-        confidence = prev.confidence * (self.config.coast_confidence_decay ** self._coast_frames)
+        # 2) Coasting exhausted (or nothing was ever detected): hold a vehicle-width
+        # virtual lane and keep the car centered before giving up entirely.
+        if self.config.virtual_hold and self._virtual_hold_frames < self.config.virtual_hold_max_frames:
+            return self._virtual_hold_lane(bev_shape, reason)
+
+        # 3) Give up: the lane is truly lost.
+        self._reset_temporal()
+        self.last_class_name = "none"
+        self.last_tier = 0
+        return self._lost(bev_shape, ("lost:%s" % reason) if had_last else reason)
+
+    def _virtual_hold_lane(self, bev_shape: Tuple[int, int], reason: str) -> LaneGeometry:
+        """Last-resort fallback: no lane evidence remains, so build a straight
+        virtual lane one vehicle-width wide and keep the car centered in it.
+
+        The centerline is anchored on the last known lane center (falling back to
+        the vehicle axis when nothing was ever seen) and eased toward the vehicle
+        axis each frame, so the car straightens out gradually instead of freezing a
+        mid-curve steering bias. The lane is reported as found (low confidence) so
+        the follower keeps driving and re-centers; the "virtual" class name lets the
+        drive-time safety guard cap its speed/steering."""
+        import numpy as np
+
+        height, width = bev_shape
+        vehicle_center_x = self._vehicle_center_x(width)
+        target_y = height * self.config.lookahead_y_ratio
+
+        if self._virtual_center_x is None:
+            self._virtual_center_x = (
+                self._smoothed_center_x if self._smoothed_center_x is not None else vehicle_center_x
+            )
+        # Ease the held center back toward the vehicle axis so we straighten out.
+        alpha = self._clip(self.config.virtual_hold_recenter_alpha, 0.0, 1.0)
+        self._virtual_center_x = (1.0 - alpha) * self._virtual_center_x + alpha * vehicle_center_x
+        center_x = self._clip(self._virtual_center_x, 0.0, float(width - 1))
+        self._virtual_hold_frames += 1
+
+        # Straight vertical virtual lane centered on the hold: one vehicle-width
+        # wide normally, or one crosswalk-lane-width wide through a crosswalk.
+        lane_w = self.config.crosswalk_lane_width_px if self._crosswalk_active else self.config.vehicle_width_px
+        half = 0.5 * lane_w
+        top = height * self.config.sample_top_y_ratio
+        bottom = height * self.config.sample_bottom_y_ratio
+        ys = np.linspace(top, bottom, self.config.num_samples)
+        self.last_centerline_bev = [(center_x, float(y)) for y in ys]
+        self.last_center_line_bev = [(center_x - half, float(y)) for y in ys]
+        self.last_right_line_bev = [(center_x + half, float(y)) for y in ys]
+        self.last_class_name = "virtual-hold"
+        self.last_tier = 5
+        self.last_lane_width_px = self.config.vehicle_width_px
+
+        # Keep temporal state consistent so a recovered real frame transitions
+        # smoothly (gated/smoothed relative to the held center, not a stale one).
+        self._smoothed_center_x = center_x
+        self._last_raw_center_x = center_x
+        self._smoothed_heading = 0.0
+
+        lateral_error_px = center_x - vehicle_center_x
+        lateral_error_norm = self._clip(lateral_error_px / (width / 2.0), -1.0, 1.0)
         return LaneGeometry(
             found=True,
-            center_x=prev.center_x,
-            vehicle_center_x=prev.vehicle_center_x,
-            target_y=prev.target_y,
-            lateral_error_px=prev.lateral_error_px,
-            lateral_error_norm=prev.lateral_error_norm,
-            heading_error=prev.heading_error,
-            confidence=self._clip(confidence, 0.0, 1.0),
-            reason="coast:%s(%d)" % (reason, self._coast_frames),
+            center_x=center_x,
+            vehicle_center_x=vehicle_center_x,
+            target_y=target_y,
+            lateral_error_px=lateral_error_px,
+            lateral_error_norm=lateral_error_norm,
+            heading_error=0.0,
+            confidence=self._clip(self.config.virtual_hold_confidence, 0.0, 1.0),
+            reason="virtual_hold:%s(%d)" % (reason, self._virtual_hold_frames),
+            height=float(height),
         )
 
     def _reset_temporal(self) -> None:
@@ -490,9 +664,15 @@ class BevCorridorLaneEstimator:
         self._smoothed_center_x = None
         self._smoothed_heading = None
         self._last_overlays = ([], [], [])
+        self._virtual_hold_frames = 0
+        self._virtual_center_x = None
 
     def _smooth_center(self, value: float) -> float:
-        alpha = self.config.center_smooth_alpha
+        alpha = (
+            self.config.crosswalk_center_smooth_alpha
+            if self._crosswalk_active
+            else self.config.center_smooth_alpha
+        )
         if self._smoothed_center_x is None:
             self._smoothed_center_x = value
         else:
@@ -530,6 +710,7 @@ class BevCorridorLaneEstimator:
             heading_error=0.0,
             confidence=0.0,
             reason=reason,
+            height=float(height),
         )
 
     @staticmethod

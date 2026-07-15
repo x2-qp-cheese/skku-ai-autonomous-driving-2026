@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import sys
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -26,6 +27,13 @@ def find_arduino_port(explicit_port: Optional[str] = None) -> Optional[str]:
         raise RuntimeError("pyserial is required for Arduino serial control") from exc
 
     ports = list(list_ports.comports())
+    # macOS exposes the same USB serial device as both /dev/tty.* and /dev/cu.*.
+    # The cu device is the correct endpoint for an app initiating the connection;
+    # preferring it also avoids a lexicographic tie accidentally selecting tty.
+    if sys.platform == "darwin":
+        callout_ports = [port for port in ports if str(port.device).startswith("/dev/cu.")]
+        if callout_ports:
+            ports = callout_ports
     scored = []
     for port in ports:
         score = _score_port(port)

@@ -14,13 +14,16 @@
 camera frame
      |
      v
-YOLO segmentation
+YOLO per-class segmentation (center / side / lane / crosswalk / light)
      |
      v
-mask center geometry
+BEV warp + two-lane corridor geometry
      |
      v
 YOLO lane follower
+     |
+     v
+command safety + traffic-light latch
      |
      v
 ControlCommand
@@ -35,10 +38,15 @@ drive and steering motors
 ## Module Boundaries
 
 - `sensors`: hardware IO only. No mission decisions.
-- `perception`: runs the trained YOLO segmentation model and returns a mask.
-- `estimation`: converts the YOLO mask into target center, lateral error, and heading error.
+- `perception`: runs YOLO, preserves per-class masks, and classifies light color.
+- `estimation`: builds the BEV driving corridor and target geometry.
 - `planning`: chooses speed and steering from the YOLO-derived geometry.
 - `control`: serial protocol and actuator command formatting.
 - `firmware`: receives simple serial commands and applies them to motor pins.
 
 Keep calibration values in `configs/default.json`. Avoid burying threshold numbers inside mission code once real track tuning starts.
+
+The competition entrypoint is `scripts/drive.py`. Its lane pipeline is always the
+BEV corridor path; legacy frame-plane and single-mask runtime switches were removed
+to prevent launching the wrong controller on race day. `scripts/bev_tune.py` and
+`scripts/bev_replay.py` remain offline calibration/replay tools.

@@ -1,3 +1,1 @@
-from .lane import LaneDetectionResult, LaneDetector
-
-__all__ = ["LaneDetectionResult", "LaneDetector"]
+"""YOLO, BEV and traffic-light perception."""

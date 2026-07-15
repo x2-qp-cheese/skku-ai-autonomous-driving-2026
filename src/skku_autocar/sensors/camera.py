@@ -1,3 +1,4 @@
+import sys
 from typing import Any, Optional, Tuple
 
 from ..config import CameraConfig
@@ -10,7 +11,12 @@ class Camera:
 
     def open(self) -> None:
         cv2 = _load_cv2()
-        cap = cv2.VideoCapture(self.config.index)
+        if sys.platform == "darwin" and hasattr(cv2, "CAP_AVFOUNDATION"):
+            cap = cv2.VideoCapture(self.config.index, cv2.CAP_AVFOUNDATION)
+        elif sys.platform.startswith("win") and hasattr(cv2, "CAP_DSHOW"):
+            cap = cv2.VideoCapture(self.config.index, cv2.CAP_DSHOW)
+        else:
+            cap = cv2.VideoCapture(self.config.index)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
         if self.config.fourcc:

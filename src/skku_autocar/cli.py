@@ -4,15 +4,14 @@ from pathlib import Path
 
 from .config import load_config
 from .control.protocol import encode_command
-from .planning.lane_follower import LaneFollower
-from .types import ControlCommand, LaneEstimate
+from .types import ControlCommand
 
 
 def _dry_run(config_path: str) -> int:
     config = load_config(config_path)
-    follower = LaneFollower(config.control)
-    sample_lane = LaneEstimate(center_offset_norm=0.12, heading_error=0.0, confidence=0.9)
-    command = follower.plan(sample_lane)
+    # Config/protocol smoke test only. Competition driving lives in scripts/drive.py
+    # and the YOLO BEV-corridor runtime.
+    command = ControlCommand(speed=config.control.base_speed, steering=10, reason="dry_run")
     payload = {
         "config": str(Path(config_path)),
         "mission_mode": config.mission.mode,

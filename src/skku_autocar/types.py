@@ -10,23 +10,10 @@ class MissionMode(str, Enum):
 
 
 @dataclass(frozen=True)
-class LaneEstimate:
-    center_offset_norm: float = 0.0
-    heading_error: float = 0.0
-    confidence: float = 0.0
-
-
-@dataclass(frozen=True)
 class ObstacleEstimate:
     front_mm: Optional[float] = None
     left_mm: Optional[float] = None
     right_mm: Optional[float] = None
-
-
-@dataclass(frozen=True)
-class TrafficLightEstimate:
-    state: str = "unknown"
-    confidence: float = 0.0
 
 
 @dataclass(frozen=True)

@@ -17,18 +17,48 @@ class BevConfig:
     scripts/bev_tune.py and paste the result here (or into configs).
     """
 
-    # Tuned on data/raw/20260709_120821_raw.mp4 (1280x720, low car-mounted cam).
-    # Symmetric about x=0.5 so the vehicle forward axis maps to the BEV center;
-    # top edge sits just below the road vanishing point (~y=0.45) for lookahead,
-    # bottom edge spans the full near-field ground just above the car body.
-    src_top_left: Tuple[float, float] = (0.20, 0.40)
-    src_top_right: Tuple[float, float] = (0.80, 0.40)
-    src_bottom_right: Tuple[float, float] = (1.00, 0.88)
-    src_bottom_left: Tuple[float, float] = (0.00, 0.88)
+    # Tuned on data/raw/20260714.mp4 (1280x720, final low/forward car-mounted cam).
+    # Symmetric about x=0.5 so the vehicle forward axis maps to the BEV center.
+    #
+    # WHY THESE VALUES (and what to change if the BEV mask looks wrong):
+    #  - src_top_y (0.52): how far ahead the top edge reaches. The closer it is to
+    #    the road's vanishing point (smaller y, higher up), the more the far field
+    #    is magnified -- i.e. "the top of the BEV balloons / gets wider". It was
+    #    0.45 (right at the track's far edge) which over-magnified the far slab;
+    #    0.52 stops mapping that extreme-far strip. RAISE this value to shrink the
+    #    ballooning (costs forward lookahead); LOWER it to see farther.
+    #  - top width vs bottom width sets where the trapezoid's left/right sides meet
+    #    (the vanishing point). If lane lines FAN OUT toward the top in the BEV
+    #    (width not uniform), the top edge is too narrow for the true perspective ->
+    #    widen it (raise src_top_left toward 0.5 less / spread the top x's); if they
+    #    PINCH inward at the top, narrow the top edge. Goal: a straight lane's two
+    #    lines are vertical and equal-width top-to-bottom.
+    #  - bottom edge kept inside the frame (0.0 .. 1.0): sampling past the frame
+    #    (was -0.10 .. 1.10) only pulls in out-of-frame black.
+    #  - The black side wedges are dst_x_margin (curve room), not a mapping error;
+    #    lower dst_x_margin to shrink them at the cost of less room for curves.
+    #
+    # Re-tune per camera with scripts/bev_tune.py or scripts/bev_replay.py --bev-*
+    # (press 'p' in bev_replay to print ratios), then paste the result here.
+    #
+    # Previous values: this (low) cam earlier used top y=0.45 w=0.36, bottom
+    # -0.10/1.10; the higher 20260709 cam used top (0.20,0.40)/(0.80,0.40), bottom
+    # (0.00,0.88)/(1.00,0.88).
+    src_top_left: Tuple[float, float] = (0.30, 0.52)
+    src_top_right: Tuple[float, float] = (0.70, 0.52)
+    src_bottom_right: Tuple[float, float] = (1.00, 1.00)
+    src_bottom_left: Tuple[float, float] = (0.00, 1.00)
 
-    # Output BEV canvas size in pixels.
+    # Output BEV canvas size in pixels. Kept square (was 480x640): a canvas taller
+    # than it is wide over-stretches the forward (y) axis, so a curve's dx/dy --
+    # which drives the heading/curvature estimate -- reads weaker and the car
+    # under-reacts to curves. Lateral error and forward lookahead coverage do NOT
+    # depend on height (only on out_width / dst_x_margin), and shortening the canvas
+    # does not clip curves (clipping is horizontal), so a shorter canvas simply
+    # strengthens the curve signal. Tune per taste with --bev-out-height; if curves
+    # over-steer after this, soften --bev-heading-gain.
     out_width: int = 480
-    out_height: int = 640
+    out_height: int = 480
 
     # Horizontal margin (ratio of out_width) that the src trapezoid maps to,
     # leaving room on both sides for lanes that bend outward.

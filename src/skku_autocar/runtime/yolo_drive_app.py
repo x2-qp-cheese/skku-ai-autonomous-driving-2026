@@ -10,9 +10,9 @@ from typing import Any, Optional
 
 from ..control.serial_vehicle import SerialVehicleClient, SerialVehicleConfig
 from ..estimation.bev_corridor import BevCorridorConfig, BevCorridorLaneEstimator, warp_class_masks
-from ..estimation.bev_lane import BevLaneConfig, BevLaneGeometryEstimator
-from ..estimation.lane_geometry import LaneGeometry, LaneGeometryConfig, MaskLaneGeometryEstimator
+from ..estimation.lane_geometry import LaneGeometry
 from ..perception.bev import BevConfig, BevTransformer
+from ..perception.traffic_light import TrafficLightConfig, TrafficLightController, TrafficLightObservation
 from ..perception.yolo_lane import YoloClassMasks, YoloLaneConfig, YoloLaneMask, YoloLaneSegmenter
 from ..planning.yolo_lane_follower import YoloLaneFollower, YoloLaneFollowerConfig
 from ..types import ControlCommand
@@ -46,29 +46,27 @@ def run(args: argparse.Namespace) -> int:
             confidence=args.conf,
             image_size=args.imgsz,
             device=args.device,
-            fallback_lane_width_ratio=args.fallback_lane_width_ratio,
         )
     )
-    legacy_lane_config = build_legacy_lane_config(args)
-    estimator = MaskLaneGeometryEstimator(legacy_lane_config)
-    # BEV lane pipeline (same logic as scripts/bev_tune.py / bev_replay.py):
-    # warp the YOLO mask to bird's-eye view, then fit the road-following
-    # centerline there so the target direction respects road curvature.
-    # --bev-corridor (Plan A) warps per-class masks first and builds the corridor
-    # in BEV instead of frame space; it needs the same transformer.
-    transformer = BevTransformer(BevConfig()) if (args.bev or args.bev_corridor) else None
-    bev_lane_config = build_bev_lane_config(args) if args.bev else None
-    bev_estimator = (
-        BevLaneGeometryEstimator(bev_lane_config)
-        if args.bev
-        else None
-    )
-    corridor_estimator = (
-        BevCorridorLaneEstimator(build_bev_corridor_config(args)) if args.bev_corridor else None
-    )
+    # The competition runtime has one lane path: per-class YOLO masks are warped
+    # into BEV first, then the two-lane corridor is resolved there.
+    transformer = BevTransformer(BevConfig())
+    corridor_config = build_bev_corridor_config(args)
+    corridor_estimator = BevCorridorLaneEstimator(corridor_config)
     follower_config = build_follower_config(args)
     follower = YoloLaneFollower(follower_config)
     command_filter = CommandSafetyFilter(args)
+    traffic_light = TrafficLightController(
+        TrafficLightConfig(
+            min_saturation=args.light_min_saturation,
+            min_value=args.light_min_value,
+            min_color_pixels=args.light_min_color_pixels,
+            min_color_ratio=args.light_min_color_ratio,
+            dominance_ratio=args.light_dominance_ratio,
+            confirm_frames=args.light_confirm_frames,
+            stop_line_y_ratio=args.light_stop_line_y,
+        )
+    )
 
     vehicle = None
     if not args.no_serial:
@@ -104,7 +102,7 @@ def run(args: argparse.Namespace) -> int:
     command = ControlCommand.stop("paused")
 
     LOG.info("model=%s device=%s camera=%s", model_path, segmenter.device, args.camera)
-    log_effective_config(args, bev_lane_config, legacy_lane_config, follower_config)
+    log_effective_config(args, corridor_config, follower_config)
     if recorder.enabled:
         LOG.info("recording raw video: %s", recorder.raw_video_path)
         if recorder.debug_video_path is not None:
@@ -131,27 +129,29 @@ def run(args: argparse.Namespace) -> int:
             last_frame_at = now
 
             bev_mask = None
-            if corridor_estimator is not None:
-                class_masks = segmenter.segment_class_masks(frame)
-                bev = warp_class_masks(transformer, class_masks)
-                lane = corridor_estimator.estimate(bev)
-                bev_mask = fuse_masks([*bev.center, *bev.side, *bev.lane, *bev.crosswalk])
-                mask_result = corridor_mask_result(class_masks, corridor_estimator, frame.shape)
-            else:
-                mask_result = segmenter.segment(frame)
-                if transformer is not None:
-                    bev_mask = transformer.warp_mask(mask_result.mask) if mask_result else None
-                    lane = bev_estimator.estimate(bev_mask)
-                else:
-                    lane = estimator.estimate(mask_result.mask if mask_result else None, frame.shape)
+            light_masks = ()
+            class_masks = segmenter.segment_class_masks(frame)
+            light_masks = class_masks.light
+            bev = warp_class_masks(transformer, class_masks)
+            lane = corridor_estimator.estimate(bev)
+            bev_mask = fuse_masks([*bev.center, *bev.side, *bev.lane, *bev.crosswalk])
+            mask_result = corridor_mask_result(class_masks, corridor_estimator, frame.shape)
             planned_command = follower.plan(lane) if running else ControlCommand.stop("paused")
             command = command_filter.apply(mask_result, lane, planned_command, running)
+            light_observation = traffic_light.update(frame, light_masks)
+            if args.traffic_light == "on":
+                command = traffic_light.apply(command, running)
 
             if vehicle is not None and now - last_command_at >= 1.0 / args.command_rate:
                 vehicle.send(command)
                 last_command_at = now
 
-            display = draw_debug(cv2, frame, mask_result, lane, command, running, fps, transformer, bev_estimator or corridor_estimator)
+            display = draw_debug(
+                cv2, frame, mask_result, lane, command, running, fps,
+                transformer, corridor_estimator,
+                light_masks, light_observation,
+                args.light_stop_line_y,
+            )
             recorder.write(frame, display)
             cv2.imshow("YOLO Drive", display)
             if args.show_mask:
@@ -189,30 +189,6 @@ def run(args: argparse.Namespace) -> int:
     return 0
 
 
-def build_legacy_lane_config(args: argparse.Namespace) -> LaneGeometryConfig:
-    defaults = LaneGeometryConfig()
-    return LaneGeometryConfig(
-        lookahead_y_ratio=_first_set(args.lookahead, defaults.lookahead_y_ratio),
-        sample_top_y_ratio=_first_set(args.sample_top, defaults.sample_top_y_ratio),
-        sample_bottom_y_ratio=_first_set(args.sample_bottom, defaults.sample_bottom_y_ratio),
-        vehicle_center_x_offset_ratio=args.vehicle_center_offset,
-    )
-
-
-def build_bev_lane_config(args: argparse.Namespace) -> BevLaneConfig:
-    defaults = BevLaneConfig()
-    return BevLaneConfig(
-        lookahead_y_ratio=_first_set(args.bev_lookahead, args.lookahead, defaults.lookahead_y_ratio),
-        sample_top_y_ratio=_first_set(args.bev_sample_top, args.sample_top, defaults.sample_top_y_ratio),
-        sample_bottom_y_ratio=_first_set(args.bev_sample_bottom, args.sample_bottom, defaults.sample_bottom_y_ratio),
-        num_samples=args.bev_num_samples,
-        vehicle_center_x_offset_ratio=args.vehicle_center_offset,
-        heading_gain=args.bev_heading_gain,
-        center_smooth_alpha=args.bev_center_smooth,
-        heading_smooth_alpha=args.bev_heading_smooth,
-    )
-
-
 def build_bev_corridor_config(args: argparse.Namespace) -> BevCorridorConfig:
     defaults = BevCorridorConfig()
     return BevCorridorConfig(
@@ -222,6 +198,18 @@ def build_bev_corridor_config(args: argparse.Namespace) -> BevCorridorConfig:
         heading_gain=args.bev_heading_gain,
         center_smooth_alpha=args.bev_center_smooth,
         heading_smooth_alpha=args.bev_heading_smooth,
+        center_anchor=args.corridor_center_anchor == "on",
+        max_center_jump_px=args.corridor_max_center_jump,
+        max_coast_frames=args.corridor_max_coast_frames,
+        max_width_jump_px=args.corridor_max_width_jump,
+        crosswalk_halt=args.crosswalk_halt == "on",
+        virtual_hold=args.corridor_virtual_hold == "on",
+        vehicle_width_px=args.corridor_vehicle_width_px,
+        poly_degree=args.corridor_poly_degree,
+        centerline_bias=args.corridor_centerline_bias,
+        crosswalk_lane_width_px=args.corridor_crosswalk_lane_width_px,
+        crosswalk_center_smooth_alpha=args.corridor_crosswalk_center_smooth,
+        crosswalk_max_center_jump_px=args.corridor_crosswalk_max_center_jump,
     )
 
 
@@ -243,13 +231,26 @@ def corridor_mask_result(
 ) -> Optional[YoloLaneMask]:
     """Wrap the corridor result as a YoloLaneMask so the existing safety filter,
     overlay and logging keep working unchanged. The class_name carries the
-    corridor tier's name (which contains "virtual" on tiers 2/3), so
-    CommandSafetyFilter's virtual-lane guard still triggers."""
-    if not class_masks.found:
-        return None
-    frame_mask = fuse_masks([*class_masks.center, *class_masks.side, *class_masks.lane, *class_masks.crosswalk])
+    corridor tier's name (which contains "virtual" on tiers 2/3 and on the
+    vehicle-width virtual-hold fallback), so CommandSafetyFilter's virtual-lane
+    guard still triggers.
+
+    When YOLO detects nothing this frame but the estimator is holding a
+    virtual-width lane (found=True downstream), we still emit a wrapper carrying
+    the "virtual" name over an all-zero mask -- otherwise mask_result would be None
+    and the safety filter would treat the guessed lane as a fully reliable real
+    lane (no speed/steering cap)."""
+    import numpy as np
+
+    name = estimator.last_class_name
+    frame_mask = None
+    if class_masks.found:
+        frame_mask = fuse_masks([*class_masks.center, *class_masks.side, *class_masks.lane, *class_masks.crosswalk])
     if frame_mask is None:
-        return None
+        if "virtual" not in name:
+            return None
+        height, width = frame_shape[:2]
+        frame_mask = np.zeros((height, width), dtype=np.uint8)
     conf = class_masks.center_conf or class_masks.side_conf or class_masks.lane_conf or class_masks.crosswalk_conf
     return YoloLaneMask(
         mask=frame_mask,
@@ -289,34 +290,27 @@ def build_follower_config(args: argparse.Namespace) -> YoloLaneFollowerConfig:
         center_lock_min_steering=args.center_lock_min_steering,
         lane_lost_hold_frames=args.lane_lost_hold_frames,
         lane_lost_steering_release_rate_limit=args.lane_lost_steering_release_rate_limit,
+        pure_pursuit=args.pure_pursuit,
+        pure_pursuit_gain=args.pp_gain,
+        pure_pursuit_full_angle=args.pp_full_angle,
     )
 
 
 def log_effective_config(
     args: argparse.Namespace,
-    bev_lane_config: Optional[BevLaneConfig],
-    legacy_lane_config: LaneGeometryConfig,
+    corridor_config: BevCorridorConfig,
     follower_config: YoloLaneFollowerConfig,
 ) -> None:
-    if args.bev and bev_lane_config is not None:
-        LOG.info(
-            "lane pipeline=bev lookahead=%.2f sample=%.2f..%.2f vehicle_offset=%.3f center_smooth=%.2f heading_smooth=%.2f heading_gain=%.2f",
-            bev_lane_config.lookahead_y_ratio,
-            bev_lane_config.sample_top_y_ratio,
-            bev_lane_config.sample_bottom_y_ratio,
-            bev_lane_config.vehicle_center_x_offset_ratio,
-            bev_lane_config.center_smooth_alpha,
-            bev_lane_config.heading_smooth_alpha,
-            bev_lane_config.heading_gain,
-        )
-    else:
-        LOG.info(
-            "lane pipeline=legacy lookahead=%.2f sample=%.2f..%.2f vehicle_offset=%.3f",
-            legacy_lane_config.lookahead_y_ratio,
-            legacy_lane_config.sample_top_y_ratio,
-            legacy_lane_config.sample_bottom_y_ratio,
-            legacy_lane_config.vehicle_center_x_offset_ratio,
-        )
+    LOG.info(
+        "lane pipeline=bev-corridor lookahead=%.2f sample=%.2f..%.2f vehicle_offset=%.3f center_smooth=%.2f heading_smooth=%.2f heading_gain=%.2f",
+        corridor_config.lookahead_y_ratio,
+        corridor_config.sample_top_y_ratio,
+        corridor_config.sample_bottom_y_ratio,
+        corridor_config.vehicle_center_x_offset_ratio,
+        corridor_config.center_smooth_alpha,
+        corridor_config.heading_smooth_alpha,
+        corridor_config.heading_gain,
+    )
 
     lane_lost_release = follower_config.lane_lost_steering_release_rate_limit
     if lane_lost_release is None:
@@ -355,6 +349,12 @@ def log_effective_config(
         args.virtual_lane_min_reliable_frames,
         args.virtual_lane_bootstrap_speed_cap,
         args.lane_lost_speed_cap,
+    )
+    LOG.info(
+        "traffic_light=%s confirm_frames=%d stop_line_y=%.3f",
+        args.traffic_light,
+        args.light_confirm_frames,
+        args.light_stop_line_y,
     )
 
 
@@ -538,10 +538,20 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument("--conf", type=float, default=0.35, help="YOLO confidence threshold")
     parser.add_argument("--imgsz", type=int, default=640, help="YOLO inference image size")
     parser.add_argument(
-        "--fallback-lane-width-ratio",
+        "--traffic-light", choices=("on", "off"), default="on",
+        help="compare red/green pixels inside YOLO 'light' masks and latch stop on red until green is confirmed",
+    )
+    parser.add_argument("--light-confirm-frames", type=int, default=TrafficLightConfig.confirm_frames)
+    parser.add_argument("--light-min-saturation", type=int, default=TrafficLightConfig.min_saturation)
+    parser.add_argument("--light-min-value", type=int, default=TrafficLightConfig.min_value)
+    parser.add_argument("--light-min-color-pixels", type=int, default=TrafficLightConfig.min_color_pixels)
+    parser.add_argument("--light-min-color-ratio", type=float, default=TrafficLightConfig.min_color_ratio)
+    parser.add_argument("--light-dominance-ratio", type=float, default=TrafficLightConfig.dominance_ratio)
+    parser.add_argument(
+        "--light-stop-line-y",
         type=float,
-        default=YoloLaneConfig.fallback_lane_width_ratio,
-        help="image-width ratio used to create a virtual missing lane boundary; lower is safer when one lane line is missing",
+        default=TrafficLightConfig.stop_line_y_ratio,
+        help="frame y ratio of the virtual vehicle/light contact line; confirmed RED brakes only when the light mask bottom reaches this line",
     )
     parser.add_argument("--camera", default="0", help="camera index or video path")
     parser.add_argument("--width", type=int, default=1280)
@@ -672,19 +682,12 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         default=150,
         help="speed cap while virtual-lane steering is blocked because there are not enough reliable real-lane frames yet",
     )
-    # BEV lane pipeline (default on): warp the mask to bird's-eye view and fit the
-    # road-following centerline there, same as scripts/bev_tune.py.
-    parser.add_argument("--bev", dest="bev", action="store_true", default=True, help="use the BEV centerline pipeline (default)")
-    parser.add_argument("--no-bev", dest="bev", action="store_false", help="use the legacy frame-plane lane estimator instead")
-    # Plan A: build the corridor in BEV from per-class masks instead of frame space.
-    # When on, it takes over the lane stage (the frame-space corridor and the
-    # plain --bev estimator are bypassed).
+    # Compatibility no-op for existing launch commands. BEV corridor is now the
+    # only competition runtime pipeline and is always enabled.
     parser.add_argument(
         "--bev-corridor",
-        dest="bev_corridor",
         action="store_true",
-        default=False,
-        help="use the BEV corridor pipeline (Plan A): warp per-class masks first, fit center/side lines and build the corridor in BEV",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--corridor-lane-width-px",
@@ -693,61 +696,124 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         help="[--bev-corridor] BEV lane width (px) between the center line and the outer side line; measure once with scripts/bev_replay.py --corridor",
     )
     parser.add_argument(
+        "--corridor-center-anchor",
+        choices=("on", "off"),
+        default="on",
+        help="[--bev-corridor] anchor the centerline on the center line + half smoothed width (less jitter, seamless tier1<->tier2); off = raw midpoint of center/side",
+    )
+    parser.add_argument(
+        "--corridor-max-center-jump",
+        type=float,
+        default=BevCorridorConfig.max_center_jump_px,
+        help="[--bev-corridor] reject and coast a frame whose lookahead center_x jumps more than this many BEV px (lower = smoother, more likely to briefly coast on real fast curves)",
+    )
+    parser.add_argument(
+        "--corridor-max-coast-frames",
+        type=int,
+        default=BevCorridorConfig.max_coast_frames,
+        help="[--bev-corridor] hold the last good geometry for at most this many rejected frames before declaring the lane lost",
+    )
+    parser.add_argument(
+        "--corridor-max-width-jump",
+        type=float,
+        default=BevCorridorConfig.max_width_jump_px,
+        help="[--bev-corridor] reject a measured lane width that jumps more than this many px from the current smoothed value",
+    )
+    parser.add_argument(
+        "--crosswalk-halt",
+        choices=("on", "off"),
+        default="off",
+        help="[--bev-corridor] stop at a crosswalk (traffic-light mission) instead of following the visible lanes through it",
+    )
+    parser.add_argument(
+        "--corridor-virtual-hold",
+        choices=("on", "off"),
+        default="on",
+        help="[--bev-corridor] when the lane is fully lost, hold a vehicle-width virtual lane and keep centered (guarded by the virtual-lane safety caps) instead of braking immediately",
+    )
+    parser.add_argument(
+        "--corridor-vehicle-width-px",
+        type=float,
+        default=BevCorridorConfig.vehicle_width_px,
+        help="[--bev-corridor] BEV pixel width of the car, used as the virtual-lane width while holding",
+    )
+    parser.add_argument(
+        "--corridor-poly-degree",
+        type=int,
+        default=BevCorridorConfig.poly_degree,
+        help="[--bev-corridor] polynomial degree for the BEV line/centerline fit (3 = follows S-curves; 2 = smoother on straights)",
+    )
+    parser.add_argument(
+        "--corridor-centerline-bias",
+        type=float,
+        default=BevCorridorConfig.centerline_bias,
+        help="[--bev-corridor] driving line position between boundaries: 0=center line, 0.5=midpoint, 1=outer side line. Raise if the car rides too far inside",
+    )
+    parser.add_argument(
+        "--corridor-crosswalk-lane-width-px",
+        type=float,
+        default=BevCorridorConfig.crosswalk_lane_width_px,
+        help="[--bev-corridor] fixed BEV lane width used to build the virtual centerline while a crosswalk is in view (zebra makes the measured width unreliable)",
+    )
+    parser.add_argument(
+        "--corridor-crosswalk-center-smooth",
+        type=float,
+        default=BevCorridorConfig.crosswalk_center_smooth_alpha,
+        help="[--bev-corridor] center-x EMA factor while a crosswalk is visible (lower = steadier)",
+    )
+    parser.add_argument(
+        "--corridor-crosswalk-max-center-jump",
+        type=float,
+        default=BevCorridorConfig.crosswalk_max_center_jump_px,
+        help="[--bev-corridor] reject and coast a crosswalk frame whose center_x jumps more than this many BEV px",
+    )
+    parser.add_argument(
         "--bev-lookahead",
         type=float,
         default=None,
         help="BEV row ratio where lateral error is measured; defaults to --lookahead when provided, otherwise BEV default",
     )
     parser.add_argument(
-        "--bev-sample-top",
-        type=float,
-        default=None,
-        help="BEV scan band top ratio; defaults to --sample-top when provided, otherwise BEV default",
-    )
-    parser.add_argument(
-        "--bev-sample-bottom",
-        type=float,
-        default=None,
-        help="BEV scan band bottom ratio; defaults to --sample-bottom when provided, otherwise BEV default",
-    )
-    parser.add_argument(
         "--bev-center-smooth",
         type=float,
-        default=BevLaneConfig.center_smooth_alpha,
+        default=BevCorridorConfig.center_smooth_alpha,
         help="BEV lane-center EMA factor (0..1). 1.0 = no smoothing (target dot sits on the raw line, fast/jittery), lower = smoother/laggier",
     )
     parser.add_argument(
         "--bev-heading-smooth",
         type=float,
-        default=BevLaneConfig.heading_smooth_alpha,
+        default=BevCorridorConfig.heading_smooth_alpha,
         help="BEV heading EMA factor (0..1). 1.0 = no smoothing, lower = smoother",
     )
-    parser.add_argument("--bev-heading-gain", type=float, default=BevLaneConfig.heading_gain)
-    parser.add_argument("--bev-num-samples", type=int, default=BevLaneConfig.num_samples)
-    # Legacy frame-plane estimator params (used only with --no-bev).
+    parser.add_argument("--bev-heading-gain", type=float, default=BevCorridorConfig.heading_gain)
     parser.add_argument(
         "--lookahead",
         type=float,
         default=None,
-        help="lookahead row ratio. In BEV mode this is also used unless --bev-lookahead is set",
-    )
-    parser.add_argument(
-        "--sample-top",
-        type=float,
-        default=None,
-        help="sample band top ratio. In BEV mode this is also used unless --bev-sample-top is set",
-    )
-    parser.add_argument(
-        "--sample-bottom",
-        type=float,
-        default=None,
-        help="sample band bottom ratio. In BEV mode this is also used unless --bev-sample-bottom is set",
+        help="compatibility alias for --bev-lookahead",
     )
     parser.add_argument(
         "--vehicle-center-offset",
         type=float,
-        default=0.0,
-        help="vehicle center x offset as frame width ratio; positive makes centered targets steer left",
+        default=BevCorridorConfig.vehicle_center_x_offset_ratio,
+        help="vehicle center x offset as frame width ratio; positive shifts the vehicle center right (camera is mounted left of the car centerline), so centered targets steer left. Default matches the last good run (~0.585 frame x)",
+    )
+    parser.add_argument(
+        "--pure-pursuit",
+        action="store_true",
+        help="steer via pure pursuit toward the BEV lookahead point (better on curves/S/hairpins) instead of the lateral+heading PID",
+    )
+    parser.add_argument(
+        "--pp-gain",
+        type=float,
+        default=YoloLaneFollowerConfig.pure_pursuit_gain,
+        help="[--pure-pursuit] steering units per radian of lookahead angle (larger = sharper)",
+    )
+    parser.add_argument(
+        "--pp-full-angle",
+        type=float,
+        default=YoloLaneFollowerConfig.pure_pursuit_full_angle,
+        help="[--pure-pursuit] lookahead angle (rad) at which curve-speed slowdown saturates",
     )
     parser.add_argument("--command-rate", type=float, default=20.0)
     parser.add_argument("--log-interval", type=float, default=0.5)
@@ -886,23 +952,45 @@ def draw_debug(
     fps: float,
     transformer: Any = None,
     bev_estimator: Any = None,
+    light_masks: tuple = (),
+    light_observation: Optional[TrafficLightObservation] = None,
+    light_stop_line_y: float = TrafficLightConfig.stop_line_y_ratio,
 ) -> Any:
     display = frame.copy()
     if mask_result is not None:
         overlay = display.copy()
         overlay[mask_result.mask > 0] = (0, 220, 80)
         display = cv2.addWeighted(overlay, 0.28, display, 0.72, 0)
+    light_mask = fuse_masks(list(light_masks))
+    if light_mask is not None:
+        overlay = display.copy()
+        overlay[light_mask > 0] = (0, 165, 255)
+        display = cv2.addWeighted(overlay, 0.45, display, 0.55, 0)
 
     height, width = display.shape[:2]
+    stop_y = int(round(height * min(1.0, max(0.0, light_stop_line_y))))
+    cv2.line(display, (0, stop_y), (width - 1, stop_y), (0, 80, 255), 2)
+    cv2.putText(
+        display,
+        "LIGHT STOP CONTACT",
+        (max(8, width - 270), max(22, stop_y - 8)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (0, 80, 255),
+        2,
+        cv2.LINE_AA,
+    )
     if transformer is not None and bev_estimator is not None:
         # BEV mode: lane geometry is in BEV pixel coords. The camera is centered,
         # so the vehicle axis is the frame midline. Draw a single line joining the
         # center axis (car, bottom) to the target point mapped back from BEV.
-        cv2.line(display, (width // 2, height), (width // 2, 0), (255, 255, 0), 1)
+        offset = getattr(getattr(bev_estimator, "config", None), "vehicle_center_x_offset_ratio", 0.0)
+        vehicle_x = int(width * (0.5 + offset))
+        cv2.line(display, (vehicle_x, height), (vehicle_x, 0), (255, 255, 0), 1)
         if lane.found:
             target = transformer.bev_to_frame([(lane.center_x, lane.target_y)], (height, width))[0]
             tp = (int(target[0]), int(target[1]))
-            cv2.line(display, (width // 2, height - 1), tp, (0, 0, 255), 2)
+            cv2.line(display, (vehicle_x, height - 1), tp, (0, 0, 255), 2)
             cv2.circle(display, tp, 9, (255, 255, 255), -1)
             cv2.circle(display, tp, 6, (0, 0, 255), -1)
     else:
@@ -926,6 +1014,18 @@ def draw_debug(
         ),
         "fps=%.1f" % fps,
     ]
+    if light_observation is not None:
+        lines.append(
+            "light=%s candidate=%s red=%d green=%d bottom=%.3f contact=%s stop=%s" % (
+                light_observation.state.upper(),
+                light_observation.candidate,
+                light_observation.red_pixels,
+                light_observation.green_pixels,
+                light_observation.mask_bottom_y_ratio,
+                "Y" if light_observation.contact else "N",
+                "Y" if light_observation.stop_latched else "N",
+            )
+        )
     for index, line in enumerate(lines):
         cv2.putText(
             display,

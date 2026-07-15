@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -37,6 +38,18 @@ class YoloLaneFollowerConfig:
     lane_lost_hold_frames: int = 20
     lane_lost_steering_release_rate_limit: Optional[int] = None
 
+    # Pure-pursuit steering: instead of summing a lateral-error PID and a heading
+    # PID, steer the wheel directly toward the BEV centerline's lookahead point
+    # (center_x, target_y) from the vehicle origin (vehicle_center_x, height). The
+    # angle to that point folds lateral offset and forward distance into one signal
+    # that grows naturally on curves, so S-curves and hairpins get stronger, better
+    # timed steering. Falls back to a normalized approximation if lane.height is 0.
+    pure_pursuit: bool = False
+    # Steering units per radian of the lookahead angle (tune: larger = sharper).
+    pure_pursuit_gain: float = 150.0
+    # Lookahead angle (rad) at which curve-speed slowdown saturates.
+    pure_pursuit_full_angle: float = 0.6
+
 
 class YoloLaneFollower:
     def __init__(self, config: YoloLaneFollowerConfig = YoloLaneFollowerConfig()):
@@ -51,6 +64,9 @@ class YoloLaneFollower:
     def plan(self, lane: LaneGeometry) -> ControlCommand:
         if not lane.found or lane.confidence < self.config.min_confidence:
             return self._hold_last_direction(lane)
+
+        if self.config.pure_pursuit:
+            return self._plan_pure_pursuit(lane)
 
         raw_curve_strength = self._curve_strength_from(lane)
         curve_strength = self._smooth_curve_strength(raw_curve_strength)
@@ -89,6 +105,41 @@ class YoloLaneFollower:
         self._last_heading_error = heading_error
         reason = "yolo_lane_follow:center_lock" if center_lock_active else "yolo_lane_follow"
         command = ControlCommand(speed=speed, steering=steering, brake=False, reason=reason)
+        self._last_command = command
+        self._lane_lost_frames = 0
+        return command
+
+    def _plan_pure_pursuit(self, lane: LaneGeometry) -> ControlCommand:
+        """Geometric steering straight from the BEV lookahead point.
+
+        alpha = angle between the vehicle's forward axis and the line to the
+        lookahead point (center_x, target_y). Forward is up (toward smaller y), so
+        the forward distance to the point is (height - target_y). Steering is
+        proportional to alpha, which grows with both lateral offset and curvature,
+        so tighter curves command more steering without a separate heading term."""
+        dx = lane.center_x - lane.vehicle_center_x           # + = point is to the right
+        dy = lane.height - lane.target_y                     # forward distance (px)
+        if dy > 1.0:
+            alpha = math.atan2(dx, dy)
+        else:
+            # No forward-distance info: approximate the angle from the normalized
+            # lateral error (treats the lookahead as ~45 deg full-scale).
+            alpha = lane.lateral_error_norm * (math.pi / 4.0)
+
+        raw_curve = min(1.0, abs(alpha) / max(1e-6, self.config.pure_pursuit_full_angle))
+        curve_strength = self._smooth_curve_strength(raw_curve)
+
+        raw_steering = self.config.pure_pursuit_gain * alpha
+        steering = self._rate_limit(int(round(raw_steering)), curve_strength, 0.0)
+        steering = self._clip(steering, -self.config.max_steering, self.config.max_steering)
+
+        speed = int(round(self.config.base_speed - self.config.speed_curve_slowdown * raw_curve))
+        speed = self._clip(speed, self.config.min_curve_speed, self.config.max_speed)
+
+        self._last_steering = steering
+        self._last_lateral_error = lane.lateral_error_norm
+        self._last_heading_error = lane.heading_error
+        command = ControlCommand(speed=speed, steering=steering, brake=False, reason="pure_pursuit")
         self._last_command = command
         self._lane_lost_frames = 0
         return command

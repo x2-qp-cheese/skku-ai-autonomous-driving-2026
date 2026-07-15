@@ -1,13 +1,10 @@
 import unittest
 
-import numpy as np
-
-from skku_autocar.estimation.lane_geometry import LaneGeometry, LaneGeometryConfig, MaskLaneGeometryEstimator
-from skku_autocar.perception.yolo_lane import YoloLaneConfig, YoloLaneSegmenter
+from skku_autocar.estimation.lane_geometry import LaneGeometry
 from skku_autocar.planning.yolo_lane_follower import YoloLaneFollower, YoloLaneFollowerConfig
 from skku_autocar.runtime.yolo_drive_app import (
     CommandSafetyFilter,
-    build_bev_lane_config,
+    build_bev_corridor_config,
     build_follower_config,
     parse_args,
 )
@@ -15,122 +12,6 @@ from skku_autocar.types import ControlCommand
 
 
 class YoloLaneGeometryTest(unittest.TestCase):
-    def test_centered_mask_has_near_zero_error(self):
-        mask = np.zeros((100, 200), dtype=np.uint8)
-        mask[45:95, 70:130] = 255
-
-        lane = MaskLaneGeometryEstimator().estimate(mask, (100, 200, 3))
-
-        self.assertTrue(lane.found)
-        self.assertAlmostEqual(lane.lateral_error_norm, 0.0, delta=0.01)
-
-    def test_positive_vehicle_center_offset_requests_left_steering(self):
-        mask = np.zeros((100, 200), dtype=np.uint8)
-        mask[45:95, 70:130] = 255
-
-        lane = MaskLaneGeometryEstimator(
-            LaneGeometryConfig(vehicle_center_x_offset_ratio=0.05)
-        ).estimate(mask, (100, 200, 3))
-        command = YoloLaneFollower(
-            YoloLaneFollowerConfig(steering_rate_limit=120)
-        ).plan(lane)
-
-        self.assertTrue(lane.found)
-        self.assertAlmostEqual(lane.vehicle_center_x, 110.0, delta=0.1)
-        self.assertLess(lane.lateral_error_norm, 0.0)
-        self.assertLess(command.steering, 0)
-
-    def test_right_shifted_mask_requests_right_steering(self):
-        mask = np.zeros((100, 200), dtype=np.uint8)
-        mask[45:95, 110:170] = 255
-
-        lane = MaskLaneGeometryEstimator().estimate(mask, (100, 200, 3))
-        command = YoloLaneFollower(
-            YoloLaneFollowerConfig(steering_rate_limit=120)
-        ).plan(lane)
-
-        self.assertTrue(lane.lateral_error_norm > 0)
-        self.assertTrue(command.steering > 0)
-
-    def test_missing_mask_stops(self):
-        lane = MaskLaneGeometryEstimator().estimate(None, (100, 200, 3))
-        command = YoloLaneFollower().plan(lane)
-
-        self.assertTrue(command.brake)
-        self.assertEqual(command.speed, 0)
-
-    def test_center_and_right_side_build_drive_corridor(self):
-        center = np.zeros((100, 200), dtype=np.uint8)
-        right = np.zeros((100, 200), dtype=np.uint8)
-        center[:, 80:84] = 255
-        right[:, 140:144] = 255
-
-        segmenter = object.__new__(YoloLaneSegmenter)
-        segmenter.config = YoloLaneConfig()
-        candidates = [
-            ("center", 0.8, 0, center, int(center.sum()), 2, "lane-center"),
-            ("side", 0.8, 1, right, int(right.sum()), 3, "lane-side"),
-        ]
-
-        selected = segmenter._select_group(candidates, (100, 200))
-        lane = MaskLaneGeometryEstimator().estimate(selected["mask"], (100, 200, 3))
-
-        self.assertEqual(selected["class_name"], "lane-center+right-lane-side")
-        self.assertTrue(lane.found)
-        self.assertAlmostEqual(lane.center_x, 112.0, delta=2.0)
-
-    def test_center_without_right_side_offsets_into_right_lane(self):
-        center = np.zeros((100, 200), dtype=np.uint8)
-        center[:, 80:84] = 255
-
-        segmenter = object.__new__(YoloLaneSegmenter)
-        segmenter.config = YoloLaneConfig(fallback_lane_width_ratio=0.30)
-        candidates = [
-            ("center", 0.8, 0, center, int(center.sum()), 2, "lane-center"),
-        ]
-
-        selected = segmenter._select_group(candidates, (100, 200))
-        lane = MaskLaneGeometryEstimator().estimate(selected["mask"], (100, 200, 3))
-
-        self.assertEqual(selected["class_name"], "lane-center+virtual-right-side")
-        self.assertTrue(lane.found)
-        self.assertAlmostEqual(lane.center_x, 112.0, delta=2.0)
-
-    def test_right_side_without_center_offsets_left_into_lane(self):
-        right = np.zeros((100, 200), dtype=np.uint8)
-        right[:, 140:144] = 255
-
-        segmenter = object.__new__(YoloLaneSegmenter)
-        segmenter.config = YoloLaneConfig(fallback_lane_width_ratio=0.30)
-        candidates = [
-            ("side", 0.8, 0, right, int(right.sum()), 3, "lane-side"),
-        ]
-
-        selected = segmenter._select_group(candidates, (100, 200))
-        lane = MaskLaneGeometryEstimator().estimate(selected["mask"], (100, 200, 3))
-
-        self.assertEqual(selected["class_name"], "virtual-lane-center+right-lane-side")
-        self.assertTrue(lane.found)
-        self.assertAlmostEqual(lane.center_x, 112.0, delta=2.0)
-
-    def test_lane_side_left_of_vehicle_still_offsets_left_into_road(self):
-        side = np.zeros((100, 200), dtype=np.uint8)
-        side[:, 80:84] = 255
-
-        segmenter = object.__new__(YoloLaneSegmenter)
-        segmenter.config = YoloLaneConfig(fallback_lane_width_ratio=0.30)
-        candidates = [
-            ("side", 0.8, 0, side, int(side.sum()), 3, "lane-side"),
-        ]
-
-        selected = segmenter._select_group(candidates, (100, 200))
-        lane = MaskLaneGeometryEstimator().estimate(selected["mask"], (100, 200, 3))
-
-        self.assertEqual(selected["class_name"], "virtual-lane-center+right-lane-side")
-        self.assertTrue(lane.found)
-        self.assertLess(lane.center_x, 82.0)
-        self.assertAlmostEqual(lane.center_x, 52.0, delta=2.0)
-
     def test_pd_steering_adds_derivative_when_error_changes(self):
         follower = YoloLaneFollower(
             YoloLaneFollowerConfig(
@@ -414,15 +295,11 @@ class YoloLaneGeometryTest(unittest.TestCase):
         self.assertEqual(command.speed, 100)
         self.assertEqual(command.steering, 70)
 
-    def test_bev_runtime_uses_common_parameter_aliases(self):
+    def test_bev_corridor_runtime_uses_lookahead_alias(self):
         args = parse_args(
             [
                 "--lookahead",
                 "0.70",
-                "--sample-top",
-                "0.35",
-                "--sample-bottom",
-                "0.76",
                 "--lateral-priority-threshold",
                 "0.25",
                 "--curve-strength-alpha",
@@ -436,12 +313,10 @@ class YoloLaneGeometryTest(unittest.TestCase):
             ]
         )
 
-        bev_config = build_bev_lane_config(args)
+        bev_config = build_bev_corridor_config(args)
         follower_config = build_follower_config(args)
 
         self.assertAlmostEqual(bev_config.lookahead_y_ratio, 0.70)
-        self.assertAlmostEqual(bev_config.sample_top_y_ratio, 0.35)
-        self.assertAlmostEqual(bev_config.sample_bottom_y_ratio, 0.76)
         self.assertAlmostEqual(follower_config.lateral_priority_threshold, 0.25)
         self.assertAlmostEqual(follower_config.curve_strength_alpha, 0.25)
         self.assertTrue(follower_config.center_lock_enabled)

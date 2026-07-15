@@ -27,7 +27,11 @@ class BevLaneConfig:
     band_height_ratio: float = 0.02
     poly_degree: int = 2
 
-    vehicle_center_x_offset_ratio: float = 0.0
+    # Camera mounted slightly left of the car centerline -> the true vehicle
+    # center is a bit right of frame center (measured ~0.585 on a good run).
+    # Positive shifts the lateral-error reference right. Tune with
+    # --vehicle-center-offset. See BevCorridorConfig for the rationale.
+    vehicle_center_x_offset_ratio: float = 0.085
     min_mask_area_ratio: float = 0.001
     # Slope (dx/dy in BEV px) is dimensionless; this scales it into [-1, 1].
     heading_gain: float = 1.6
@@ -97,6 +101,7 @@ class BevLaneGeometryEstimator:
             heading_error=heading_error,
             confidence=self._clip(confidence, 0.0, 1.0),
             reason="ok",
+            height=float(height),
         )
 
     def _sample_centers(self, binary: Any) -> List[Tuple[float, float]]:

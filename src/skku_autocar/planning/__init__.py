@@ -1,3 +1,3 @@
-from .lane_follower import LaneFollower
+from .yolo_lane_follower import YoloLaneFollower, YoloLaneFollowerConfig
 
-__all__ = ["LaneFollower"]
+__all__ = ["YoloLaneFollower", "YoloLaneFollowerConfig"]
