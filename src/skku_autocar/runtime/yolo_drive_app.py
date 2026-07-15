@@ -14,6 +14,7 @@ from ..estimation.lane_geometry import LaneGeometry
 from ..perception.bev import BevConfig, BevTransformer
 from ..perception.traffic_light import TrafficLightConfig, TrafficLightController, TrafficLightObservation
 from ..perception.yolo_lane import YoloClassMasks, YoloLaneConfig, YoloLaneMask, YoloLaneSegmenter
+from ..planning.lane_change_test import LaneChangeTestConfig, LaneChangeTestController
 from ..planning.yolo_lane_follower import YoloLaneFollower, YoloLaneFollowerConfig
 from ..types import ControlCommand
 
@@ -56,6 +57,16 @@ def run(args: argparse.Namespace) -> int:
     follower_config = build_follower_config(args)
     follower = YoloLaneFollower(follower_config)
     command_filter = CommandSafetyFilter(args)
+    lane_change_test = LaneChangeTestController(
+        LaneChangeTestConfig(
+            mode=args.lane_change_test,
+            trigger_seconds=args.lane_change_trigger_seconds,
+            transition_seconds=args.lane_change_transition_seconds,
+            hold_seconds=args.lane_change_hold_seconds,
+            max_straight_heading=args.lane_change_max_heading,
+            speed_cap=args.lane_change_speed_cap,
+        )
+    )
     traffic_light = TrafficLightController(
         TrafficLightConfig(
             min_saturation=args.light_min_saturation,
@@ -110,7 +121,7 @@ def run(args: argparse.Namespace) -> int:
         LOG.info("recording raw video: %s", recorder.raw_video_path)
         if recorder.debug_video_path is not None:
             LOG.info("recording debug video: %s", recorder.debug_video_path)
-    LOG.info("space: start/stop toggle | q or esc: quit")
+    LOG.info("space: start/stop toggle | l: request lane-change test | q or esc: quit")
 
     pending_frame = first_frame
     try:
@@ -139,8 +150,22 @@ def run(args: argparse.Namespace) -> int:
             lane = corridor_estimator.estimate(bev)
             bev_mask = fuse_masks([*bev.center, *bev.side, *bev.lane, *bev.crosswalk])
             mask_result = corridor_mask_result(class_masks, corridor_estimator, frame.shape)
+            lane_change = lane_change_test.update(
+                lane,
+                corridor_estimator.last_lane_width_px,
+                bev.shape[1],
+                now,
+                running,
+            )
+            lane = lane_change.lane
+            if lane_change.offset_px and corridor_estimator.last_centerline_bev:
+                corridor_estimator.last_centerline_bev = [
+                    (x + lane_change.offset_px, y)
+                    for x, y in corridor_estimator.last_centerline_bev
+                ]
             planned_command = follower.plan(lane) if running else ControlCommand.stop("paused")
             command = command_filter.apply(mask_result, lane, planned_command, running)
+            command = lane_change_test.apply_speed_cap(command, lane_change.active)
             stop_crosswalk_masks = (
                 class_masks.crosswalk
                 if class_masks.crosswalk_conf >= args.light_crosswalk_min_conf
@@ -159,6 +184,7 @@ def run(args: argparse.Namespace) -> int:
                 transformer, corridor_estimator,
                 light_masks, light_observation,
                 args.light_stop_line_y,
+                lane_change.state,
             )
             recorder.write(frame, display)
             cv2.imshow("YOLO Drive", display)
@@ -182,6 +208,15 @@ def run(args: argparse.Namespace) -> int:
                 LOG.info("driving: %s", "ON" if running else "OFF")
                 if not running and vehicle is not None:
                     vehicle.stop("paused")
+            if key == ord("l"):
+                if running and lane_change_test.request("keyboard"):
+                    LOG.info("lane-change request armed: waiting for a straight frame")
+                else:
+                    LOG.info(
+                        "lane-change request ignored: mode=%s state=%s",
+                        args.lane_change_test,
+                        lane_change_test.state,
+                    )
     finally:
         recorder.close()
         if vehicle is not None:
@@ -365,6 +400,15 @@ def log_effective_config(
         args.traffic_light,
         args.light_confirm_frames,
         args.light_stop_line_y,
+    )
+    LOG.info(
+        "lane_change_test=%s trigger=%.1fs transition=%.1fs hold=%.1fs max_heading=%.3f speed_cap=%d",
+        args.lane_change_test,
+        args.lane_change_trigger_seconds,
+        args.lane_change_transition_seconds,
+        args.lane_change_hold_seconds,
+        args.lane_change_max_heading,
+        args.lane_change_speed_cap,
     )
 
 
@@ -604,6 +648,22 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     )
     parser.add_argument("--max-speed", type=int, default=170)
     parser.add_argument("--min-curve-speed", type=int, default=60)
+    parser.add_argument(
+        "--lane-change-test",
+        choices=("off", "manual", "timed", "external"),
+        default="off",
+        help="straight-section 2->1->2 controller; manual uses L, timed uses a delay, external waits for a future detector request",
+    )
+    parser.add_argument("--lane-change-trigger-seconds", type=float, default=8.0)
+    parser.add_argument("--lane-change-transition-seconds", type=float, default=2.0)
+    parser.add_argument("--lane-change-hold-seconds", type=float, default=3.0)
+    parser.add_argument(
+        "--lane-change-max-heading",
+        type=float,
+        default=0.08,
+        help="start each transition only when absolute BEV heading error is below this straightness threshold",
+    )
+    parser.add_argument("--lane-change-speed-cap", type=int, default=70)
     parser.add_argument("--max-steering", type=int, default=120)
     parser.add_argument("--steering-rate-limit", type=int, default=110)
     parser.add_argument("--min-steering-rate-limit", type=int, default=40)
@@ -1001,6 +1061,7 @@ def draw_debug(
     light_masks: tuple = (),
     light_observation: Optional[TrafficLightObservation] = None,
     light_stop_line_y: float = TrafficLightConfig.stop_line_y_ratio,
+    lane_change_status: str = "off",
 ) -> Any:
     display = frame.copy()
     if mask_result is not None:
@@ -1072,6 +1133,8 @@ def draw_debug(
                 "Y" if light_observation.stop_latched else "N",
             )
         )
+    if lane_change_status != "off":
+        lines.append("lane_change=%s" % lane_change_status.upper())
     for index, line in enumerate(lines):
         cv2.putText(
             display,
