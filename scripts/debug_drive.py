@@ -16,11 +16,14 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from skku_autocar.control.serial_vehicle import SerialVehicleClient, SerialVehicleConfig
+from skku_autocar.perception.yolo_lane import YoloLaneConfig, YoloLaneSegmenter
 from skku_autocar.types import ControlCommand
 
 
 WINDOW_NAME = "Debug Keyboard Drive"
+MASK_WINDOW_NAME = "YOLO Lane Mask"
 DEFAULT_CAPTURE_DIR = "data/raw/debug_drive"
+DEFAULT_MODEL = "trained_model/skku_merged_yolov8n_seg_aug_best.pt"
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -52,6 +55,11 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         default="auto",
         help="camera backend for numeric camera indexes",
     )
+    parser.add_argument("--show-mask", action="store_true", help="run YOLO on the front camera and show its mask")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="trained YOLO segmentation model path")
+    parser.add_argument("--device", default="auto", help="auto, mps, cpu, 0, cuda, ...")
+    parser.add_argument("--conf", type=float, default=0.35, help="YOLO confidence threshold")
+    parser.add_argument("--imgsz", type=int, default=640, help="YOLO inference image size")
 
     parser.add_argument("--serial-port", default=None)
     parser.add_argument("--baudrate", type=int, default=115200)
@@ -95,6 +103,19 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
 
 def run(args: argparse.Namespace) -> int:
     cv2 = load_cv2()
+    segmenter = None
+    if args.show_mask:
+        model_path = resolve_model_path(args.model)
+        segmenter = YoloLaneSegmenter(
+            YoloLaneConfig(
+                model_path=model_path,
+                confidence=args.conf,
+                image_size=args.imgsz,
+                device=args.device,
+            )
+        )
+        print("yolo mask enabled: model=%s device=%s" % (model_path, segmenter.device))
+
     front_cap = open_camera(cv2, args, args.camera)
     if not front_cap.isOpened():
         raise RuntimeError("front camera could not be opened: %s" % args.camera)
@@ -147,6 +168,9 @@ def run(args: argparse.Namespace) -> int:
         preview = compose_preview(cv2, first_front_frame, first_rear_frame)
         frame_h, frame_w = preview.shape[:2]
         cv2.resizeWindow(WINDOW_NAME, frame_w, frame_h)
+        if segmenter is not None:
+            cv2.namedWindow(MASK_WINDOW_NAME, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(MASK_WINDOW_NAME, first_front_frame.shape[1], first_front_frame.shape[0])
 
         print("session:", session_dir)
         for name, directory in image_dirs.items():
@@ -206,6 +230,9 @@ def run(args: argparse.Namespace) -> int:
                 args.hold_to_run == "on",
             )
             cv2.imshow(WINDOW_NAME, display)
+            if segmenter is not None:
+                class_masks = segmenter.segment_class_masks(raw_frames["front"])
+                cv2.imshow(MASK_WINDOW_NAME, draw_yolo_mask_view(cv2, class_masks, raw_frames["front"].shape))
 
             key = cv2.waitKey(1) & 0xFF
             command_changed = timed_out
@@ -355,6 +382,23 @@ def resolve_path(value: str) -> Path:
     return path if path.is_absolute() else ROOT / path
 
 
+def resolve_model_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    cwd_path = Path.cwd() / path
+    if cwd_path.exists():
+        return cwd_path
+    root_path = ROOT / path
+    if root_path.exists():
+        return root_path
+    trained_dir = ROOT / "trained_model"
+    model_files = sorted(trained_dir.glob("*.pt")) if trained_dir.exists() else []
+    if value == DEFAULT_MODEL and len(model_files) == 1:
+        return model_files[0]
+    return root_path
+
+
 def save_label_images(
     cv2: Any,
     frames: Dict[str, Any],
@@ -462,6 +506,37 @@ def draw_overlay(
             cv2.LINE_AA,
         )
     return display
+
+
+def draw_yolo_mask_view(cv2: Any, class_masks: Any, frame_shape: tuple) -> Any:
+    import numpy as np
+
+    height, width = frame_shape[:2]
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    groups = (
+        ("center", class_masks.center, (0, 220, 80)),
+        ("side", class_masks.side, (255, 200, 0)),
+        ("lane", class_masks.lane, (255, 80, 0)),
+        ("crosswalk", class_masks.crosswalk, (220, 0, 220)),
+        ("light", class_masks.light, (0, 165, 255)),
+        ("obstacle", class_masks.obstacle, (0, 0, 255)),
+    )
+    visible = []
+    for name, masks, color in groups:
+        if not masks:
+            continue
+        visible.append("%s=%d" % (name, len(masks)))
+        for mask in masks:
+            arr = np.asarray(mask)
+            if arr.shape[:2] != (height, width):
+                arr = cv2.resize(arr, (width, height), interpolation=cv2.INTER_NEAREST)
+            canvas[arr > 0] = color
+
+    title = " ".join(visible) if visible else "no YOLO mask"
+    detail = "infer=%.1fms device=%s" % (class_masks.inference_ms, class_masks.device)
+    cv2.putText(canvas, title, (22, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(canvas, detail, (22, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.66, (255, 255, 255), 2, cv2.LINE_AA)
+    return canvas
 
 
 def current_command(speed: int, steering: int, braking: bool) -> ControlCommand:

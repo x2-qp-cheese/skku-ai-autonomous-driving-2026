@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional, Tuple
 
 @dataclass(frozen=True)
 class YoloLaneConfig:
-    model_path: Path = Path("trained_model/best.pt")
+    model_path: Path = Path("trained_model/skku_merged_yolov8n_seg_aug_best.pt")
     confidence: float = 0.35
     image_size: int = 640
     device: str = "auto"
@@ -16,6 +16,7 @@ class YoloLaneConfig:
     side_classes: Tuple[str, ...] = ("lane-side", "side")
     crosswalk_classes: Tuple[str, ...] = ("crosswalk", "cross-walk", "zebra")
     light_classes: Tuple[str, ...] = ("light", "traffic-light", "traffic_light", "trafficlight")
+    obstacle_classes: Tuple[str, ...] = ("obstacle",)
     lane_classes: Tuple[str, ...] = (
         "lane",
         "line",
@@ -28,6 +29,7 @@ class YoloLaneConfig:
     # Traffic lights are much smaller than lane masks, especially near the top of
     # the frame, so they need their own area threshold.
     min_light_mask_area_ratio: float = 0.00002
+    min_obstacle_mask_area_ratio: float = 0.0002
     fallback_lane_width_ratio: float = 0.24
     min_lane_width_ratio: float = 0.12
     max_lane_width_ratio: float = 0.58
@@ -58,11 +60,13 @@ class YoloClassMasks:
     lane: Tuple[Any, ...] = ()
     crosswalk: Tuple[Any, ...] = ()
     light: Tuple[Any, ...] = ()
+    obstacle: Tuple[Any, ...] = ()
     center_conf: float = 0.0
     side_conf: float = 0.0
     lane_conf: float = 0.0
     crosswalk_conf: float = 0.0
     light_conf: float = 0.0
+    obstacle_conf: float = 0.0
     device: str = "cpu"
     inference_ms: float = 0.0
 
@@ -180,7 +184,11 @@ class YoloLaneSegmenter:
             kind_min_area = (
                 total_area * self.config.min_light_mask_area_ratio
                 if kind == "light"
-                else min_area
+                else (
+                    total_area * self.config.min_obstacle_mask_area_ratio
+                    if kind == "obstacle"
+                    else min_area
+                )
             )
             if area < kind_min_area:
                 continue
@@ -222,17 +230,20 @@ class YoloLaneSegmenter:
         lane, lane_conf = group("lane")
         crosswalk, crosswalk_conf = group("crosswalk")
         light, light_conf = group("light")
+        obstacle, obstacle_conf = group("obstacle")
         return YoloClassMasks(
             center=center,
             side=side,
             lane=lane,
             crosswalk=crosswalk,
             light=light,
+            obstacle=obstacle,
             center_conf=center_conf,
             side_conf=side_conf,
             lane_conf=lane_conf,
             crosswalk_conf=crosswalk_conf,
             light_conf=light_conf,
+            obstacle_conf=obstacle_conf,
             device=self.device,
             inference_ms=self._inference_ms(result),
         )
@@ -287,6 +298,8 @@ class YoloLaneSegmenter:
             return "crosswalk"
         if any(token == lowered or token in lowered for token in self.config.light_classes):
             return "light"
+        if any(token == lowered or token in lowered for token in self.config.obstacle_classes):
+            return "obstacle"
         if any(token in lowered for token in self.config.center_classes):
             return "center"
         if any(token in lowered for token in self.config.side_classes):
@@ -294,6 +307,10 @@ class YoloLaneSegmenter:
         if any(token in lowered for token in self.config.lane_classes):
             return "lane"
         return None
+
+    @property
+    def has_obstacle_class(self) -> bool:
+        return any(self._class_kind(name) == "obstacle" for name in self.names.values())
 
     def _select_group(self, candidates: list, frame_hw: Tuple[int, int]) -> Optional[Dict[str, Any]]:
         import cv2

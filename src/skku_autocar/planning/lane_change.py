@@ -7,8 +7,8 @@ from ..types import ControlCommand
 
 
 @dataclass(frozen=True)
-class LaneChangeTestConfig:
-    mode: str = "off"  # off, keyboard, manual, timed, external
+class LaneChangeConfig:
+    mode: str = "off"  # off, external, timed
     trigger_seconds: float = 8.0
     transition_seconds: float = 1.2
     hold_seconds: float = 3.0
@@ -17,20 +17,19 @@ class LaneChangeTestConfig:
     steering_min: int = 100
     steering_boost: int = 25
     steering_cap: int = 120
-    settle_seconds: float = 0.0
     steering_override: bool = False
     stable_lateral_error: float = 0.12
+    stable_near_lateral_error: float = 0.18
     stable_heading_error: float = 0.18
     stable_required_frames: int = 5
-    stabilize_timeout_seconds: float = 0.0
+    target_lane_width_px: float = 150.0
+    target_capture_error: float = 0.20
+    target_capture_frames: int = 2
     allow_virtual_stabilize: bool = False
-    recenter_steering: bool = False
-    recenter_lateral_error: float = 0.35
-    recenter_heading_error: float = 0.12
 
 
 @dataclass(frozen=True)
-class LaneChangeTestResult:
+class LaneChangeResult:
     lane: LaneGeometry
     state: str
     offset_px: float = 0.0
@@ -40,57 +39,68 @@ class LaneChangeTestResult:
     stable_frames: int = 0
 
 
-class LaneChangeTestController:
+class LaneChangeController:
     """Reusable 2 -> 1 -> 2 lane-change trajectory controller.
 
     The normal BEV corridor produces the center of lane 2, on the right side of
     the center line. Lane 1's center is one physical BEV lane width to the left.
-    This controller moves that target laterally with a smoothstep profile. The
-    current keyboard/timer are test adapters; a future obstacle detector calls
-    request("obstacle") without changing the trajectory or safety logic.
+    Keyboard/timer changes move that target with a smoothstep profile. Obstacle
+    avoidance selects the complete adjacent-lane target immediately and lets
+    the normal lateral/heading controller close the measured target error.
     """
 
-    def __init__(self, config: LaneChangeTestConfig = LaneChangeTestConfig()):
+    def __init__(self, config: LaneChangeConfig = LaneChangeConfig()):
         self.config = config
         self.state = "lane2"
         self._run_started_at = None
         self._phase_started_at = None
         self._request_source = "none"
+        self._request_profile = "normal"
         self._return_requested = False
         self._return_source = "none"
-        self._settle_until = None
-        self._settle_direction = 0
+        self._return_profile = "normal"
         self._stable_frames = 0
-        self._stabilize_started_at = None
+        self._target_capture_frames = 0
+        self._locked_lane_width_px = None
 
     def reset(self) -> None:
         self.state = "lane2"
         self._run_started_at = None
         self._phase_started_at = None
         self._request_source = "none"
+        self._request_profile = "normal"
         self._return_requested = False
         self._return_source = "none"
-        self._settle_until = None
-        self._settle_direction = 0
+        self._return_profile = "normal"
         self._stable_frames = 0
-        self._stabilize_started_at = None
+        self._target_capture_frames = 0
+        self._locked_lane_width_px = None
 
     def request(self, source: str = "external") -> bool:
         """Arm a lane change from any detector/trigger.
 
-        The current keyboard and timer adapters call this method. A future
-        obstacle detector should call ``request("obstacle")`` when its decision is
-        confirmed; the trajectory and safety gates remain unchanged.
+        Keyboard/timer adapters and the obstacle-fusion planner call this method
+        after their trigger is confirmed; trajectory and safety gates remain
+        unchanged.
         """
+        return self._arm_request(source, "normal")
+
+    def request_avoidance(self, source: str = "obstacle") -> bool:
+        """Arm a safety-priority change with target-arrival verification."""
+        return self._arm_request(source, "avoidance")
+
+    def _arm_request(self, source: str, profile: str) -> bool:
         if self.config.mode == "off" or self.state not in ("lane2", "completed"):
             return False
         self.state = "armed"
         self._phase_started_at = None
         self._request_source = source
+        self._request_profile = profile
         self._return_requested = False
         self._return_source = "none"
-        self._clear_settle()
+        self._return_profile = "normal"
         self._clear_stability()
+        self._locked_lane_width_px = None
         return True
 
     @property
@@ -99,10 +109,18 @@ class LaneChangeTestController:
 
     def request_return(self, source: str = "external") -> bool:
         """Request lane 1 -> lane 2 after an obstacle-clear decision."""
+        return self._arm_return(source, "normal")
+
+    def request_avoidance_return(self, source: str = "obstacle") -> bool:
+        """Request a safety-priority return after lane 1 is stable."""
+        return self._arm_return(source, "avoidance")
+
+    def _arm_return(self, source: str, profile: str) -> bool:
         if self.config.mode == "off" or self.state != "lane1":
             return False
         self._return_requested = True
         self._return_source = source
+        self._return_profile = profile
         return True
 
     @property
@@ -117,12 +135,12 @@ class LaneChangeTestController:
         now: float,
         running: bool,
         lane_reliable: bool = True,
-    ) -> LaneChangeTestResult:
+    ) -> LaneChangeResult:
         if self.config.mode == "off":
-            return LaneChangeTestResult(lane=lane, state="off")
+            return LaneChangeResult(lane=lane, state="off")
         if not running:
             self.reset()
-            return LaneChangeTestResult(lane=lane, state=self.state)
+            return LaneChangeResult(lane=lane, state=self.state)
 
         if self._run_started_at is None:
             self._run_started_at = now
@@ -135,23 +153,29 @@ class LaneChangeTestController:
             self.request("timer")
 
         straight = lane.found and abs(lane.heading_error) <= max(0.0, self.config.max_straight_heading)
-        urgent_obstacle = self._request_source == "ultrasonic_obstacle"
-        if self.state == "armed" and (straight or (urgent_obstacle and lane.found)):
+        priority_request = self._request_profile == "avoidance"
+        if self.state == "armed" and (straight or (priority_request and lane.found)):
             self.state = "changing_to_lane1"
             self._phase_started_at = now
-            self._clear_settle()
+            self._lock_lane_width(lane_width_px, self._request_profile)
             self._clear_stability()
 
         offset_ratio = 0.0
         direction = 0
         progress = 0.0
         if self.state == "changing_to_lane1":
-            progress = self._progress(now)
             direction = -1
-            offset_ratio = -self._smoothstep(progress)
-            if progress >= 1.0:
+            if self._uses_target_arrival(self.state):
+                # Avoidance targets the complete adjacent-lane geometry from
+                # the first control frame. Arrival is decided from measured
+                # target error, not elapsed transition time.
+                progress = 1.0
                 offset_ratio = -1.0
-                if not self._uses_target_arrival("changing_to_lane1"):
+            else:
+                progress = self._progress(now)
+                offset_ratio = -self._smoothstep(progress)
+                if progress >= 1.0:
+                    offset_ratio = -1.0
                     direction = 0
                     self._finish_transition_or_stabilize("stabilizing_lane1", "lane1", now)
         elif self.state == "stabilizing_lane1":
@@ -159,61 +183,56 @@ class LaneChangeTestController:
         elif self.state == "lane1":
             offset_ratio = -1.0
             timed_return = (
-                self.config.mode not in ("external", "keyboard")
+                self.config.mode == "timed"
                 and self._phase_started_at is not None
                 and now - self._phase_started_at >= max(0.0, self.config.hold_seconds)
             )
-            if straight and (timed_return or self._return_requested):
+            priority_return = self._return_profile == "avoidance"
+            return_path_ready = straight or (priority_return and lane.found)
+            if return_path_ready and (timed_return or self._return_requested):
                 self.state = "changing_to_lane2"
                 self._phase_started_at = now
-                self._clear_settle()
+                self._lock_lane_width(lane_width_px, self._return_profile)
                 self._clear_stability()
         elif self.state == "changing_to_lane2":
-            progress = self._progress(now)
             direction = 1
-            offset_ratio = -(1.0 - self._smoothstep(progress))
-            if progress >= 1.0:
+            if self._uses_target_arrival(self.state):
+                progress = 1.0
                 offset_ratio = 0.0
-                if not self._uses_target_arrival("changing_to_lane2"):
+            else:
+                progress = self._progress(now)
+                offset_ratio = -(1.0 - self._smoothstep(progress))
+                if progress >= 1.0:
+                    offset_ratio = 0.0
                     direction = 0
                     self._finish_transition_or_stabilize("stabilizing_lane2", "completed", now)
         elif self.state == "stabilizing_lane2":
             offset_ratio = 0.0
 
-        settle_direction = self._settle_direction_at(now) if direction == 0 else 0
-
-        offset_px = offset_ratio * max(0.0, lane_width_px)
+        offset_px = offset_ratio * self._effective_lane_width(lane_width_px)
         shifted = self._shift_lane(lane, offset_px, bev_width_px) if lane.found else lane
         if (
             self.state == "changing_to_lane1"
-            and progress >= 1.0
             and self._uses_target_arrival(self.state)
-            and self._target_arrived(shifted, -1)
+            and self._target_captured(shifted, -1)
         ):
             direction = 0
             self._finish_transition_or_stabilize("stabilizing_lane1", "lane1", now)
         elif (
             self.state == "changing_to_lane2"
-            and progress >= 1.0
             and self._uses_target_arrival(self.state)
-            and self._target_arrived(shifted, 1)
+            and self._target_captured(shifted, 1)
         ):
             direction = 0
             self._finish_transition_or_stabilize("stabilizing_lane2", "completed", now)
         if self.state == "stabilizing_lane1":
-            if self._update_stability(shifted, lane_reliable, now):
+            if self._update_stability(shifted, lane_reliable):
                 self.state = "lane1"
                 self._phase_started_at = now
-                self._clear_settle()
         elif self.state == "stabilizing_lane2":
-            if self._update_stability(shifted, lane_reliable, now):
+            if self._update_stability(shifted, lane_reliable):
                 self.state = "completed"
                 self._phase_started_at = None
-                self._clear_settle()
-        if self.state in ("stabilizing_lane1", "stabilizing_lane2"):
-            direction = self._recenter_direction(shifted)
-        elif direction == 0:
-            direction = settle_direction
         applied_offset_px = shifted.center_x - lane.center_x if lane.found else 0.0
         active = self.state in (
             "changing_to_lane1",
@@ -222,7 +241,7 @@ class LaneChangeTestController:
             "changing_to_lane2",
             "stabilizing_lane2",
         )
-        return LaneChangeTestResult(
+        return LaneChangeResult(
             lane=shifted,
             state=self.state,
             offset_px=applied_offset_px,
@@ -235,13 +254,13 @@ class LaneChangeTestController:
     def apply_control_adjustments(
         self,
         command: ControlCommand,
-        result: LaneChangeTestResult,
+        result: LaneChangeResult,
     ) -> ControlCommand:
         command = self.apply_speed_cap(command, self.speed_cap_active(result))
         return self.apply_steering_assist(command, result)
 
     @staticmethod
-    def speed_cap_active(result: LaneChangeTestResult) -> bool:
+    def speed_cap_active(result: LaneChangeResult) -> bool:
         return result.state in (
             "armed",
             "changing_to_lane1",
@@ -255,13 +274,13 @@ class LaneChangeTestController:
             return command
         cap = max(0, int(self.config.speed_cap))
         speed = max(-cap, min(cap, command.speed))
-        reason = "%s:lane_change_test" % command.reason if command.reason else "lane_change_test"
+        reason = "%s:lane_change" % command.reason if command.reason else "lane_change"
         return ControlCommand(speed=speed, steering=command.steering, brake=False, reason=reason)
 
     def apply_steering_assist(
         self,
         command: ControlCommand,
-        result: LaneChangeTestResult,
+        result: LaneChangeResult,
     ) -> ControlCommand:
         if command.brake or result.direction == 0:
             return command
@@ -272,7 +291,22 @@ class LaneChangeTestController:
         minimum = max(0, int(self.config.steering_min))
         cap = max(0, int(self.config.steering_cap))
         force_target_lane = self._uses_target_arrival(result.state)
-        if self.config.steering_override or force_target_lane:
+        if force_target_lane:
+            # The avoidance target is already the complete adjacent lane.
+            # Preserve the follower's feedback command so large errors
+            # naturally saturate and smaller/heading errors are corrected
+            # without an open-loop steering script.
+            return ControlCommand(
+                speed=command.speed,
+                steering=command.steering,
+                brake=False,
+                reason=(
+                    "%s:lane_change_feedback" % command.reason
+                    if command.reason
+                    else "lane_change_feedback"
+                ),
+            )
+        if self.config.steering_override:
             steering = direction * (cap if cap > 0 else minimum)
         else:
             steering = command.steering
@@ -294,53 +328,44 @@ class LaneChangeTestController:
             return 0.0
         return min(1.0, max(0.0, (now - self._phase_started_at) / duration))
 
-    def _begin_settle(self, now: float, direction: int) -> None:
-        duration = max(0.0, float(self.config.settle_seconds))
-        if duration <= 0.0:
-            self._clear_settle()
-            return
-        self._settle_until = now + duration
-        self._settle_direction = -1 if direction < 0 else 1
-
-    def _clear_settle(self) -> None:
-        self._settle_until = None
-        self._settle_direction = 0
-
-    def _settle_direction_at(self, now: float) -> int:
-        if self._settle_until is None or now > self._settle_until:
-            self._clear_settle()
-            return 0
-        return self._settle_direction
-
     def _finish_transition_or_stabilize(self, stabilizing_state: str, final_state: str, now: float) -> None:
         if max(0, int(self.config.stable_required_frames)) <= 0:
             self.state = final_state
             self._phase_started_at = None if final_state == "completed" else now
-            self._begin_settle(now, -1 if stabilizing_state.endswith("lane1") else 1)
             return
         self.state = stabilizing_state
         self._phase_started_at = now
-        self._stabilize_started_at = now
         self._stable_frames = 0
-        self._clear_settle()
+        self._target_capture_frames = 0
 
-    def _update_stability(self, lane: LaneGeometry, lane_reliable: bool, now: float) -> bool:
+    def _update_stability(
+        self,
+        lane: LaneGeometry,
+        lane_reliable: bool,
+    ) -> bool:
         if self._stable_now(lane, lane_reliable):
             self._stable_frames += 1
         else:
             self._stable_frames = 0
-        if self._stable_frames >= max(1, int(self.config.stable_required_frames)):
-            return True
-        if self._stabilize_started_at is None:
-            self._stabilize_started_at = now
-        timeout = max(0.0, float(self.config.stabilize_timeout_seconds))
-        return timeout > 0.0 and now - self._stabilize_started_at >= timeout
+        return self._stable_frames >= max(1, int(self.config.stable_required_frames))
 
     def _stable_now(self, lane: LaneGeometry, lane_reliable: bool) -> bool:
         if not lane.found:
             return False
         if not self.config.allow_virtual_stabilize and not lane_reliable:
             return False
+        if self._uses_avoidance_profile(self.state):
+            near_error = (
+                lane.near_lateral_error_norm
+                if lane.near_lateral_error_norm is not None
+                else lane.lateral_error_norm
+            )
+            return (
+                abs(lane.lateral_error_norm)
+                <= max(0.0, float(self.config.stable_lateral_error))
+                and abs(near_error)
+                <= max(0.0, float(self.config.stable_near_lateral_error))
+            )
         return (
             abs(lane.lateral_error_norm) <= max(0.0, float(self.config.stable_lateral_error))
             and abs(lane.heading_error) <= max(0.0, float(self.config.stable_heading_error))
@@ -348,41 +373,55 @@ class LaneChangeTestController:
 
     def _uses_target_arrival(self, state: str) -> bool:
         if state == "changing_to_lane1":
-            return self._request_source == "ultrasonic_obstacle"
+            return self._request_profile == "avoidance"
         if state == "changing_to_lane2":
-            return self._return_source == "ultrasonic_obstacle"
+            return self._return_profile == "avoidance"
         return False
 
-    def _target_arrived(self, lane: LaneGeometry, direction: int) -> bool:
+    def _target_captured(self, lane: LaneGeometry, direction: int) -> bool:
         if not lane.found or direction == 0:
+            self._target_capture_frames = 0
             return False
-        remaining_error = lane.lateral_error_norm * direction
-        return remaining_error <= max(0.0, float(self.config.stable_lateral_error))
-
-    def _recenter_direction(self, lane: LaneGeometry) -> int:
-        if not self.config.recenter_steering or not lane.found:
-            return 0
-        # Automatic obstacle avoidance must finish against the shifted lane
-        # target. A timed opposite-direction override can fire before the car
-        # reaches that target and make it weave between steering directions.
-        if self._request_source == "ultrasonic_obstacle":
-            return 0
-        if self.state == "stabilizing_lane1":
-            counter_direction = 1
-        elif self.state == "stabilizing_lane2":
-            counter_direction = -1
-        else:
-            return 0
-        heading_ready = (
-            lane.heading_error * counter_direction
-            >= max(0.0, float(self.config.recenter_heading_error))
+        lateral_error = (
+            lane.near_lateral_error_norm
+            if lane.near_lateral_error_norm is not None
+            else lane.lateral_error_norm
         )
-        lateral_ready = abs(lane.lateral_error_norm) <= max(0.0, float(self.config.recenter_lateral_error))
-        return counter_direction if heading_ready or lateral_ready else 0
+        remaining_error = lateral_error * direction
+        # The high-priority shift ends from target-lane feedback. The normal
+        # lane controller then owns both steering direction and magnitude.
+        capture_error = max(0.0, float(self.config.target_capture_error))
+        if remaining_error <= capture_error:
+            self._target_capture_frames += 1
+        else:
+            self._target_capture_frames = 0
+        required = max(1, int(self.config.target_capture_frames))
+        return self._target_capture_frames >= required
+
+    def _uses_avoidance_profile(self, state: str) -> bool:
+        if state == "stabilizing_lane1":
+            return self._request_profile == "avoidance"
+        if state == "stabilizing_lane2":
+            return self._return_profile == "avoidance"
+        return False
 
     def _clear_stability(self) -> None:
         self._stable_frames = 0
-        self._stabilize_started_at = None
+        self._target_capture_frames = 0
+
+    def _lock_lane_width(self, lane_width_px: float, profile: str) -> None:
+        if self._locked_lane_width_px is not None:
+            return
+        configured = max(0.0, float(self.config.target_lane_width_px))
+        if profile == "avoidance" and configured > 0.0:
+            self._locked_lane_width_px = configured
+        else:
+            self._locked_lane_width_px = max(0.0, float(lane_width_px))
+
+    def _effective_lane_width(self, lane_width_px: float) -> float:
+        if self._locked_lane_width_px is not None:
+            return self._locked_lane_width_px
+        return max(0.0, float(lane_width_px))
 
     @staticmethod
     def _smoothstep(value: float) -> float:
@@ -398,10 +437,26 @@ class LaneChangeTestController:
         center_x = max(0.0, min(max(0.0, bev_width_px - 1.0), lane.center_x + offset_px))
         lateral_error_px = center_x - lane.vehicle_center_x
         lateral_error_norm = max(-1.0, min(1.0, lateral_error_px / half_width))
+        near_center_x = None
+        near_lateral_error_px = None
+        near_lateral_error_norm = None
+        if lane.near_center_x is not None:
+            near_center_x = max(
+                0.0,
+                min(max(0.0, bev_width_px - 1.0), lane.near_center_x + offset_px),
+            )
+            near_lateral_error_px = near_center_x - lane.vehicle_center_x
+            near_lateral_error_norm = max(
+                -1.0,
+                min(1.0, near_lateral_error_px / half_width),
+            )
         return replace(
             lane,
             center_x=center_x,
             lateral_error_px=lateral_error_px,
             lateral_error_norm=lateral_error_norm,
-            reason="%s:lane_change_test" % lane.reason,
+            near_center_x=near_center_x,
+            near_lateral_error_px=near_lateral_error_px,
+            near_lateral_error_norm=near_lateral_error_norm,
+            reason="%s:lane_change" % lane.reason,
         )

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -17,3 +18,11 @@ class LaneGeometry:
     # Height of the BEV space. Pure pursuit uses height-target_y as its forward
     # distance. Zero keeps compatibility with synthetic planner tests.
     height: float = 0.0
+    # A second lateral measurement close to the vehicle. The normal target is a
+    # forward lookahead point and can cross the next-lane center while the rear of
+    # a diagonally moving car is still beside the obstacle. Obstacle lane changes
+    # use this near-field value before releasing maximum steering.
+    near_center_x: Optional[float] = None
+    near_target_y: Optional[float] = None
+    near_lateral_error_px: Optional[float] = None
+    near_lateral_error_norm: Optional[float] = None

@@ -16,9 +16,11 @@ logs/*
 data/raw/*
 data/processed/*
 data/calibration/*
+data/datasets/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 !data/calibration/.gitkeep
+!data/datasets/.gitkeep
 
 *.avi
 *.mp4

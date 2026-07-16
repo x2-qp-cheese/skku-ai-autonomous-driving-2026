@@ -21,47 +21,60 @@ macOS에서는 카메라 인덱스에 AVFoundation을 사용하고 Arduino는
 `/dev/cu.usbmodem*` 또는 `/dev/cu.usbserial*` 포트를 우선 선택합니다.
 
 LiDAR 입력과 미션 타입은 향후 확장을 위해 보존되어 있습니다.
-현재 `drive.py`의 장애물 차선 변경은 아두이노 초음파 센서값을 사용합니다.
+현재 `drive.py`의 장애물 회피는 YOLO segmentation과 초음파 센서를 융합합니다.
 
 ## 키보드 장애물 회피 테스트
 
-초음파 센서나 LiDAR 없이 장애물 차선 변경을 연습할 때는 주행 중 `l` 키를 누릅니다.
+YOLO 장애물 감지 없이 차선 변경을 연습할 때는 주행 중 `l` 키를 누릅니다.
 첫 `l`은 장애물 감지처럼 차선 2에서 차선 1로 이동을 요청하고, 차선 1에 있거나 이동 중일 때 다시 `l`을 누르면 장애물 해제처럼 차선 2 복귀를 요청합니다.
-기본값은 키보드 테스트가 켜진 `--lane-change-test keyboard`이며, 키 입력 전에는 차선 변경하지 않습니다.
+기본값 `--lane-change-mode external`은 센서 융합과 `l` 키 요청을 모두 받습니다.
 
 ```powershell
-..\venv\Scripts\python.exe scripts\drive.py --camera 0 --traffic-light off --lane-change-test keyboard
+..\venv\Scripts\python.exe scripts\drive.py --camera 0 --traffic-light off --lane-change-mode external --obstacle-avoidance off
 ```
 
 차선 변경이 느리거나 조향이 작으면 아래 값부터 조정합니다.
 
 ```powershell
-..\venv\Scripts\python.exe scripts\drive.py --camera 0 --traffic-light off --lane-change-test keyboard --lane-change-transition-seconds 1.0 --lane-change-steering-min 110 --lane-change-steering-boost 35
+..\venv\Scripts\python.exe scripts\drive.py --camera 0 --traffic-light off --lane-change-mode external --obstacle-avoidance off --lane-change-transition-seconds 1.0 --lane-change-steering-min 110 --lane-change-steering-boost 35
 ```
 
 `--lane-change-transition-seconds`는 목표 차선으로 넘어가는 시간이고, `--lane-change-steering-min`은 변경 중 강제로 보장할 최소 조향값입니다.
 `--lane-change-steering-boost`는 기존 차선 추종 조향에 추가로 더하는 값입니다.
-`--lane-change-steering-override on`은 차선 변경/settle 구간에서 기존 차선 추종 조향을 섞지 않고 차선 변경 방향 조향을 우선합니다.
-`--lane-change-settle-seconds`는 시간상 차선 변경이 끝난 뒤에도 같은 방향 강제 조향과 속도 제한을 유지하는 시간입니다.
+`--lane-change-steering-override on`은 차선 변경 구간에서 차선 추종 조향을 섞지 않고 변경 방향 조향을 우선합니다.
 현재 차선 변경 완료 판정은 시간만 보지 않고 `stabilizing_lane1/stabilizing_lane2` 상태에서 새 차선 중심 안정도를 확인합니다.
 기본적으로 실제(non-virtual) 차선에서 `abs(err) <= 0.12`, `abs(head) <= 0.18`이 5프레임 연속 유지되어야 다음 차선 상태로 확정됩니다.
-`--lane-change-recenter-steering on`은 왼쪽으로 피한 뒤 안정화 중 heading/lateral 조건이 맞으면 오른쪽 counter-steer를, 오른쪽으로 복귀한 뒤에는 왼쪽 counter-steer를 강하게 넣어 차체를 빨리 세웁니다.
 속도 제한은 차선 변경 중에만 적용되고, 차선 1에 도착한 뒤에는 기존 `--fixed-speed on --speed 255` 설정대로 다시 255가 나갑니다.
 기본값 `--light-stop-during-lane-change off`는 차선 변경/차선 1 유지 중 먼 빨간불 contact 오검출로 정지하지 않게 합니다.
 
-## 초음파 자동 장애물 차선 변경
+## YOLO + 초음파 장애물 회피
 
-아두이노 펌웨어를 다시 업로드하면 `drive.py`가 전방 초음파 센서에 `USF`를 주기적으로 보내 `FR/FL` 값을 읽습니다.
-기본값은 `--obstacle-lane-change on`이며, `FR` 또는 `FL` 중 하나가 `50..850mm` 범위에 들어오면 장애물로 보고 다음 차선 변경을 요청합니다.
-차선을 바꾼 뒤에는 기존 차선 추종 로직으로 계속 주행하고, 값이 `950mm` 이상 또는 `0mm`/`50mm` 미만으로 clear된 뒤 다시 장애물을 만나면 반대 차선으로 다시 변경합니다.
-장애물 감지 직후와 차선 변경 예약/전환 중에는 `--obstacle-speed-cap`으로 속도를 낮추고, `--obstacle-stop-mm` 이하로 너무 가까우면 정지합니다.
+학습 데이터에서 장애물 외곽을 polygon으로 지정하고 클래스 이름을 정확히 `obstacle`로 사용합니다.
+차선 모델과 같은 YOLO segmentation 모델에 이 클래스를 함께 학습해야 합니다.
+
+판단 순서는 다음과 같습니다.
+
+1. 카메라 프레임의 obstacle 접지 영역을 투영된 1/2차선 경로와 비교해 BEV 진입 전부터 현재 경로 장애물을 추적하고 속도를 제한합니다.
+2. BEV obstacle mask도 함께 사용해 근거리의 현재 경로와 반대 경로 점유를 다시 확인합니다.
+3. 신뢰도 0.75 이상의 현재 경로 점유가 2프레임 연속 확인된 뒤, 전방 초음파 3개 중 신선한 2개 이상이 2000mm 이내이거나 TTC가 1.8초 이하이면 회피를 확정합니다. 초음파 필터는 가까워지는 값은 즉시 반영하고 멀어지는 값만 중앙값으로 안정화합니다.
+4. 목적 경로의 YOLO 점유, 목적 방향 측면 초음파, 두 차선 중심 사이의 `lane-side` 실선 검사를 모두 통과해야 변경을 시작합니다. 목적 차선 바깥의 정상 외곽 실선은 변경을 차단하지 않습니다.
+5. 목적 경로가 막힌 상태로 650mm 이내까지 접근하면 정지합니다. 변경 전에는 전방 센서 2개가 300mm 이내여도 독립 비상 정지합니다.
+6. 변경을 시작하면 시간 보간 없이 목적 차선 전체 중심선을 목표로 설정하고, 목표 차선 근접 오차가 0.20 이내로 2프레임 들어올 때까지만 변경 방향 우선 조향을 유지합니다. 목표가 포착되면 강제 조향을 해제하고 기존 차선 추종기가 매 프레임 횡오차와 헤딩으로 조향합니다. 근거리와 원거리 목표 오차가 함께 안정될 때만 정상 주행으로 복귀합니다.
+7. 변경 중 원래 차선 장애물의 가까운 초음파 잔여 에코는 새 목표 경로가 YOLO상 비어 있을 때 중간 제동을 만들지 않습니다.
+8. 한 장애물 이벤트는 차선 변경과 안정화가 끝날 때까지 한 번만 소비됩니다. 새 차선에서 YOLO와 초음파가 모두 3프레임 연속 clear가 된 뒤에만 다음 장애물을 받을 수 있으므로 같은 장애물 때문에 원래 차선으로 즉시 복귀하지 않습니다.
+
+초음파 단독 신호는 경로와 물체 종류를 알 수 없으므로 차선 변경을 시작하지 않습니다.
+신뢰도 0.75 미만의 obstacle mask는 선제 감속에는 사용하지만 차선 변경 요청에는 사용하지 않습니다. 가까운 저신뢰도 물체는 사람일 수 있으므로 무시하지 않고 비상 정지 대상으로만 사용합니다.
 
 ```powershell
-..\venv\Scripts\python.exe scripts\drive.py --camera 0 --traffic-light on --obstacle-lane-change on --obstacle-trigger-mm 850 --obstacle-clear-mm 950 --obstacle-min-mm 50 --obstacle-speed-cap 90 --obstacle-stop-mm 300
+..\venv\Scripts\python.exe scripts\drive.py --camera 0 --traffic-light on --obstacle-avoidance on --obstacle-fusion-mode fused --obstacle-action-confidence 0.75 --obstacle-frame-visual-trigger-y 0.18 --obstacle-visual-trigger-y 0.05 --obstacle-trigger-mm 2000 --obstacle-clear-mm 2300 --obstacle-min-front-sensors 2 --obstacle-range-confirm-frames 1 --obstacle-rearm-clear-frames 3 --obstacle-ttc-seconds 1.8 --obstacle-stop-mm 300 --obstacle-blocked-stop-mm 650 --obstacle-side-clearance-mm 300 --obstacle-approach-speed-cap 120 --obstacle-speed-cap 120 --obstacle-solid-crossing-margin-px 8 --lane-change-transition-seconds 1.0 --lane-change-speed-cap 120 --lane-change-steering-min 150 --lane-change-steering-cap 150 --lane-change-target-capture-error 0.20 --lane-change-target-capture-frames 2 --lane-change-stable-lateral-error 0.12 --lane-change-stable-near-error 0.18 --lane-change-stable-frames 5
 ```
 
-왼쪽 센서가 아직 `9mm`처럼 튀는 상태라면 기본 `--obstacle-min-mm 50` 때문에 그 값만으로는 차선 변경하지 않습니다.
-양쪽 전방 센서가 모두 감지할 때만 바꾸고 싶으면 `--obstacle-front-mode both`를 추가합니다.
+`--obstacle-path-half-width-px`는 차량이 점유할 BEV 충돌 경로의 반폭입니다.
+`--obstacle-min-overlap`은 obstacle 접지 mask가 경로와 겹쳐야 하는 최소 비율입니다.
+`--obstacle-solid-crossing-margin-px`는 두 차선 중심 사이에 실선이 있는지 판정할 때 쓰는 BEV 허용 오차입니다.
+현재 모델에 `obstacle` 클래스가 없으면 경고만 출력하고 기존 차선 주행은 계속합니다.
+아두이노 없이 녹화 영상을 재생할 때만 `--no-serial --obstacle-fusion-mode yolo`를 사용합니다.
 
 ## 키보드 수동 조종 + 라벨링 사진 저장
 
@@ -92,6 +105,7 @@ LiDAR 입력과 미션 타입은 향후 확장을 위해 보존되어 있습니�
 | --- | ---: | ---: |
 | 전방 우 | D22 | D23 |
 | 전방 좌 | D24 | D25 |
+| 전방 중앙 | D30 | D31 |
 | 옆 우 | D26 | D27 |
 | 옆 좌 | D28 | D29 |
 
@@ -110,4 +124,4 @@ LiDAR 입력과 미션 타입은 향후 확장을 위해 보존되어 있습니�
 ```
 
 왼쪽 센서만 `0mm` 또는 `9mm`처럼 고정되면 왼쪽 센서의 `VCC/GND`, `TRIG/ECHO 반대 연결`, 핀 번호(D24/D25, D28/D29), 센서 불량을 우선 확인합니다.
-아두이노 시리얼 명령을 직접 보낼 때는 `US`가 전체 1회 측정, `USFR/USFL/USSR/USSL`이 단일 센서 측정, `USON`이 주기 출력 켜기, `USOFF`가 주기 출력 끄기입니다.
+펌웨어는 30ms마다 센서 하나를 순환 측정합니다. `US`와 `USF`는 캐시된 최신값을 즉시 출력하고, `USFC/USFR/USFL/USSR/USSL`은 고장 진단용 단일 센서 측정입니다. `USON`과 `USOFF`는 캐시값 스트리밍을 켜고 끕니다.

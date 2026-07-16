@@ -61,5 +61,5 @@ python3 scripts/drive.py --device mps --record on
 1. `scripts/camera_check.py`로 카메라 번호, 해상도, ROI 확인
 2. `scripts/list_serial_ports.py`로 아두이노와 라이다 포트 고정
 3. `firmware/arduino/vehicle_controller/vehicle_controller.ino`는 유지하고, 필요하면 Arduino IDE에서 그대로 다시 업로드
-4. 학습 완료된 모델을 `trained_model/best.pt`로 두거나, `trained_model/` 안에 `.pt` 파일 하나만 둔 뒤 `python3 scripts/drive.py --no-serial --show-mask`로 mask 품질 확인
+4. 학습 완료된 모델을 `trained_model/skku_merged_yolov8n_seg_aug_best.pt`로 둔 뒤 `python3 scripts/drive.py --no-serial --show-mask`로 mask 품질 확인
 5. 시간측정 주행부터 안정화한 뒤 장애물, 신호등, 수직주차 모드를 추가

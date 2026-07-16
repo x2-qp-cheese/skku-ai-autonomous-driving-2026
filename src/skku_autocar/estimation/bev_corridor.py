@@ -46,6 +46,9 @@ class BevCorridorConfig:
 
     # Row (ratio of BEV height) where lateral error is measured / width sampled.
     lookahead_y_ratio: float = 0.45
+    # Near-field row used only to verify that the vehicle body has completed an
+    # obstacle lane change. This must stay below/closer than the lookahead row.
+    lane_change_near_y_ratio: float = 0.88
     sample_top_y_ratio: float = 0.02
     sample_bottom_y_ratio: float = 0.98
     num_samples: int = 24
@@ -162,10 +165,12 @@ class BevClassMasks:
     side: List[Any] = field(default_factory=list)
     lane: List[Any] = field(default_factory=list)
     crosswalk: List[Any] = field(default_factory=list)
+    obstacle: List[Any] = field(default_factory=list)
     center_conf: float = 1.0
     side_conf: float = 1.0
     lane_conf: float = 1.0
     crosswalk_conf: float = 1.0
+    obstacle_conf: float = 0.0
     shape: Tuple[int, int] = (0, 0)  # (height, width) of the BEV canvas
 
 
@@ -177,10 +182,12 @@ def warp_class_masks(transformer: Any, class_masks: Any) -> BevClassMasks:
         side=[transformer.warp_mask(m) for m in class_masks.side],
         lane=[transformer.warp_mask(m) for m in class_masks.lane],
         crosswalk=[transformer.warp_mask(m) for m in getattr(class_masks, "crosswalk", ())],
+        obstacle=[transformer.warp_mask(m) for m in getattr(class_masks, "obstacle", ())],
         center_conf=class_masks.center_conf,
         side_conf=class_masks.side_conf,
         lane_conf=class_masks.lane_conf,
         crosswalk_conf=getattr(class_masks, "crosswalk_conf", 0.0),
+        obstacle_conf=getattr(class_masks, "obstacle_conf", 0.0),
         shape=(out_h, out_w),
     )
 
@@ -189,6 +196,7 @@ class BevCorridorLaneEstimator:
     def __init__(self, config: BevCorridorConfig = BevCorridorConfig()):
         self.config = config
         self._smoothed_center_x: Optional[float] = None
+        self._smoothed_near_center_x: Optional[float] = None
         self._smoothed_heading: Optional[float] = None
         self._lane_width_px: Optional[float] = None
 
@@ -229,6 +237,7 @@ class BevCorridorLaneEstimator:
 
         vehicle_center_x = self._vehicle_center_x(width)
         target_y = height * self.config.lookahead_y_ratio
+        near_target_y = height * self.config.lane_change_near_y_ratio
 
         # A crosswalk in view does NOT halt driving: its pixels are a separate
         # class (kept out of the lane fits), so we keep following whatever lane
@@ -259,6 +268,7 @@ class BevCorridorLaneEstimator:
 
         centerline_fit, left_fit, right_fit, tier, class_name, det_conf = resolved
         raw_center_x = float(np.polyval(centerline_fit["fit"], target_y))
+        raw_near_center_x = float(np.polyval(centerline_fit["fit"], near_target_y))
         raw_heading = self._heading_error(centerline_fit["fit"], height)
 
         # Temporal gate: an outlier fit shows up as a big lookahead center_x jump.
@@ -279,9 +289,20 @@ class BevCorridorLaneEstimator:
         self._last_overlays = (self.last_centerline_bev, self.last_center_line_bev, self.last_right_line_bev)
 
         center_x = self._clip(self._smooth_center(raw_center_x), 0.0, float(width - 1))
+        near_center_x = self._clip(
+            self._smooth_near_center(raw_near_center_x),
+            0.0,
+            float(width - 1),
+        )
         heading_error = self._smooth_heading(raw_heading)
         lateral_error_px = center_x - vehicle_center_x
         lateral_error_norm = self._clip(lateral_error_px / (width / 2.0), -1.0, 1.0)
+        near_lateral_error_px = near_center_x - vehicle_center_x
+        near_lateral_error_norm = self._clip(
+            near_lateral_error_px / (width / 2.0),
+            -1.0,
+            1.0,
+        )
 
         row_coverage = min(1.0, centerline_fit["n"] / float(self.config.num_samples))
         tier_base = {1: 1.0, 2: 0.8, 3: 0.6, 4: 0.5}.get(tier, 0.5)
@@ -301,6 +322,10 @@ class BevCorridorLaneEstimator:
             confidence=confidence,
             reason="corridor_tier%d" % tier,
             height=float(height),
+            near_center_x=near_center_x,
+            near_target_y=near_target_y,
+            near_lateral_error_px=near_lateral_error_px,
+            near_lateral_error_norm=near_lateral_error_norm,
         )
         self._last_lane = lane
         return lane
@@ -613,6 +638,10 @@ class BevCorridorLaneEstimator:
                 confidence=self._clip(confidence, 0.0, 1.0),
                 reason="coast:%s(%d)" % (reason, self._coast_frames),
                 height=prev.height,
+                near_center_x=prev.near_center_x,
+                near_target_y=prev.near_target_y,
+                near_lateral_error_px=prev.near_lateral_error_px,
+                near_lateral_error_norm=prev.near_lateral_error_norm,
             )
 
         # 2) Coasting exhausted (or nothing was ever detected): hold a vehicle-width
@@ -641,6 +670,7 @@ class BevCorridorLaneEstimator:
         height, width = bev_shape
         vehicle_center_x = self._vehicle_center_x(width)
         target_y = height * self.config.lookahead_y_ratio
+        near_target_y = height * self.config.lane_change_near_y_ratio
 
         if self._virtual_center_x is None:
             self._virtual_center_x = (
@@ -669,6 +699,7 @@ class BevCorridorLaneEstimator:
         # Keep temporal state consistent so a recovered real frame transitions
         # smoothly (gated/smoothed relative to the held center, not a stale one).
         self._smoothed_center_x = center_x
+        self._smoothed_near_center_x = center_x
         self._last_raw_center_x = center_x
         self._smoothed_heading = 0.0
 
@@ -685,6 +716,10 @@ class BevCorridorLaneEstimator:
             confidence=self._clip(self.config.virtual_hold_confidence, 0.0, 1.0),
             reason="virtual_hold:%s(%d)" % (reason, self._virtual_hold_frames),
             height=float(height),
+            near_center_x=center_x,
+            near_target_y=near_target_y,
+            near_lateral_error_px=lateral_error_px,
+            near_lateral_error_norm=lateral_error_norm,
         )
 
     def _reset_temporal(self) -> None:
@@ -692,6 +727,7 @@ class BevCorridorLaneEstimator:
         self._last_lane = None
         self._last_raw_center_x = None
         self._smoothed_center_x = None
+        self._smoothed_near_center_x = None
         self._smoothed_heading = None
         self._last_overlays = ([], [], [])
         self._virtual_hold_frames = 0
@@ -717,6 +753,20 @@ class BevCorridorLaneEstimator:
             self._smoothed_heading = alpha * value + (1.0 - alpha) * self._smoothed_heading
         return self._smoothed_heading
 
+    def _smooth_near_center(self, value: float) -> float:
+        alpha = (
+            self.config.crosswalk_center_smooth_alpha
+            if self._crosswalk_active
+            else self.config.center_smooth_alpha
+        )
+        if self._smoothed_near_center_x is None:
+            self._smoothed_near_center_x = value
+        else:
+            self._smoothed_near_center_x = (
+                alpha * value + (1.0 - alpha) * self._smoothed_near_center_x
+            )
+        return self._smoothed_near_center_x
+
     def reset(self) -> None:
         self._lane_width_px = None
         self.last_centerline_bev = []
@@ -730,6 +780,7 @@ class BevCorridorLaneEstimator:
         height, width = bev_shape if bev_shape[1] > 0 else (1, 2)
         vehicle_center_x = self._vehicle_center_x(width)
         target_y = height * self.config.lookahead_y_ratio
+        near_target_y = height * self.config.lane_change_near_y_ratio
         return LaneGeometry(
             found=False,
             center_x=vehicle_center_x,
@@ -741,6 +792,10 @@ class BevCorridorLaneEstimator:
             confidence=0.0,
             reason=reason,
             height=float(height),
+            near_center_x=vehicle_center_x,
+            near_target_y=near_target_y,
+            near_lateral_error_px=0.0,
+            near_lateral_error_norm=0.0,
         )
 
     @staticmethod

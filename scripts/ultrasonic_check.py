@@ -27,7 +27,7 @@ def main(argv: Optional[list] = None) -> int:
 
 
 def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Read four ultrasonic sensors from the Arduino vehicle controller")
+    parser = argparse.ArgumentParser(description="Read five ultrasonic sensors from the Arduino vehicle controller")
     parser.add_argument("--serial-port", default=None, help="Arduino port; auto-detected when omitted")
     parser.add_argument("--baudrate", type=int, default=115200)
     parser.add_argument("--interval", type=float, default=0.2, help="seconds between US requests")
@@ -35,7 +35,7 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     parser.add_argument("--ready-timeout", type=float, default=3.0)
     parser.add_argument(
         "--sensor",
-        choices=("all", "front_right", "front_left", "side_right", "side_left"),
+        choices=("all", "front_center", "front_right", "front_left", "side_right", "side_left"),
         default="all",
         help="read all sensors or only one sensor for wiring diagnosis",
     )
@@ -77,6 +77,7 @@ def run(args: argparse.Namespace) -> int:
 def ultrasonic_command(sensor: str) -> bytes:
     commands = {
         "all": b"US\n",
+        "front_center": b"USFC\n",
         "front_right": b"USFR\n",
         "front_left": b"USFL\n",
         "side_right": b"USSR\n",
@@ -103,9 +104,10 @@ def wait_ready(conn: object, timeout_s: float) -> None:
 def format_ultrasonic_line(line: str) -> str:
     values = parse_key_values(line)
     return (
-        "front_right={FR:>4}mm  front_left={FL:>4}mm  "
+        "front_center={FC:>4}mm  front_right={FR:>4}mm  front_left={FL:>4}mm  "
         "side_right={SR:>4}mm  side_left={SL:>4}mm"
     ).format(
+        FC=values.get("FC", "0"),
         FR=values.get("FR", "0"),
         FL=values.get("FL", "0"),
         SR=values.get("SR", "0"),

@@ -119,7 +119,11 @@ def parse_args(argv):
         action="store_false",
         help="[--save] disable the centerline overlay (BEV warp only)",
     )
-    parser.add_argument("--model", default="trained_model/best.pt", help="YOLO seg model for the centerline")
+    parser.add_argument(
+        "--model",
+        default="trained_model/skku_merged_yolov8n_seg_aug_best.pt",
+        help="YOLO seg model for the centerline",
+    )
     parser.add_argument("--device", default="auto", help="auto, cpu, mps, 0, cuda, ...")
     parser.add_argument("--conf", type=float, default=0.35, help="YOLO confidence threshold")
     parser.add_argument("--imgsz", type=int, default=640, help="YOLO inference image size")
@@ -236,7 +240,7 @@ def resolve_model_path(value: str) -> Path:
             return candidate
     trained = ROOT / "trained_model"
     pts = sorted(trained.glob("*.pt")) if trained.exists() else []
-    if value == "trained_model/best.pt" and len(pts) == 1:
+    if value == "trained_model/skku_merged_yolov8n_seg_aug_best.pt" and len(pts) == 1:
         return pts[0]
     return ROOT / value
 

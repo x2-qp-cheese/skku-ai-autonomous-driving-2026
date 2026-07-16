@@ -1,6 +1,6 @@
 # YOLO Segmentation Runtime
 
-이 브랜치의 주행 경로는 `trained_model/` 안의 YOLOv8 segmentation 모델을 기준으로 한다. 기본 경로는 `trained_model/best.pt`이고, 그 파일이 없더라도 `trained_model/` 안에 `.pt` 파일이 하나뿐이면 자동으로 그 파일을 사용한다.
+이 브랜치의 주행 경로는 `trained_model/` 안의 YOLOv8 segmentation 모델을 기준으로 한다. 기본 모델은 `trained_model/skku_merged_yolov8n_seg_aug_best.pt`이며, `--model` 옵션으로 다른 모델을 명시할 수 있다.
 
 ```text
 camera frame

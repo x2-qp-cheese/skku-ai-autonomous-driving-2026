@@ -278,7 +278,10 @@ def main(argv=None) -> int:
 def parse_args(argv):
     parser = argparse.ArgumentParser(description="Offline BEV pipeline viewer for recorded video")
     parser.add_argument("--source", required=True, help="video path, image path, or camera index")
-    parser.add_argument("--model", default="trained_model/best.pt")
+    parser.add_argument(
+        "--model",
+        default="trained_model/skku_merged_yolov8n_seg_aug_best.pt",
+    )
     parser.add_argument("--device", default="auto", help="auto, cpu, mps, 0, cuda, ...")
     parser.add_argument("--conf", type=float, default=0.35)
     parser.add_argument("--imgsz", type=int, default=640)
@@ -652,7 +655,7 @@ def resolve_model_path(value: str) -> Path:
             return candidate
     trained = ROOT / "trained_model"
     pts = sorted(trained.glob("*.pt")) if trained.exists() else []
-    if value == "trained_model/best.pt" and len(pts) == 1:
+    if value == "trained_model/skku_merged_yolov8n_seg_aug_best.pt" and len(pts) == 1:
         return pts[0]
     return ROOT / value
 
