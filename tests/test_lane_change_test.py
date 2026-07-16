@@ -295,6 +295,102 @@ class LaneChangeTestControllerTest(unittest.TestCase):
         self.assertEqual(adjusted.speed, 60)
         self.assertEqual(adjusted.steering, 150)
 
+    def test_ultrasonic_stabilizing_uses_lane_target_even_when_legacy_recenter_is_on(self):
+        self.controller = LaneChangeTestController(
+            LaneChangeTestConfig(
+                mode="keyboard",
+                transition_seconds=1.0,
+                stable_required_frames=5,
+                steering_override=True,
+                steering_cap=150,
+                recenter_steering=True,
+            )
+        )
+        self.controller.request("ultrasonic_obstacle")
+        self.controller.update(lane(), 150.0, 800.0, 0.0, True)
+
+        stabilizing = self.controller.update(
+            lane_for_target_error(lateral_error_norm=-0.05, heading=0.30),
+            150.0,
+            800.0,
+            1.0,
+            True,
+        )
+        adjusted = self.controller.apply_control_adjustments(
+            ControlCommand(speed=255, steering=-30, reason="lane"),
+            stabilizing,
+        )
+
+        self.assertEqual(stabilizing.state, "stabilizing_lane1")
+        self.assertEqual(stabilizing.direction, 0)
+        self.assertEqual(adjusted.steering, -30)
+
+    def test_ultrasonic_change_keeps_priority_until_shifted_target_is_reached(self):
+        self.controller = LaneChangeTestController(
+            LaneChangeTestConfig(
+                mode="keyboard",
+                transition_seconds=1.0,
+                stable_required_frames=2,
+                stable_lateral_error=0.12,
+                stable_heading_error=0.18,
+            )
+        )
+        self.controller.request("ultrasonic_obstacle")
+        self.controller.update(lane(), 150.0, 800.0, 0.0, True)
+
+        still_approaching = self.controller.update(lane(), 150.0, 800.0, 1.5, True)
+        arrived = self.controller.update(
+            lane_for_shifted_lane1(heading=0.30),
+            150.0,
+            800.0,
+            1.6,
+            True,
+        )
+        stable1 = self.controller.update(
+            lane_for_shifted_lane1(heading=0.05),
+            150.0,
+            800.0,
+            1.7,
+            True,
+        )
+        stable2 = self.controller.update(
+            lane_for_shifted_lane1(heading=0.04),
+            150.0,
+            800.0,
+            1.8,
+            True,
+        )
+
+        self.assertEqual(still_approaching.state, "changing_to_lane1")
+        self.assertEqual(still_approaching.direction, -1)
+        self.assertEqual(arrived.state, "stabilizing_lane1")
+        self.assertEqual(arrived.direction, 0)
+        self.assertEqual(stable1.state, "stabilizing_lane1")
+        self.assertEqual(stable2.state, "lane1")
+
+    def test_ultrasonic_change_forces_max_steering_until_target_arrival(self):
+        self.controller = LaneChangeTestController(
+            LaneChangeTestConfig(
+                mode="keyboard",
+                transition_seconds=1.0,
+                steering_override=False,
+                steering_min=100,
+                steering_cap=150,
+                stable_required_frames=2,
+            )
+        )
+        self.controller.request("ultrasonic_obstacle")
+        self.controller.update(lane(), 150.0, 800.0, 0.0, True)
+        approaching = self.controller.update(lane(), 150.0, 800.0, 1.5, True)
+
+        adjusted = self.controller.apply_control_adjustments(
+            ControlCommand(speed=255, steering=-20, reason="lane"),
+            approaching,
+        )
+
+        self.assertEqual(approaching.state, "changing_to_lane1")
+        self.assertEqual(adjusted.steering, -150)
+
     def test_return_request_waits_until_lane1_is_stable(self):
         self.controller = LaneChangeTestController(
             LaneChangeTestConfig(

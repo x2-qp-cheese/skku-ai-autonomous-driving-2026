@@ -24,7 +24,7 @@ class LaneChangeTestConfig:
     stable_required_frames: int = 5
     stabilize_timeout_seconds: float = 0.0
     allow_virtual_stabilize: bool = False
-    recenter_steering: bool = True
+    recenter_steering: bool = False
     recenter_lateral_error: float = 0.35
     recenter_heading_error: float = 0.12
 
@@ -135,7 +135,8 @@ class LaneChangeTestController:
             self.request("timer")
 
         straight = lane.found and abs(lane.heading_error) <= max(0.0, self.config.max_straight_heading)
-        if self.state == "armed" and straight:
+        urgent_obstacle = self._request_source == "ultrasonic_obstacle"
+        if self.state == "armed" and (straight or (urgent_obstacle and lane.found)):
             self.state = "changing_to_lane1"
             self._phase_started_at = now
             self._clear_settle()
@@ -150,8 +151,9 @@ class LaneChangeTestController:
             offset_ratio = -self._smoothstep(progress)
             if progress >= 1.0:
                 offset_ratio = -1.0
-                direction = 0
-                self._finish_transition_or_stabilize("stabilizing_lane1", "lane1", now)
+                if not self._uses_target_arrival("changing_to_lane1"):
+                    direction = 0
+                    self._finish_transition_or_stabilize("stabilizing_lane1", "lane1", now)
         elif self.state == "stabilizing_lane1":
             offset_ratio = -1.0
         elif self.state == "lane1":
@@ -172,8 +174,9 @@ class LaneChangeTestController:
             offset_ratio = -(1.0 - self._smoothstep(progress))
             if progress >= 1.0:
                 offset_ratio = 0.0
-                direction = 0
-                self._finish_transition_or_stabilize("stabilizing_lane2", "completed", now)
+                if not self._uses_target_arrival("changing_to_lane2"):
+                    direction = 0
+                    self._finish_transition_or_stabilize("stabilizing_lane2", "completed", now)
         elif self.state == "stabilizing_lane2":
             offset_ratio = 0.0
 
@@ -181,6 +184,22 @@ class LaneChangeTestController:
 
         offset_px = offset_ratio * max(0.0, lane_width_px)
         shifted = self._shift_lane(lane, offset_px, bev_width_px) if lane.found else lane
+        if (
+            self.state == "changing_to_lane1"
+            and progress >= 1.0
+            and self._uses_target_arrival(self.state)
+            and self._target_arrived(shifted, -1)
+        ):
+            direction = 0
+            self._finish_transition_or_stabilize("stabilizing_lane1", "lane1", now)
+        elif (
+            self.state == "changing_to_lane2"
+            and progress >= 1.0
+            and self._uses_target_arrival(self.state)
+            and self._target_arrived(shifted, 1)
+        ):
+            direction = 0
+            self._finish_transition_or_stabilize("stabilizing_lane2", "completed", now)
         if self.state == "stabilizing_lane1":
             if self._update_stability(shifted, lane_reliable, now):
                 self.state = "lane1"
@@ -252,7 +271,8 @@ class LaneChangeTestController:
         direction = -1 if result.direction < 0 else 1
         minimum = max(0, int(self.config.steering_min))
         cap = max(0, int(self.config.steering_cap))
-        if self.config.steering_override:
+        force_target_lane = self._uses_target_arrival(result.state)
+        if self.config.steering_override or force_target_lane:
             steering = direction * (cap if cap > 0 else minimum)
         else:
             steering = command.steering
@@ -326,8 +346,26 @@ class LaneChangeTestController:
             and abs(lane.heading_error) <= max(0.0, float(self.config.stable_heading_error))
         )
 
+    def _uses_target_arrival(self, state: str) -> bool:
+        if state == "changing_to_lane1":
+            return self._request_source == "ultrasonic_obstacle"
+        if state == "changing_to_lane2":
+            return self._return_source == "ultrasonic_obstacle"
+        return False
+
+    def _target_arrived(self, lane: LaneGeometry, direction: int) -> bool:
+        if not lane.found or direction == 0:
+            return False
+        remaining_error = lane.lateral_error_norm * direction
+        return remaining_error <= max(0.0, float(self.config.stable_lateral_error))
+
     def _recenter_direction(self, lane: LaneGeometry) -> int:
         if not self.config.recenter_steering or not lane.found:
+            return 0
+        # Automatic obstacle avoidance must finish against the shifted lane
+        # target. A timed opposite-direction override can fire before the car
+        # reaches that target and make it weave between steering directions.
+        if self._request_source == "ultrasonic_obstacle":
             return 0
         if self.state == "stabilizing_lane1":
             counter_direction = 1

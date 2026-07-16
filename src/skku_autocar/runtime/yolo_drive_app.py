@@ -495,11 +495,13 @@ def log_effective_config(
         args.lane_change_steering_override,
     )
     LOG.info(
-        "obstacle_lane_change=%s trigger=%.0fmm clear=%.0fmm min_valid=%.0fmm speed_cap=%d stop=%.0fmm poll=%.2fs max_age=%.2fs cooldown=%.1fs front_mode=%s",
+        "obstacle_lane_change=%s trigger=%.0fmm clear=%.0fmm min_valid=%.0fmm confirm=%d clear_frames=%d speed_cap=%d stop=%.0fmm poll=%.2fs max_age=%.2fs cooldown=%.1fs front_mode=%s",
         args.obstacle_lane_change,
         args.obstacle_trigger_mm,
         args.obstacle_clear_mm,
         args.obstacle_min_mm,
+        args.obstacle_confirm_frames,
+        args.obstacle_clear_frames,
         args.obstacle_speed_cap,
         args.obstacle_stop_mm,
         args.obstacle_poll_interval,
@@ -695,12 +697,17 @@ class UltrasonicObstacleLaneChanger:
         self.max_age = float(args.obstacle_max_age)
         self.cooldown_seconds = float(args.obstacle_cooldown_seconds)
         self.front_mode = args.obstacle_front_mode
+        self.confirm_frames = max(1, int(args.obstacle_confirm_frames))
+        self.clear_frames_required = max(1, int(args.obstacle_clear_frames))
         self.values = {"FR": 0, "FL": 0, "SR": 0, "SL": 0}
         self.last_read_at: Optional[float] = None
         self._next_poll_at = 0.0
         self._was_obstacle = False
         self._last_trigger_at = -1e9
         self._last_obstacle_at = -1e9
+        self._detect_frames = 0
+        self._clear_frames = 0
+        self._confirmed_obstacle = False
 
     def should_poll(self, now: float) -> bool:
         return self.enabled and now >= self._next_poll_at
@@ -717,32 +724,37 @@ class UltrasonicObstacleLaneChanger:
     ) -> Optional[str]:
         if not self.enabled:
             return None
+        received_reading = False
         for line in lines:
             parsed = parse_ultrasonic_line(line)
             if parsed:
                 self.values.update(parsed)
                 self.last_read_at = now
+                received_reading = True
+
+        if received_reading:
+            obstacle_now = self._obstacle_present(now)
+            clear_now = self._obstacle_clear(now)
+            self._update_detection_state(obstacle_now, clear_now, now)
+        elif not self._fresh(now):
+            self._update_detection_state(False, True, now)
 
         if not running:
-            self._was_obstacle = False
             return None
 
-        obstacle = self._obstacle_present(now)
-        clear = self._obstacle_clear(now)
         event = None
-        if clear:
-            self._was_obstacle = False
         if (
-            obstacle
+            self._confirmed_obstacle
             and not self._was_obstacle
             and now - self._last_trigger_at >= max(0.0, self.cooldown_seconds)
         ):
             event = self._trigger_lane_change(lane_change_test, now)
-        if obstacle and (event is not None or self._state_can_trigger(lane_change_test.state)):
+        # Mark the obstacle consumed only after its lane-change request is
+        # accepted. A newly detected second obstacle may arrive while the first
+        # change is still stabilizing; keep that request pending until the target
+        # lane reaches lane1/completed instead of silently dropping it.
+        if event is not None:
             self._was_obstacle = True
-            self._last_obstacle_at = now
-        elif obstacle:
-            self._last_obstacle_at = now
         return event
 
     def apply_safety(
@@ -754,10 +766,14 @@ class UltrasonicObstacleLaneChanger:
     ) -> ControlCommand:
         if not self.enabled or not running or command.brake:
             return command
-        if self._emergency_close(now):
+        lane_change_active = self._lane_change_active(lane_change_state)
+        if self._emergency_close(now) and not lane_change_active:
             return ControlCommand.stop(self._append_reason(command.reason, "obstacle_stop"))
-        if not self._slow_active(lane_change_state, now):
-            return command
+        if self._slow_active(lane_change_state, now):
+            command = self._apply_speed_cap(command)
+        return command
+
+    def _apply_speed_cap(self, command: ControlCommand) -> ControlCommand:
         cap = max(0, int(self.speed_cap))
         speed = self._clip_abs(command.speed, cap)
         if speed == command.speed:
@@ -775,6 +791,12 @@ class UltrasonicObstacleLaneChanger:
         age = 0.0 if self.last_read_at is None else max(0.0, now - self.last_read_at)
         if self._emergency_close(now):
             state = "STOP"
+        elif self._confirmed_obstacle:
+            state = "CONFIRMED"
+        elif self._detect_frames > 0:
+            state = "CONFIRM %d/%d" % (self._detect_frames, self.confirm_frames)
+        elif not self._fresh(now):
+            state = "stale"
         elif self._obstacle_present(now):
             state = "DETECT"
         else:
@@ -799,9 +821,20 @@ class UltrasonicObstacleLaneChanger:
                 return "ultrasonic obstacle: lane1 -> lane2 requested (%s)" % self.status_text(now)
         return None
 
-    @staticmethod
-    def _state_can_trigger(state: str) -> bool:
-        return state in ("lane2", "completed", "lane1")
+    def _update_detection_state(self, obstacle_now: bool, clear_now: bool, now: float) -> None:
+        if obstacle_now:
+            self._detect_frames += 1
+            self._clear_frames = 0
+            self._last_obstacle_at = now
+        elif clear_now:
+            self._clear_frames += 1
+            self._detect_frames = 0
+
+        if self._detect_frames >= self.confirm_frames:
+            self._confirmed_obstacle = True
+        if self._clear_frames >= self.clear_frames_required:
+            self._confirmed_obstacle = False
+            self._was_obstacle = False
 
     def _front_values(self) -> list:
         return [int(self.values.get("FR", 0)), int(self.values.get("FL", 0))]
@@ -843,17 +876,21 @@ class UltrasonicObstacleLaneChanger:
         )
 
     def _slow_active(self, lane_change_state: str, now: float) -> bool:
-        if lane_change_state in (
+        if self._lane_change_active(lane_change_state):
+            return True
+        if self._confirmed_obstacle or self._detect_frames > 0:
+            return True
+        return now - self._last_obstacle_at <= max(0.0, self.slow_hold_seconds)
+
+    @staticmethod
+    def _lane_change_active(lane_change_state: str) -> bool:
+        return lane_change_state in (
             "armed",
             "changing_to_lane1",
             "stabilizing_lane1",
             "changing_to_lane2",
             "stabilizing_lane2",
-        ):
-            return True
-        if self._obstacle_present(now):
-            return True
-        return now - self._last_obstacle_at <= max(0.0, self.slow_hold_seconds)
+        )
 
     @staticmethod
     def _clip_abs(value: int, limit: int) -> int:
@@ -1037,8 +1074,8 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument(
         "--lane-change-recenter-steering",
         choices=("on", "off"),
-        default="on",
-        help="while stabilizing after a lane change, apply opposite-direction steering once heading/lateral conditions show the car should straighten into the target lane",
+        default="off",
+        help="legacy manual-test option that can force opposite steering while stabilizing; automatic ultrasonic lane changes always use lane-target tracking",
     )
     parser.add_argument(
         "--lane-change-recenter-lateral-error",
@@ -1075,6 +1112,18 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         type=float,
         default=50.0,
         help="ignore front ultrasonic readings below this value as timeout/noise, e.g. 0mm or a stuck 9mm sensor",
+    )
+    parser.add_argument(
+        "--obstacle-confirm-frames",
+        type=int,
+        default=2,
+        help="consecutive front-ultrasonic detections required before an obstacle lane change is requested",
+    )
+    parser.add_argument(
+        "--obstacle-clear-frames",
+        type=int,
+        default=2,
+        help="consecutive clear/stale front-ultrasonic reads required before the same obstacle can trigger again",
     )
     parser.add_argument(
         "--obstacle-speed-cap",
@@ -1117,6 +1166,18 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         choices=("any", "both"),
         default="any",
         help="any=FR or FL can trigger; both=FR and FL must both be valid obstacle readings",
+    )
+    parser.add_argument(
+        "--obstacle-counter-steer-seconds",
+        type=float,
+        default=0.0,
+        help="deprecated compatibility option; timed obstacle counter-steer is no longer applied",
+    )
+    parser.add_argument(
+        "--obstacle-counter-steering",
+        type=int,
+        default=0,
+        help="deprecated compatibility option; timed obstacle counter-steer is no longer applied",
     )
     parser.add_argument("--max-steering", type=int, default=120)
     parser.add_argument("--steering-rate-limit", type=int, default=110)

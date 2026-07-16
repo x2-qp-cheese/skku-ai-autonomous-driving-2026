@@ -372,11 +372,25 @@ class YoloLaneGeometryTest(unittest.TestCase):
         detector = UltrasonicObstacleLaneChanger(args)
         controller = LaneChangeTestController(LaneChangeTestConfig(mode="keyboard"))
 
-        event = detector.update(["US FR=700 FL=0"], 1.0, controller, True)
+        first_event = detector.update(["US FR=700 FL=0"], 1.0, controller, True)
+        event = detector.update(["US FR=700 FL=0"], 1.1, controller, True)
 
+        self.assertIsNone(first_event)
         self.assertIn("lane2 -> lane1", event)
         self.assertEqual(controller.state, "armed")
         self.assertEqual(controller.request_source, "ultrasonic_obstacle")
+
+    def test_ultrasonic_obstacle_confirm_counts_sensor_reads_not_camera_frames(self):
+        args = parse_args(["--obstacle-lane-change", "on", "--obstacle-trigger-mm", "850"])
+        detector = UltrasonicObstacleLaneChanger(args)
+        controller = LaneChangeTestController(LaneChangeTestConfig(mode="keyboard"))
+
+        detector.update(["US FR=700 FL=0"], 1.0, controller, True)
+        frame_event = detector.update([], 1.03, controller, True)
+        sensor_event = detector.update(["US FR=700 FL=0"], 1.1, controller, True)
+
+        self.assertIsNone(frame_event)
+        self.assertIn("lane2 -> lane1", sensor_event)
 
     def test_ultrasonic_obstacle_seen_while_paused_still_triggers_after_start(self):
         args = parse_args(["--obstacle-lane-change", "on", "--obstacle-trigger-mm", "850"])
@@ -403,6 +417,7 @@ class YoloLaneGeometryTest(unittest.TestCase):
         detector = UltrasonicObstacleLaneChanger(args)
         controller = LaneChangeTestController(LaneChangeTestConfig(mode="keyboard"))
         detector.update(["US FR=700 FL=0"], 1.0, controller, True)
+        detector.update(["US FR=700 FL=0"], 1.1, controller, True)
 
         guarded = detector.apply_safety(
             ControlCommand(speed=255, steering=20, brake=False, reason="fixed_speed"),
@@ -452,11 +467,96 @@ class YoloLaneGeometryTest(unittest.TestCase):
         controller.update(lane_geometry(0.0, 0.0), 150.0, 800.0, 0.0, True)
         controller.update(lane_geometry(0.0, 0.0), 150.0, 800.0, 1.0, True)
         detector.update(["US FR=1000 FL=0"], 2.0, controller, True)
+        detector.update(["US FR=1000 FL=0"], 2.1, controller, True)
+        detector.update(["US FR=700 FL=0"], 3.0, controller, True)
 
-        event = detector.update(["US FR=700 FL=0"], 3.0, controller, True)
+        event = detector.update(["US FR=700 FL=0"], 3.1, controller, True)
 
         self.assertIn("lane1 -> lane2", event)
         self.assertEqual(controller.return_source, "ultrasonic_obstacle")
+
+    def test_ultrasonic_obstacle_consumes_same_obstacle_while_transitioning(self):
+        args = parse_args(["--obstacle-lane-change", "on", "--obstacle-trigger-mm", "850"])
+        detector = UltrasonicObstacleLaneChanger(args)
+        controller = LaneChangeTestController(
+            LaneChangeTestConfig(mode="keyboard", transition_seconds=1.0, stable_required_frames=0)
+        )
+
+        detector.update(["US FR=700 FL=0"], 1.0, controller, True)
+        first_event = detector.update(["US FR=700 FL=0"], 1.1, controller, True)
+        controller.update(lane_geometry(0.0, 0.0), 150.0, 800.0, 1.1, True)
+        controller.update(lane_geometry(0.0, 0.0), 150.0, 800.0, 2.2, True)
+        repeated_event = detector.update(["US FR=700 FL=0"], 2.2, controller, True)
+
+        self.assertIn("lane2 -> lane1", first_event)
+        self.assertEqual(controller.state, "lane1")
+        self.assertIsNone(repeated_event)
+
+    def test_new_obstacle_detected_while_stabilizing_is_held_until_lane_is_stable(self):
+        args = parse_args(
+            [
+                "--obstacle-lane-change",
+                "on",
+                "--obstacle-trigger-mm",
+                "850",
+                "--obstacle-clear-mm",
+                "950",
+                "--obstacle-cooldown-seconds",
+                "0",
+            ]
+        )
+        detector = UltrasonicObstacleLaneChanger(args)
+        controller = LaneChangeTestController(LaneChangeTestConfig(mode="keyboard"))
+
+        detector.update(["US FR=700 FL=0"], 1.0, controller, True)
+        first_event = detector.update(["US FR=700 FL=0"], 1.1, controller, True)
+        detector.update(["US FR=1200 FL=0"], 2.0, controller, True)
+        detector.update(["US FR=1200 FL=0"], 2.1, controller, True)
+
+        controller.state = "stabilizing_lane1"
+        detector.update(["US FR=700 FL=0"], 3.0, controller, True)
+        busy_event = detector.update(["US FR=700 FL=0"], 3.1, controller, True)
+        controller.state = "lane1"
+        stable_event = detector.update([], 3.2, controller, True)
+
+        self.assertIn("lane2 -> lane1", first_event)
+        self.assertIsNone(busy_event)
+        self.assertIn("lane1 -> lane2", stable_event)
+
+    def test_ultrasonic_obstacle_request_starts_without_straight_gate(self):
+        controller = LaneChangeTestController(
+            LaneChangeTestConfig(mode="keyboard", transition_seconds=1.0, max_straight_heading=0.01)
+        )
+        controller.request("ultrasonic_obstacle")
+
+        result = controller.update(lane_geometry(0.0, 0.50), 150.0, 800.0, 1.0, True)
+
+        self.assertEqual(result.state, "changing_to_lane1")
+        self.assertEqual(result.direction, -1)
+
+    def test_ultrasonic_obstacle_does_not_force_timed_counter_steer(self):
+        args = parse_args(
+            [
+                "--obstacle-lane-change",
+                "on",
+                "--obstacle-counter-steer-seconds",
+                "0.5",
+                "--obstacle-counter-steering",
+                "140",
+            ]
+        )
+        detector = UltrasonicObstacleLaneChanger(args)
+        detector.apply_safety(ControlCommand(80, -140, reason="avoid"), "changing_to_lane1", 1.0, True)
+
+        guarded = detector.apply_safety(
+            ControlCommand(80, 37, reason="stabilize"),
+            "stabilizing_lane1",
+            1.1,
+            True,
+        )
+
+        self.assertEqual(guarded.steering, 37)
+        self.assertNotIn("obstacle_counter", guarded.reason)
 
     def test_ultrasonic_obstacle_waits_for_lane_stability_before_return(self):
         args = parse_args(["--obstacle-lane-change", "on", "--obstacle-trigger-mm", "850"])
