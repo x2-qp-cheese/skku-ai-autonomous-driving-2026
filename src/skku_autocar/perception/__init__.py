@@ -1,1 +1,1 @@
-"""YOLO, BEV and traffic-light perception."""
+"""YOLO and BEV lane perception."""

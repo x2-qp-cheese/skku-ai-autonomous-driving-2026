@@ -15,7 +15,6 @@ class YoloLaneConfig:
     center_classes: Tuple[str, ...] = ("lane-center", "center")
     side_classes: Tuple[str, ...] = ("lane-side", "side")
     crosswalk_classes: Tuple[str, ...] = ("crosswalk", "cross-walk", "zebra")
-    light_classes: Tuple[str, ...] = ("light", "traffic-light", "traffic_light", "trafficlight")
     lane_classes: Tuple[str, ...] = (
         "lane",
         "line",
@@ -25,9 +24,6 @@ class YoloLaneConfig:
         "driveable",
     )
     min_mask_area_ratio: float = 0.001
-    # Traffic lights are much smaller than lane masks, especially near the top of
-    # the frame, so they need their own area threshold.
-    min_light_mask_area_ratio: float = 0.00002
     fallback_lane_width_ratio: float = 0.24
     min_lane_width_ratio: float = 0.12
     max_lane_width_ratio: float = 0.58
@@ -57,12 +53,10 @@ class YoloClassMasks:
     side: Tuple[Any, ...] = ()
     lane: Tuple[Any, ...] = ()
     crosswalk: Tuple[Any, ...] = ()
-    light: Tuple[Any, ...] = ()
     center_conf: float = 0.0
     side_conf: float = 0.0
     lane_conf: float = 0.0
     crosswalk_conf: float = 0.0
-    light_conf: float = 0.0
     device: str = "cpu"
     inference_ms: float = 0.0
 
@@ -177,12 +171,7 @@ class YoloLaneSegmenter:
             if kind is None:
                 continue
             area = float((mask > 0).sum())
-            kind_min_area = (
-                total_area * self.config.min_light_mask_area_ratio
-                if kind == "light"
-                else min_area
-            )
-            if area < kind_min_area:
+            if area < min_area:
                 continue
             confidence = float(confidences[index])
             score = confidence * (area / total_area)
@@ -221,18 +210,15 @@ class YoloLaneSegmenter:
         side, side_conf = group("side")
         lane, lane_conf = group("lane")
         crosswalk, crosswalk_conf = group("crosswalk")
-        light, light_conf = group("light")
         return YoloClassMasks(
             center=center,
             side=side,
             lane=lane,
             crosswalk=crosswalk,
-            light=light,
             center_conf=center_conf,
             side_conf=side_conf,
             lane_conf=lane_conf,
             crosswalk_conf=crosswalk_conf,
-            light_conf=light_conf,
             device=self.device,
             inference_ms=self._inference_ms(result),
         )
@@ -285,8 +271,6 @@ class YoloLaneSegmenter:
         # Crosswalk is checked first so it is never absorbed by a lane class.
         if any(token in lowered for token in self.config.crosswalk_classes):
             return "crosswalk"
-        if any(token == lowered or token in lowered for token in self.config.light_classes):
-            return "light"
         if any(token in lowered for token in self.config.center_classes):
             return "center"
         if any(token in lowered for token in self.config.side_classes):

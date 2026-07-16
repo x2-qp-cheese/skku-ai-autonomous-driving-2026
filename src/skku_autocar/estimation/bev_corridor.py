@@ -89,13 +89,8 @@ class BevCorridorConfig:
     # Crosswalk handling. YOLO's crosswalk pixels are their own class, so they are
     # already kept out of the center/side line fits; a lane line partly covered by
     # a crosswalk is still followed, and if the center line is fully covered the
-    # visible side line drives the corridor via tier 3. We therefore do NOT stop
-    # for a crosswalk by default -- dropping good, clearly-visible lanes just
-    # because a crosswalk is in view is wrong. crosswalk_halt is opt-in for the
-    # traffic-light mission that must hold before the line; crosswalk_min_area_ratio
-    # is the BEV-area fraction at which the crosswalk counts as "present" (the
-    # last_crosswalk_visible flag, and the optional halt).
-    crosswalk_halt: bool = False
+    # visible side line drives the corridor via tier 3. Crosswalk detection is used
+    # only to activate the stable virtual-center strategy below.
     crosswalk_min_area_ratio: float = 0.02
     # While a crosswalk is in view, the zebra stripes make the measured lane width
     # unreliable, so build the corridor's virtual centerline from a FIXED lane
@@ -233,14 +228,8 @@ class BevCorridorLaneEstimator:
         # A crosswalk in view does NOT halt driving: its pixels are a separate
         # class (kept out of the lane fits), so we keep following whatever lane
         # lines are still visible -- e.g. the right side line, which stays clean
-        # through a crosswalk and drives the corridor via tier 3. Only the opt-in
-        # crosswalk_halt (traffic-light mission) stops here.
+        # through a crosswalk and drives the corridor via tier 3.
         self.last_crosswalk_visible = self._crosswalk_visible(bev)
-        if self.config.crosswalk_halt and self.last_crosswalk_visible:
-            self.last_class_name = "crosswalk"
-            self.last_tier = 0
-            self._reset_temporal()
-            return self._lost(bev.shape, "crosswalk")
 
         # Through a crosswalk (not halting), build the virtual centerline from the
         # fixed crosswalk_lane_width_px rather than the zebra-contaminated measured
@@ -430,8 +419,8 @@ class BevCorridorLaneEstimator:
     def _crosswalk_visible(self, bev: BevClassMasks) -> bool:
         """True when YOLO's dedicated crosswalk class covers at least
         crosswalk_min_area_ratio of the BEV canvas (proximity-based: a far/small
-        crosswalk stays below it). Used only for the last_crosswalk_visible flag
-        and the opt-in crosswalk_halt -- it does not, by itself, stop driving."""
+        crosswalk stays below it). It activates crosswalk virtual-lane handling
+        and never stops the vehicle by itself."""
         import numpy as np
 
         if not bev.crosswalk:

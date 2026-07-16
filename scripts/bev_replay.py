@@ -97,7 +97,6 @@ class ReplayPipeline:
                     max_center_jump_px=args.max_center_jump,
                     max_coast_frames=args.max_coast_frames,
                     max_width_jump_px=args.max_width_jump,
-                    crosswalk_halt=args.crosswalk_halt == "on",
                     crosswalk_lane_width_px=args.crosswalk_lane_width_px,
                     crosswalk_center_smooth_alpha=args.crosswalk_center_smooth,
                     crosswalk_max_center_jump_px=args.crosswalk_max_center_jump,
@@ -329,8 +328,6 @@ def parse_args(argv):
                         help="[--corridor] max rejected frames to coast before lost")
     parser.add_argument("--max-width-jump", type=float, default=BevCorridorConfig.max_width_jump_px,
                         help="[--corridor] reject a lane-width measurement jumping more than this many px")
-    parser.add_argument("--crosswalk-halt", choices=("on", "off"), default="off",
-                        help="[--corridor] stop at a crosswalk instead of following visible lanes through it")
     parser.add_argument("--crosswalk-lane-width-px", type=float, default=BevCorridorConfig.crosswalk_lane_width_px,
                         help="[--corridor] fixed BEV lane width used to build the virtual centerline while a crosswalk is in view (zebra makes the measured width unreliable)")
     parser.add_argument("--crosswalk-center-smooth", type=float,
