@@ -4,6 +4,11 @@
 //   왼쪽   뒷바퀴 모터 : IN1=D7,  IN2=D8
 //   조향 모터          : IN1=D11, IN2=D12
 //   조향각 가변저항     : A4
+//   초음파 센서:
+//     전방 우: TRIG=D22, ECHO=D23
+//     전방 좌: TRIG=D24, ECHO=D25
+//     옆   우: TRIG=D26, ECHO=D27
+//     옆   좌: TRIG=D28, ECHO=D29
 //   드라이버 PWM(Enable)핀 -> 아두이노 5V 고정  (항상 활성화)
 //   드라이버 5V / COM(GND) -> 아두이노 5V / GND (공통 접지 필수!)
 //
@@ -13,6 +18,10 @@
 // 시리얼 프로토콜 (PC -> 아두이노), protocol.py 와 1:1 호환:
 //   "DRIVE <speed> <steer>\n"   speed: -255..255 (양수=전진), steer: -120..120 (0=직진, 양수=우측 목표)
 //   "STOP\n"   "PING\n"   "POT\n"(조향 캘리브레이션용: 현재 A4값 출력)
+//   "US\n"     초음파 1회 측정 출력: US FR=<mm> FL=<mm> SR=<mm> SL=<mm> (0=미검출/타임아웃)
+//   "USF\n"    전방 초음파만 1회 측정 출력: US FR=<mm> FL=<mm>
+//   "USFR\n"   전방 우 1개만 측정, "USFL\n" 전방 좌, "USSR\n" 옆 우, "USSL\n" 옆 좌
+//   "USON\n"   초음파 주기 출력 켜기, "USOFF\n" 끄기
 
 const long BAUD_RATE = 115200;
 const unsigned long SAFETY_TIMEOUT_MS = 500;   // 이 시간 동안 명령 없으면 자동 정지(안전)
@@ -26,6 +35,18 @@ const int STEER_IN1 = 11, STEER_IN2 = 12;
 
 // ---- 조향 피드백(가변저항) ----
 const int STEER_POT = A4;
+
+// ---- 초음파 센서 핀 ----
+const int US_FRONT_RIGHT_TRIG = 22, US_FRONT_RIGHT_ECHO = 23;
+const int US_FRONT_LEFT_TRIG  = 24, US_FRONT_LEFT_ECHO  = 25;
+const int US_SIDE_RIGHT_TRIG  = 26, US_SIDE_RIGHT_ECHO  = 27;
+const int US_SIDE_LEFT_TRIG   = 28, US_SIDE_LEFT_ECHO   = 29;
+
+const unsigned long US_ECHO_TIMEOUT_US = 12000UL;  // 약 2m. 근거리 장애물 확인용으로 루프 블로킹을 줄임.
+const unsigned long US_INTER_SENSOR_DELAY_MS = 30;  // HC-SR04 간섭/잔향 방지용 센서 간격.
+const unsigned long US_STREAM_INTERVAL_MS = 220;
+bool ultrasonicStream = false;
+unsigned long lastUltrasonicAt = 0;
 
 // ================= 조향 캘리브레이션 (반드시 실측 후 수정!) =================
 // 시동 끄고 바퀴를 손으로 [정중앙/왼쪽끝/오른쪽끝] 에 두고 "POT" 명령으로 A4값을 읽어 채우세요.
@@ -48,6 +69,7 @@ void setup() {
   Serial.begin(BAUD_RATE);
   int outs[] = {RIGHT_IN1, RIGHT_IN2, LEFT_IN1, LEFT_IN2, STEER_IN1, STEER_IN2};
   for (int i = 0; i < 6; i++) pinMode(outs[i], OUTPUT);
+  setupUltrasonicPins();
   stopAll();
   lastCommandAt = millis();
   Serial.println("OK READY");
@@ -71,6 +93,7 @@ void loop() {
 
   applyDrive(driveSpeed);   // 구동 모터 (좌우 동시)
   updateSteering();         // 조향 위치제어 (매 루프 실행)
+  updateUltrasonicStream();
 }
 
 void handleCommand(const String& line) {
@@ -79,6 +102,34 @@ void handleCommand(const String& line) {
   if (line == "POT") {                 // 캘리브레이션용: 현재 조향각 센서값 출력
     Serial.print("POT ");
     Serial.println(analogRead(STEER_POT));
+    return;
+  }
+
+  if (line == "US") {
+    printUltrasonicReadings();
+    return;
+  }
+
+  if (line == "USF") {
+    printFrontUltrasonicReadings();
+    return;
+  }
+
+  if (line == "USFR") { printSingleUltrasonic("FR", US_FRONT_RIGHT_TRIG, US_FRONT_RIGHT_ECHO); return; }
+  if (line == "USFL") { printSingleUltrasonic("FL", US_FRONT_LEFT_TRIG, US_FRONT_LEFT_ECHO); return; }
+  if (line == "USSR") { printSingleUltrasonic("SR", US_SIDE_RIGHT_TRIG, US_SIDE_RIGHT_ECHO); return; }
+  if (line == "USSL") { printSingleUltrasonic("SL", US_SIDE_LEFT_TRIG, US_SIDE_LEFT_ECHO); return; }
+
+  if (line == "USON") {
+    ultrasonicStream = true;
+    lastUltrasonicAt = 0;
+    Serial.println("OK USON");
+    return;
+  }
+
+  if (line == "USOFF") {
+    ultrasonicStream = false;
+    Serial.println("OK USOFF");
     return;
   }
 
@@ -147,4 +198,78 @@ void stopAll() {
   motor(RIGHT_IN1, RIGHT_IN2, 0);
   motor(LEFT_IN1,  LEFT_IN2,  0);
   motor(STEER_IN1, STEER_IN2, 0);
+}
+
+void setupUltrasonicPins() {
+  pinMode(US_FRONT_RIGHT_TRIG, OUTPUT);
+  pinMode(US_FRONT_LEFT_TRIG, OUTPUT);
+  pinMode(US_SIDE_RIGHT_TRIG, OUTPUT);
+  pinMode(US_SIDE_LEFT_TRIG, OUTPUT);
+  pinMode(US_FRONT_RIGHT_ECHO, INPUT);
+  pinMode(US_FRONT_LEFT_ECHO, INPUT);
+  pinMode(US_SIDE_RIGHT_ECHO, INPUT);
+  pinMode(US_SIDE_LEFT_ECHO, INPUT);
+  digitalWrite(US_FRONT_RIGHT_TRIG, LOW);
+  digitalWrite(US_FRONT_LEFT_TRIG, LOW);
+  digitalWrite(US_SIDE_RIGHT_TRIG, LOW);
+  digitalWrite(US_SIDE_LEFT_TRIG, LOW);
+}
+
+void updateUltrasonicStream() {
+  if (!ultrasonicStream) return;
+  unsigned long now = millis();
+  if (now - lastUltrasonicAt < US_STREAM_INTERVAL_MS) return;
+  lastUltrasonicAt = now;
+  printUltrasonicReadings();
+}
+
+int readUltrasonicMm(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  unsigned long duration = pulseIn(echoPin, HIGH, US_ECHO_TIMEOUT_US);
+  if (duration == 0) return 0;
+  // 왕복 시간(us) * 음속(mm/us) / 2. 20도 기준 음속은 약 0.343 mm/us.
+  return (int)((duration * 343UL) / 2000UL);
+}
+
+void printUltrasonicReadings() {
+  int fr = readUltrasonicMm(US_FRONT_RIGHT_TRIG, US_FRONT_RIGHT_ECHO);
+  delay(US_INTER_SENSOR_DELAY_MS);
+  int fl = readUltrasonicMm(US_FRONT_LEFT_TRIG, US_FRONT_LEFT_ECHO);
+  delay(US_INTER_SENSOR_DELAY_MS);
+  int sr = readUltrasonicMm(US_SIDE_RIGHT_TRIG, US_SIDE_RIGHT_ECHO);
+  delay(US_INTER_SENSOR_DELAY_MS);
+  int sl = readUltrasonicMm(US_SIDE_LEFT_TRIG, US_SIDE_LEFT_ECHO);
+
+  Serial.print("US FR=");
+  Serial.print(fr);
+  Serial.print(" FL=");
+  Serial.print(fl);
+  Serial.print(" SR=");
+  Serial.print(sr);
+  Serial.print(" SL=");
+  Serial.println(sl);
+}
+
+void printFrontUltrasonicReadings() {
+  int fr = readUltrasonicMm(US_FRONT_RIGHT_TRIG, US_FRONT_RIGHT_ECHO);
+  delay(US_INTER_SENSOR_DELAY_MS);
+  int fl = readUltrasonicMm(US_FRONT_LEFT_TRIG, US_FRONT_LEFT_ECHO);
+
+  Serial.print("US FR=");
+  Serial.print(fr);
+  Serial.print(" FL=");
+  Serial.println(fl);
+}
+
+void printSingleUltrasonic(const char* name, int trigPin, int echoPin) {
+  int value = readUltrasonicMm(trigPin, echoPin);
+  Serial.print("US ");
+  Serial.print(name);
+  Serial.print("=");
+  Serial.println(value);
 }

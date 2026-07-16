@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 import sys
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from ..types import ControlCommand
 from .protocol import encode_command
@@ -77,6 +77,7 @@ class SerialVehicleClient:
         self.max_steering = max_steering
         self.port: Optional[str] = None
         self._serial = None
+        self._rx_buffer = ""
 
     def connect(self) -> None:
         try:
@@ -96,10 +97,34 @@ class SerialVehicleClient:
             self.close()
             raise
 
-    def send(self, command: ControlCommand) -> None:
+    def send(self, command: ControlCommand) -> List[str]:
         serial_conn = self._require_open()
+        # The firmware acknowledges every DRIVE/STOP command. Drain replies from
+        # the previous command so a long run cannot fill the host receive buffer.
+        lines = self.read_lines()
         line = encode_command(command, self.max_speed, self.max_steering)
         serial_conn.write(line.encode("ascii"))
+        return lines
+
+    def write_line(self, line: str) -> List[str]:
+        serial_conn = self._require_open()
+        lines = self.read_lines()
+        text = line if line.endswith("\n") else line + "\n"
+        serial_conn.write(text.encode("ascii"))
+        return lines
+
+    def read_lines(self) -> List[str]:
+        serial_conn = self._require_open()
+        waiting = int(getattr(serial_conn, "in_waiting", 0))
+        if waiting <= 0:
+            return []
+        raw = serial_conn.read(waiting)
+        if not raw:
+            return []
+        self._rx_buffer += raw.decode("ascii", errors="replace")
+        parts = self._rx_buffer.split("\n")
+        self._rx_buffer = parts[-1]
+        return [part.strip("\r") for part in parts[:-1] if part.strip("\r")]
 
     def stop(self, reason: str = "stop") -> None:
         if self._serial is not None:
@@ -109,6 +134,7 @@ class SerialVehicleClient:
         if self._serial is not None:
             self._serial.close()
             self._serial = None
+        self._rx_buffer = ""
 
     def _wait_ready(self) -> None:
         serial_conn = self._require_open()

@@ -2,11 +2,16 @@ import unittest
 
 from skku_autocar.estimation.lane_geometry import LaneGeometry
 from skku_autocar.planning.yolo_lane_follower import YoloLaneFollower, YoloLaneFollowerConfig
+from skku_autocar.planning.lane_change_test import LaneChangeTestConfig, LaneChangeTestController
 from skku_autocar.runtime.yolo_drive_app import (
     CommandSafetyFilter,
+    UltrasonicObstacleLaneChanger,
     build_bev_corridor_config,
     build_follower_config,
+    build_lane_change_config,
+    handle_lane_change_key,
     parse_args,
+    parse_ultrasonic_line,
 )
 from skku_autocar.types import ControlCommand
 
@@ -322,6 +327,150 @@ class YoloLaneGeometryTest(unittest.TestCase):
         self.assertTrue(follower_config.center_lock_enabled)
         self.assertAlmostEqual(follower_config.center_lock_error_threshold, 0.04)
         self.assertEqual(follower_config.center_lock_min_steering, 95)
+
+    def test_lane_change_cli_defaults_are_keyboard_ready_and_aggressive(self):
+        args = parse_args([])
+        lane_change_config = build_lane_change_config(args)
+
+        self.assertEqual(lane_change_config.mode, "keyboard")
+        self.assertLess(lane_change_config.transition_seconds, 2.0)
+        self.assertGreaterEqual(lane_change_config.speed_cap, 85)
+        self.assertGreaterEqual(lane_change_config.steering_min, 100)
+
+    def test_lane_change_key_requests_and_returns(self):
+        controller = LaneChangeTestController(
+            LaneChangeTestConfig(mode="external", transition_seconds=1.0, stable_required_frames=0)
+        )
+
+        action, _ = handle_lane_change_key(controller, True)
+        controller.update(lane_geometry(0.0, 0.0), 150.0, 800.0, 0.0, True)
+        controller.update(lane_geometry(0.0, 0.0), 150.0, 800.0, 1.0, True)
+        return_action, _ = handle_lane_change_key(controller, True)
+
+        self.assertEqual(action, "request")
+        self.assertEqual(controller.state, "lane1")
+        self.assertEqual(return_action, "return")
+        self.assertEqual(controller.return_source, "keyboard_clear")
+
+    def test_ultrasonic_line_parser_reads_front_and_side_values(self):
+        parsed = parse_ultrasonic_line("US FR=700 FL=0 SR=1200 SL=95")
+
+        self.assertEqual(parsed, {"FR": 700, "FL": 0, "SR": 1200, "SL": 95})
+
+    def test_ultrasonic_obstacle_ignores_zero_and_too_small_noise(self):
+        args = parse_args(["--obstacle-lane-change", "on", "--obstacle-min-mm", "50"])
+        detector = UltrasonicObstacleLaneChanger(args)
+        controller = LaneChangeTestController(LaneChangeTestConfig(mode="keyboard"))
+
+        event = detector.update(["US FR=0 FL=9"], 1.0, controller, True)
+
+        self.assertIsNone(event)
+        self.assertEqual(controller.state, "lane2")
+
+    def test_ultrasonic_obstacle_requests_lane_change_on_front_detection(self):
+        args = parse_args(["--obstacle-lane-change", "on", "--obstacle-trigger-mm", "850"])
+        detector = UltrasonicObstacleLaneChanger(args)
+        controller = LaneChangeTestController(LaneChangeTestConfig(mode="keyboard"))
+
+        event = detector.update(["US FR=700 FL=0"], 1.0, controller, True)
+
+        self.assertIn("lane2 -> lane1", event)
+        self.assertEqual(controller.state, "armed")
+        self.assertEqual(controller.request_source, "ultrasonic_obstacle")
+
+    def test_ultrasonic_obstacle_seen_while_paused_still_triggers_after_start(self):
+        args = parse_args(["--obstacle-lane-change", "on", "--obstacle-trigger-mm", "850"])
+        detector = UltrasonicObstacleLaneChanger(args)
+        controller = LaneChangeTestController(LaneChangeTestConfig(mode="keyboard"))
+
+        paused_event = detector.update(["US FR=700 FL=0"], 1.0, controller, False)
+        running_event = detector.update(["US FR=700 FL=0"], 1.1, controller, True)
+
+        self.assertIsNone(paused_event)
+        self.assertIn("lane2 -> lane1", running_event)
+
+    def test_ultrasonic_obstacle_caps_speed_while_lane_change_is_armed(self):
+        args = parse_args(
+            [
+                "--obstacle-lane-change",
+                "on",
+                "--obstacle-trigger-mm",
+                "850",
+                "--obstacle-speed-cap",
+                "90",
+            ]
+        )
+        detector = UltrasonicObstacleLaneChanger(args)
+        controller = LaneChangeTestController(LaneChangeTestConfig(mode="keyboard"))
+        detector.update(["US FR=700 FL=0"], 1.0, controller, True)
+
+        guarded = detector.apply_safety(
+            ControlCommand(speed=255, steering=20, brake=False, reason="fixed_speed"),
+            controller.state,
+            1.0,
+            True,
+        )
+
+        self.assertEqual(controller.state, "armed")
+        self.assertEqual(guarded.speed, 90)
+        self.assertEqual(guarded.steering, 20)
+        self.assertIn("obstacle_cap", guarded.reason)
+
+    def test_ultrasonic_obstacle_stops_when_front_distance_is_too_close(self):
+        args = parse_args(
+            [
+                "--obstacle-lane-change",
+                "on",
+                "--obstacle-trigger-mm",
+                "1000",
+                "--obstacle-stop-mm",
+                "300",
+            ]
+        )
+        detector = UltrasonicObstacleLaneChanger(args)
+        controller = LaneChangeTestController(LaneChangeTestConfig(mode="keyboard"))
+        detector.update(["US FR=250 FL=0"], 1.0, controller, True)
+
+        guarded = detector.apply_safety(
+            ControlCommand(speed=255, steering=20, brake=False, reason="fixed_speed"),
+            controller.state,
+            1.0,
+            True,
+        )
+
+        self.assertTrue(guarded.brake)
+        self.assertEqual(guarded.speed, 0)
+        self.assertIn("obstacle_stop", guarded.reason)
+
+    def test_ultrasonic_obstacle_requests_return_after_next_obstacle_in_lane1(self):
+        args = parse_args(["--obstacle-lane-change", "on", "--obstacle-trigger-mm", "850"])
+        detector = UltrasonicObstacleLaneChanger(args)
+        controller = LaneChangeTestController(
+            LaneChangeTestConfig(mode="keyboard", transition_seconds=1.0, stable_required_frames=0)
+        )
+        controller.request("setup")
+        controller.update(lane_geometry(0.0, 0.0), 150.0, 800.0, 0.0, True)
+        controller.update(lane_geometry(0.0, 0.0), 150.0, 800.0, 1.0, True)
+        detector.update(["US FR=1000 FL=0"], 2.0, controller, True)
+
+        event = detector.update(["US FR=700 FL=0"], 3.0, controller, True)
+
+        self.assertIn("lane1 -> lane2", event)
+        self.assertEqual(controller.return_source, "ultrasonic_obstacle")
+
+    def test_ultrasonic_obstacle_waits_for_lane_stability_before_return(self):
+        args = parse_args(["--obstacle-lane-change", "on", "--obstacle-trigger-mm", "850"])
+        detector = UltrasonicObstacleLaneChanger(args)
+        controller = LaneChangeTestController(LaneChangeTestConfig(mode="keyboard"))
+        controller.state = "stabilizing_lane1"
+
+        stabilizing_event = detector.update(["US FR=700 FL=0"], 1.0, controller, True)
+        controller.state = "lane1"
+        stable_event = detector.update(["US FR=700 FL=0"], 1.1, controller, True)
+
+        self.assertIsNone(stabilizing_event)
+        self.assertIn("lane1 -> lane2", stable_event)
+        self.assertEqual(controller.return_source, "ultrasonic_obstacle")
 
     def test_virtual_lane_command_is_capped(self):
         args = parse_args(

@@ -21,6 +21,12 @@ def mask_band(top, bottom):
     return (mask,)
 
 
+def narrow_mask_band(top, bottom):
+    mask = np.zeros((40, 40), dtype=np.uint8)
+    mask[top:bottom, 18:22] = 255
+    return (mask,)
+
+
 class TrafficLightControllerTest(unittest.TestCase):
     def setUp(self):
         self.controller = TrafficLightController(
@@ -148,6 +154,25 @@ class TrafficLightControllerTest(unittest.TestCase):
         self.assertFalse(jumped.contact)
         self.assertFalse(recovered.contact)
         self.assertFalse(recovered.stop_latched)
+
+    def test_narrow_lower_contact_mask_is_ignored(self):
+        controller = TrafficLightController(
+            TrafficLightConfig(
+                confirm_frames=1,
+                min_color_pixels=5,
+                stop_line_y_ratio=0.70,
+                contact_min_row_width_ratio=0.25,
+            )
+        )
+        red, masks = light_frame((0, 0, 255))
+
+        controller.update(red, masks, mask_band(4, 18))
+        narrow = controller.update(red, masks, narrow_mask_band(28, 39))
+
+        self.assertEqual(narrow.state, "red")
+        self.assertFalse(narrow.contact)
+        self.assertFalse(narrow.stop_latched)
+        self.assertEqual(narrow.mask_bottom_y_ratio, 0.0)
 
     def test_red_contact_stop_stays_latched_if_mask_is_lost(self):
         red, masks = light_frame((0, 0, 255), top=18, bottom=36)

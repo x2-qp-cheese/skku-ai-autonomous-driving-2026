@@ -19,6 +19,7 @@ class TrafficLightConfig:
     red_confirm_frames: Optional[int] = None
     contact_confirm_frames: int = 2
     contact_hold_frames: int = 5
+    contact_min_row_width_ratio: float = 0.20
     # Virtual front-contact line in frame coordinates. A confirmed RED is remembered
     # as soon as it is seen, but braking starts only when the bottom of the supplied
     # contact mask reaches this y ratio. The drive runtime supplies crosswalk masks.
@@ -98,20 +99,25 @@ class TrafficLightController:
         threshold = min(1.0, max(0.0, self.config.stop_line_y_ratio))
         crossed_contact_line = False
         if contact_detected:
-            rows = np.flatnonzero(contact_union.any(axis=1))
-            denominator = max(1, int(contact_union.shape[0]) - 1)
-            mask_bottom_y_ratio = float(rows[-1]) / float(denominator)
-            if self._previous_contact_bottom is not None:
-                crossed_contact_line = self._previous_contact_bottom < threshold <= mask_bottom_y_ratio
-            if crossed_contact_line:
-                self._contact_crossing_armed = True
-                self._contact_above_frames = 1
-            elif self._contact_crossing_armed and mask_bottom_y_ratio >= threshold:
-                self._contact_above_frames += 1
-            elif mask_bottom_y_ratio < threshold:
+            rows = self._wide_contact_rows(contact_union)
+            if len(rows) > 0:
+                denominator = max(1, int(contact_union.shape[0]) - 1)
+                mask_bottom_y_ratio = float(rows[-1]) / float(denominator)
+                if self._previous_contact_bottom is not None:
+                    crossed_contact_line = self._previous_contact_bottom < threshold <= mask_bottom_y_ratio
+                if crossed_contact_line:
+                    self._contact_crossing_armed = True
+                    self._contact_above_frames = 1
+                elif self._contact_crossing_armed and mask_bottom_y_ratio >= threshold:
+                    self._contact_above_frames += 1
+                elif mask_bottom_y_ratio < threshold:
+                    self._contact_crossing_armed = False
+                    self._contact_above_frames = 0
+                self._previous_contact_bottom = mask_bottom_y_ratio
+            else:
+                self._previous_contact_bottom = None
                 self._contact_crossing_armed = False
                 self._contact_above_frames = 0
-            self._previous_contact_bottom = mask_bottom_y_ratio
         else:
             self._previous_contact_bottom = None
             self._contact_crossing_armed = False
@@ -155,6 +161,14 @@ class TrafficLightController:
             layer = layer > 0
             union = layer if union is None else (union | layer)
         return union
+
+    def _wide_contact_rows(self, contact_union: Any) -> Any:
+        import numpy as np
+
+        min_width = int(round(contact_union.shape[1] * max(0.0, self.config.contact_min_row_width_ratio)))
+        min_width = max(1, min_width)
+        row_widths = np.count_nonzero(contact_union, axis=1)
+        return np.flatnonzero(row_widths >= min_width)
 
     def apply(self, command: ControlCommand, running: bool) -> ControlCommand:
         if running and self.state == "red" and self._stop_latched:
