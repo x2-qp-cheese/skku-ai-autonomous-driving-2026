@@ -24,6 +24,9 @@ class LaneChangeTestConfig:
     stable_required_frames: int = 5
     stabilize_timeout_seconds: float = 0.0
     allow_virtual_stabilize: bool = False
+    recenter_steering: bool = True
+    recenter_lateral_error: float = 0.35
+    recenter_heading_error: float = 0.12
 
 
 @dataclass(frozen=True)
@@ -174,8 +177,7 @@ class LaneChangeTestController:
         elif self.state == "stabilizing_lane2":
             offset_ratio = 0.0
 
-        if direction == 0:
-            direction = self._settle_direction_at(now)
+        settle_direction = self._settle_direction_at(now) if direction == 0 else 0
 
         offset_px = offset_ratio * max(0.0, lane_width_px)
         shifted = self._shift_lane(lane, offset_px, bev_width_px) if lane.found else lane
@@ -189,6 +191,10 @@ class LaneChangeTestController:
                 self.state = "completed"
                 self._phase_started_at = None
                 self._clear_settle()
+        if self.state in ("stabilizing_lane1", "stabilizing_lane2"):
+            direction = self._recenter_direction(shifted)
+        elif direction == 0:
+            direction = settle_direction
         applied_offset_px = shifted.center_x - lane.center_x if lane.found else 0.0
         active = self.state in (
             "changing_to_lane1",
@@ -319,6 +325,22 @@ class LaneChangeTestController:
             abs(lane.lateral_error_norm) <= max(0.0, float(self.config.stable_lateral_error))
             and abs(lane.heading_error) <= max(0.0, float(self.config.stable_heading_error))
         )
+
+    def _recenter_direction(self, lane: LaneGeometry) -> int:
+        if not self.config.recenter_steering or not lane.found:
+            return 0
+        if self.state == "stabilizing_lane1":
+            counter_direction = 1
+        elif self.state == "stabilizing_lane2":
+            counter_direction = -1
+        else:
+            return 0
+        heading_ready = (
+            lane.heading_error * counter_direction
+            >= max(0.0, float(self.config.recenter_heading_error))
+        )
+        lateral_ready = abs(lane.lateral_error_norm) <= max(0.0, float(self.config.recenter_lateral_error))
+        return counter_direction if heading_ready or lateral_ready else 0
 
     def _clear_stability(self) -> None:
         self._stable_frames = 0

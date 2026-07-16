@@ -385,6 +385,9 @@ def build_lane_change_config(args: argparse.Namespace) -> LaneChangeTestConfig:
         stable_required_frames=args.lane_change_stable_frames,
         stabilize_timeout_seconds=args.lane_change_stabilize_timeout,
         allow_virtual_stabilize=args.lane_change_allow_virtual_stabilize == "on",
+        recenter_steering=args.lane_change_recenter_steering == "on",
+        recenter_lateral_error=args.lane_change_recenter_lateral_error,
+        recenter_heading_error=args.lane_change_recenter_heading_error,
     )
 
 
@@ -471,7 +474,7 @@ def log_effective_config(
         args.light_stop_during_lane_change,
     )
     LOG.info(
-        "lane_change_test=%s trigger=%.1fs transition=%.1fs settle=%.1fs stable_err=%.2f stable_head=%.2f stable_frames=%d stabilize_timeout=%.1fs hold=%.1fs max_heading=%.3f speed_cap=%d steer_min=%d steer_boost=%d steer_cap=%s override=%s",
+        "lane_change_test=%s trigger=%.1fs transition=%.1fs settle=%.1fs stable_err=%.2f stable_head=%.2f stable_frames=%d stabilize_timeout=%.1fs recenter=%s recenter_err=%.2f recenter_head=%.2f hold=%.1fs max_heading=%.3f speed_cap=%d steer_min=%d steer_boost=%d steer_cap=%s override=%s",
         args.lane_change_test,
         args.lane_change_trigger_seconds,
         args.lane_change_transition_seconds,
@@ -480,6 +483,9 @@ def log_effective_config(
         args.lane_change_stable_heading_error,
         args.lane_change_stable_frames,
         args.lane_change_stabilize_timeout,
+        args.lane_change_recenter_steering,
+        args.lane_change_recenter_lateral_error,
+        args.lane_change_recenter_heading_error,
         args.lane_change_hold_seconds,
         args.lane_change_max_heading,
         args.lane_change_speed_cap,
@@ -1027,6 +1033,24 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         choices=("on", "off"),
         default="off",
         help="off requires a non-virtual YOLO mask before a new lane can be marked stable",
+    )
+    parser.add_argument(
+        "--lane-change-recenter-steering",
+        choices=("on", "off"),
+        default="on",
+        help="while stabilizing after a lane change, apply opposite-direction steering once heading/lateral conditions show the car should straighten into the target lane",
+    )
+    parser.add_argument(
+        "--lane-change-recenter-lateral-error",
+        type=float,
+        default=LaneChangeTestConfig.recenter_lateral_error,
+        help="during stabilizing, allow counter-steer once absolute lateral error is below this value",
+    )
+    parser.add_argument(
+        "--lane-change-recenter-heading-error",
+        type=float,
+        default=LaneChangeTestConfig.recenter_heading_error,
+        help="during stabilizing, allow counter-steer once heading error points in the counter-steer direction by at least this value",
     )
     parser.add_argument(
         "--obstacle-lane-change",

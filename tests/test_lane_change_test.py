@@ -35,6 +35,23 @@ def lane_for_shifted_lane1(heading=0.0):
     )
 
 
+def lane_for_target_error(lateral_error_norm=0.0, heading=0.0, lane_width_px=150.0, bev_width_px=800.0):
+    vehicle_center_x = 400.0
+    target_center_x = vehicle_center_x + lateral_error_norm * (bev_width_px / 2.0)
+    return LaneGeometry(
+        found=True,
+        center_x=target_center_x + lane_width_px,
+        vehicle_center_x=vehicle_center_x,
+        target_y=200.0,
+        lateral_error_px=target_center_x + lane_width_px - vehicle_center_x,
+        lateral_error_norm=(target_center_x + lane_width_px - vehicle_center_x) / (bev_width_px / 2.0),
+        heading_error=heading,
+        confidence=1.0,
+        reason="corridor",
+        height=500.0,
+    )
+
+
 class LaneChangeTestControllerTest(unittest.TestCase):
     def setUp(self):
         self.controller = LaneChangeTestController(
@@ -230,6 +247,7 @@ class LaneChangeTestControllerTest(unittest.TestCase):
                 speed_cap=70,
                 steering_override=True,
                 steering_cap=150,
+                recenter_steering=False,
             )
         )
         self.controller.request("obstacle")
@@ -243,6 +261,39 @@ class LaneChangeTestControllerTest(unittest.TestCase):
         self.assertEqual(stabilizing.direction, 0)
         self.assertEqual(adjusted.speed, 70)
         self.assertEqual(adjusted.steering, 35)
+
+    def test_stabilizing_counter_steers_after_left_lane_change(self):
+        self.controller = LaneChangeTestController(
+            LaneChangeTestConfig(
+                mode="keyboard",
+                transition_seconds=1.0,
+                stable_required_frames=5,
+                stabilize_timeout_seconds=0.0,
+                speed_cap=60,
+                steering_override=True,
+                steering_cap=150,
+                recenter_steering=True,
+                recenter_lateral_error=0.35,
+                recenter_heading_error=0.12,
+            )
+        )
+        self.controller.request("obstacle")
+        self.controller.update(lane(), 150.0, 800.0, 0.0, True)
+        stabilizing = self.controller.update(
+            lane_for_target_error(lateral_error_norm=-0.20, heading=0.30),
+            150.0,
+            800.0,
+            1.0,
+            True,
+        )
+        command = ControlCommand(speed=255, steering=-30, reason="lane")
+
+        adjusted = self.controller.apply_control_adjustments(command, stabilizing)
+
+        self.assertEqual(stabilizing.state, "stabilizing_lane1")
+        self.assertEqual(stabilizing.direction, 1)
+        self.assertEqual(adjusted.speed, 60)
+        self.assertEqual(adjusted.steering, 150)
 
     def test_return_request_waits_until_lane1_is_stable(self):
         self.controller = LaneChangeTestController(

@@ -45,6 +45,7 @@ LiDAR 입력과 미션 타입은 향후 확장을 위해 보존되어 있습니�
 `--lane-change-settle-seconds`는 시간상 차선 변경이 끝난 뒤에도 같은 방향 강제 조향과 속도 제한을 유지하는 시간입니다.
 현재 차선 변경 완료 판정은 시간만 보지 않고 `stabilizing_lane1/stabilizing_lane2` 상태에서 새 차선 중심 안정도를 확인합니다.
 기본적으로 실제(non-virtual) 차선에서 `abs(err) <= 0.12`, `abs(head) <= 0.18`이 5프레임 연속 유지되어야 다음 차선 상태로 확정됩니다.
+`--lane-change-recenter-steering on`은 왼쪽으로 피한 뒤 안정화 중 heading/lateral 조건이 맞으면 오른쪽 counter-steer를, 오른쪽으로 복귀한 뒤에는 왼쪽 counter-steer를 강하게 넣어 차체를 빨리 세웁니다.
 속도 제한은 차선 변경 중에만 적용되고, 차선 1에 도착한 뒤에는 기존 `--fixed-speed on --speed 255` 설정대로 다시 255가 나갑니다.
 기본값 `--light-stop-during-lane-change off`는 차선 변경/차선 1 유지 중 먼 빨간불 contact 오검출로 정지하지 않게 합니다.
 
