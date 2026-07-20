@@ -319,26 +319,31 @@ def open_source(cv2, args):
     return read, cap.release
 
 
-# Trackbars are stored as integers 0..1000 mapped to ratios 0..1.
-# Defaults mirror the tuned BevConfig (see src/skku_autocar/perception/bev.py).
+# Trackbars use 0.001 ratio steps. x accepts -1..2 so a source trapezoid may
+# extend beyond the frame; y stays within the actual image at 0..1.
 _BARS = [
-    ("top_y", 400),
-    ("top_left_x", 200),
-    ("top_right_x", 800),
-    ("bottom_y", 880),
-    ("bottom_left_x", 0),
-    ("bottom_right_x", 1000),
+    ("top_y", 0.400, 0.0, 1.0),
+    ("top_left_x", 0.200, -1.0, 2.0),
+    ("top_right_x", 0.800, -1.0, 2.0),
+    ("bottom_y", 0.880, 0.0, 1.0),
+    ("bottom_left_x", 0.000, -1.0, 2.0),
+    ("bottom_right_x", 1.000, -1.0, 2.0),
 ]
 
 
 def create_trackbars(cv2, args):
-    for name, default in _BARS:
-        cv2.createTrackbar(name, WINDOW, default, 1000, lambda _v: None)
+    for name, default, minimum, maximum in _BARS:
+        value = float(getattr(args, name, default))
+        slider_max = int(round((maximum - minimum) * 1000))
+        initial = int(round((value - minimum) * 1000))
+        initial = max(0, min(slider_max, initial))
+        cv2.createTrackbar(name, WINDOW, initial, slider_max, lambda _v: None)
 
 
 def config_from_trackbars(cv2, args) -> BevConfig:
     def r(name):
-        return cv2.getTrackbarPos(name, WINDOW) / 1000.0
+        minimum = next(item[2] for item in _BARS if item[0] == name)
+        return minimum + cv2.getTrackbarPos(name, WINDOW) / 1000.0
 
     top_y = r("top_y")
     bottom_y = r("bottom_y")

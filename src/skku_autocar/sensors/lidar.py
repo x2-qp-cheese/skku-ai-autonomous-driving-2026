@@ -1,7 +1,28 @@
-from typing import Iterable, Optional, Sequence, Tuple
+from __future__ import annotations
+
+import bisect
+import csv
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 
 ScanPoint = Tuple[float, float]
+
+
+@dataclass(frozen=True)
+class LidarPoint:
+    quality: int
+    angle_deg: float
+    distance_mm: float
+
+
+@dataclass(frozen=True)
+class LidarScan:
+    timestamp: float
+    points: Tuple[LidarPoint, ...]
 
 
 def angle_in_window(angle_deg: float, start_deg: float, end_deg: float) -> bool:
@@ -35,3 +56,135 @@ def normalize_rplidar_scan(raw_scan: Sequence[Sequence[float]]) -> Iterable[Scan
         angle = float(point[1])
         distance = float(point[2])
         yield angle, distance
+
+
+def load_lidar_csv(path: str) -> List[LidarScan]:
+    """Load the timestamp/quality/angle/distance format used by recordings."""
+
+    groups = []
+    current_timestamp = None
+    current_points = []
+    with Path(path).open("r", newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        required = {"timestamp", "quality", "angle_deg", "distance_mm"}
+        if reader.fieldnames is None or not required.issubset(reader.fieldnames):
+            raise ValueError(
+                "LiDAR CSV must contain: timestamp,quality,angle_deg,distance_mm"
+            )
+        for row in reader:
+            timestamp = float(row["timestamp"])
+            if current_timestamp is not None and timestamp != current_timestamp:
+                groups.append(LidarScan(current_timestamp, tuple(current_points)))
+                current_points = []
+            current_timestamp = timestamp
+            current_points.append(
+                LidarPoint(
+                    quality=int(float(row["quality"])),
+                    angle_deg=float(row["angle_deg"]),
+                    distance_mm=float(row["distance_mm"]),
+                )
+            )
+    if current_timestamp is not None:
+        groups.append(LidarScan(current_timestamp, tuple(current_points)))
+    return groups
+
+
+class LidarCsvReplay:
+    """Select the nearest recorded scan using time relative to CSV start."""
+
+    def __init__(self, path: str):
+        self.scans = load_lidar_csv(path)
+        if not self.scans:
+            raise ValueError("LiDAR CSV contains no scans: %s" % path)
+        self._relative_times = [scan.timestamp - self.scans[0].timestamp for scan in self.scans]
+
+    @property
+    def duration_s(self) -> float:
+        return self._relative_times[-1]
+
+    def scan_at_elapsed(self, elapsed_s: float) -> LidarScan:
+        index = bisect.bisect_left(self._relative_times, max(0.0, elapsed_s))
+        if index <= 0:
+            return self.scans[0]
+        if index >= len(self.scans):
+            return self.scans[-1]
+        before = self._relative_times[index - 1]
+        after = self._relative_times[index]
+        if elapsed_s - before <= after - elapsed_s:
+            return self.scans[index - 1]
+        return self.scans[index]
+
+
+class RplidarScanner:
+    """Background reader exposing only the latest complete RPLidar scan."""
+
+    def __init__(self, port: str, max_buf_meas: int = 500):
+        self.port = port
+        self.max_buf_meas = max_buf_meas
+        self._lock = threading.Lock()
+        self._latest: Optional[LidarScan] = None
+        self._error: Optional[Exception] = None
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._device = None
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, name="rplidar", daemon=True)
+        self._thread.start()
+
+    def latest(self) -> Optional[LidarScan]:
+        with self._lock:
+            return self._latest
+
+    @property
+    def error(self) -> Optional[Exception]:
+        with self._lock:
+            return self._error
+
+    def close(self) -> None:
+        self._stop_event.set()
+        device = self._device
+        if device is not None:
+            for method_name in ("stop", "stop_motor", "disconnect"):
+                try:
+                    getattr(device, method_name)()
+                except Exception:
+                    pass
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        self._thread = None
+        self._device = None
+
+    def _run(self) -> None:
+        try:
+            from rplidar import RPLidar
+
+            device = RPLidar(self.port)
+            self._device = device
+            for raw_scan in device.iter_scans(max_buf_meas=self.max_buf_meas):
+                if self._stop_event.is_set():
+                    break
+                points = tuple(
+                    LidarPoint(int(point[0]), float(point[1]), float(point[2]))
+                    for point in raw_scan
+                    if len(point) >= 3
+                )
+                scan = LidarScan(time.time(), points)
+                with self._lock:
+                    self._latest = scan
+                    self._error = None
+        except Exception as exc:
+            with self._lock:
+                self._error = exc
+        finally:
+            device = self._device
+            if device is not None:
+                for method_name in ("stop", "stop_motor", "disconnect"):
+                    try:
+                        getattr(device, method_name)()
+                    except Exception:
+                        pass
+            self._device = None

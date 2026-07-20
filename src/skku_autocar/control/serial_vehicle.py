@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import time
+import re
 import sys
+import time
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -15,6 +16,42 @@ class SerialVehicleConfig:
     baudrate: int = 115200
     timeout_s: float = 0.1
     ready_timeout_s: float = 3.0
+
+
+@dataclass(frozen=True)
+class UltrasonicReadings:
+    """One Arduino ultrasonic report in millimeters.
+
+    The vehicle firmware returns zero when an echo was not measured. Such
+    values are represented as ``None`` so they cannot trigger a false 10 cm
+    emergency stop.
+    """
+
+    front_right_mm: Optional[float] = None
+    front_left_mm: Optional[float] = None
+    side_right_mm: Optional[float] = None
+    side_left_mm: Optional[float] = None
+
+
+def parse_ultrasonic_line(line: str) -> Optional[UltrasonicReadings]:
+    if not line.startswith("US "):
+        return None
+    values = {
+        key: _valid_ultrasonic_mm(float(value))
+        for key, value in re.findall(r"\b(FR|FL|SR|SL)=(-?\d+(?:\.\d+)?)", line)
+    }
+    if not values:
+        return None
+    return UltrasonicReadings(
+        front_right_mm=values.get("FR"),
+        front_left_mm=values.get("FL"),
+        side_right_mm=values.get("SR"),
+        side_left_mm=values.get("SL"),
+    )
+
+
+def _valid_ultrasonic_mm(value: float) -> Optional[float]:
+    return value if value > 0.0 else None
 
 
 def find_arduino_port(explicit_port: Optional[str] = None) -> Optional[str]:
