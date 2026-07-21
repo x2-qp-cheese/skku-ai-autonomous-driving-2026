@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 import tempfile
 import time
 import zipfile
@@ -1303,7 +1304,9 @@ def newest_ultrasonic_sample(lines: list[str]) -> Optional[UltrasonicReadings]:
 
 def open_capture(cv2: Any, source: str, config: ParkingAppConfig) -> Any:
     value: Any = int(source) if source.isdigit() else str(resolve_path(source))
-    if isinstance(value, int) and hasattr(cv2, "CAP_DSHOW"):
+    if isinstance(value, int) and sys.platform == "darwin" and hasattr(cv2, "CAP_AVFOUNDATION"):
+        cap = cv2.VideoCapture(value, cv2.CAP_AVFOUNDATION)
+    elif isinstance(value, int) and sys.platform.startswith("win") and hasattr(cv2, "CAP_DSHOW"):
         cap = cv2.VideoCapture(value, cv2.CAP_DSHOW)
     else:
         cap = cv2.VideoCapture(value)

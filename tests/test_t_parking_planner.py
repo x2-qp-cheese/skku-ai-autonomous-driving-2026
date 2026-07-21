@@ -182,6 +182,22 @@ class TParkingPlannerTest(unittest.TestCase):
         self.assertEqual(parked.state, ParkingState.PARKED)
         self.assertTrue(parked.command.brake)
 
+    def test_search_drives_forward_while_waiting_for_lidar(self):
+        planner = self.make_planner()
+        planner.start(0.0)
+
+        searching = planner.update(
+            geometry(),
+            LidarParkingObservation(reason="no_scan"),
+            0.1,
+        )
+
+        self.assertEqual(searching.state, ParkingState.SEARCH_CARS)
+        self.assertEqual(searching.command.speed, planner.config.search_speed)
+        self.assertEqual(searching.command.steering, 0)
+        self.assertFalse(searching.command.brake)
+        self.assertEqual(searching.reason, "searching_for_lidar")
+
     def test_lidar_obstacle_latches_emergency_stop(self):
         planner = self.make_planner()
         self.arm_reverse(planner)

@@ -171,7 +171,7 @@ class TParkingPlanner:
             if self._expired(now, self.config.search_timeout_s):
                 return self._abort(now, "parked_car_search_timeout")
             if not lidar.valid:
-                return self._stop("waiting_for_lidar")
+                return self._drive(self.config.search_speed, 0, "searching_for_lidar")
             if (
                 self.config.prealign_enabled
                 and self.config.first_car_preemptive_turn_enabled
