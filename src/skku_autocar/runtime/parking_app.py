@@ -6,7 +6,8 @@ import tempfile
 import time
 import zipfile
 from dataclasses import replace
-from math import cos, radians, sin
+from datetime import datetime
+from math import cos, isfinite, radians, sin
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
@@ -31,6 +32,86 @@ from ..sensors.lidar import LidarCsvReplay, RplidarScanner
 
 LOG = logging.getLogger("skku_autocar.parking")
 ROOT = Path(__file__).resolve().parents[3]
+
+
+class DashboardVideoRecorder:
+    """Record the exact 1280x720 dashboard shown by the live runtime."""
+
+    def __init__(self, cv2: Any, path: Path, fps: float) -> None:
+        self.cv2 = cv2
+        self.path = path
+        self.fps = fps
+        self.writer: Any = None
+        self.frame_size: Optional[Tuple[int, int]] = None
+        self.next_frame_s: Optional[float] = None
+        self.frames_written = 0
+
+    def write(self, frame: Any, elapsed_s: float) -> None:
+        height, width = frame.shape[:2]
+        frame_size = (width, height)
+        if self.writer is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fourcc = self.cv2.VideoWriter_fourcc(*"mp4v")
+            self.writer = self.cv2.VideoWriter(
+                str(self.path), fourcc, self.fps, frame_size
+            )
+            if not self.writer.isOpened():
+                self.writer.release()
+                self.writer = None
+                raise RuntimeError(
+                    "dashboard recording could not be opened: %s" % self.path
+                )
+            self.frame_size = frame_size
+        elif frame_size != self.frame_size:
+            raise ValueError(
+                "dashboard frame size changed from %s to %s"
+                % (self.frame_size, frame_size)
+            )
+
+        # Keep video duration close to wall-clock time even when YOLO inference
+        # produces frames slower than the recording FPS. Missing instants repeat
+        # the most recent dashboard, exactly as it appeared on screen.
+        interval_s = 1.0 / self.fps
+        target_s = max(0.0, elapsed_s)
+        if self.next_frame_s is None:
+            # Model/device warm-up happens before the first visible dashboard;
+            # do not block live control by encoding that startup delay.
+            self.next_frame_s = target_s
+        writes_this_update = 0
+        while self.next_frame_s <= target_s + 1e-9:
+            self.writer.write(frame)
+            self.frames_written += 1
+            self.next_frame_s += interval_s
+            writes_this_update += 1
+            if writes_this_update >= 3 and self.next_frame_s <= target_s:
+                # Recording must never stall steering/motor updates after an
+                # unusually slow inference or a debugger pause.
+                self.next_frame_s = target_s + interval_s
+                break
+
+    def close(self) -> None:
+        if self.writer is not None:
+            self.writer.release()
+            self.writer = None
+
+
+def timestamped_dashboard_path(directory: str, now: Optional[datetime] = None) -> Path:
+    root = resolve_path(directory)
+    timestamp = (now or datetime.now().astimezone()).strftime("%Y%m%d_%H%M%S")
+    candidate = root / (timestamp + ".mp4")
+    suffix = 1
+    while candidate.exists():
+        candidate = root / ("%s_%02d.mp4" % (timestamp, suffix))
+        suffix += 1
+    return candidate
+
+
+def dashboard_recording_enabled(mode: str, is_video: bool) -> bool:
+    if mode == "on":
+        return True
+    if mode == "off":
+        return False
+    return not is_video
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -141,6 +222,17 @@ def run_prepared(args: argparse.Namespace) -> int:
     if not args.serial:
         LOG.info("serial output disabled; pass --serial only after replay/calibration checks")
 
+    dashboard_recorder: Optional[DashboardVideoRecorder] = None
+    dashboard_record_path: Optional[Path] = None
+    if dashboard_recording_enabled(args.record_dashboard, is_video):
+        dashboard_record_path = timestamped_dashboard_path(args.parking_record_dir)
+        dashboard_recorder = DashboardVideoRecorder(
+            cv2,
+            dashboard_record_path,
+            args.dashboard_record_fps,
+        )
+        LOG.info("dashboard recording enabled: %s", dashboard_record_path)
+
     try:
         while True:
             ok, frame = cap.read()
@@ -219,16 +311,48 @@ def run_prepared(args: argparse.Namespace) -> int:
                 fps,
                 left_ultrasonic_mm,
                 right_ultrasonic_mm,
+                show_status=False,
             )
-            cv2.imshow("T Parking - Rear", display)
-            cv2.imshow("T Parking - BEV", bev_display)
-            cv2.imshow("T Parking - LiDAR", draw_lidar_debug(
+            lidar_display = draw_lidar_debug(
                 cv2,
                 np,
                 lidar_estimator.vehicle_points(lidar_scan),
                 config,
                 lidar_observation,
-            ))
+            )
+            dashboard = draw_live_dashboard(
+                cv2,
+                np,
+                display,
+                bev_display,
+                lidar_display,
+                geometry,
+                lidar_observation,
+                plan,
+                elapsed,
+                fps,
+                left_ultrasonic_mm,
+                right_ultrasonic_mm,
+                vehicle is not None,
+                dashboard_record_path,
+            )
+            cv2.imshow("T Parking - Live Dashboard", dashboard)
+            if dashboard_recorder is not None:
+                dashboard_recorder.write(
+                    dashboard,
+                    time.monotonic() - run_started_at,
+                )
+            if hasattr(cv2, "getWindowProperty") and hasattr(cv2, "WND_PROP_VISIBLE"):
+                try:
+                    if cv2.getWindowProperty(
+                        "T Parking - Live Dashboard",
+                        cv2.WND_PROP_VISIBLE,
+                    ) < 1:
+                        LOG.info("dashboard window closed; stopping parking runtime")
+                        break
+                except cv2.error:
+                    # Some macOS OpenCV backends do not implement this query.
+                    pass
 
             key = cv2.waitKey(1 if not is_video else max(1, args.replay_delay_ms)) & 0xFF
             if key in (ord("q"), 27):
@@ -267,6 +391,14 @@ def run_prepared(args: argparse.Namespace) -> int:
                     vehicle.write_line("USOFF")
                 finally:
                     vehicle.close()
+        if dashboard_recorder is not None:
+            dashboard_recorder.close()
+            if dashboard_recorder.frames_written > 0:
+                LOG.info(
+                    "dashboard recording saved: %s (%d frames)",
+                    dashboard_recorder.path,
+                    dashboard_recorder.frames_written,
+                )
         if lidar_scanner is not None:
             lidar_scanner.close()
         cap.release()
@@ -309,6 +441,215 @@ def current_lidar_observation(
     return estimator.estimate(None), None
 
 
+def compose_parking_dashboard(
+    cv2: Any,
+    np: Any,
+    rear_display: Any,
+    bev_display: Any,
+    lidar_display: Any,
+    header_text: str,
+    header_color: Tuple[int, int, int],
+    status_lines: Tuple[str, ...],
+) -> Any:
+    """Build the one dashboard layout shared by live and offline replay."""
+
+    rear_panel = rear_display.copy()
+    cv2.rectangle(
+        rear_panel,
+        (0, 0),
+        (rear_panel.shape[1], 58),
+        (0, 0, 0),
+        -1,
+    )
+    cv2.putText(
+        rear_panel,
+        header_text,
+        (18, 39),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.85,
+        header_color,
+        2,
+        cv2.LINE_AA,
+    )
+
+    dashboard = np.zeros((720, 1280, 3), dtype=np.uint8)
+    dashboard[0:495, 0:880] = cv2.resize(rear_panel, (880, 495))
+    dashboard[0:360, 900:1260] = cv2.resize(bev_display, (360, 360))
+    dashboard[360:720, 900:1260] = cv2.resize(lidar_display, (360, 360))
+    cv2.putText(
+        dashboard,
+        "REAR + YOLO",
+        (12, 487),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        dashboard,
+        "BEV",
+        (905, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.58,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        dashboard,
+        "LiDAR",
+        (905, 384),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.58,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    for index, text in enumerate(status_lines[:8]):
+        color = (0, 255, 255) if index == 0 else (220, 220, 220)
+        cv2.putText(
+            dashboard,
+            text,
+            (18, 510 + index * 26),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+    return dashboard
+
+
+def draw_live_dashboard(
+    cv2: Any,
+    np: Any,
+    rear_display: Any,
+    bev_display: Any,
+    lidar_display: Any,
+    geometry: ParkingGeometry,
+    lidar: LidarParkingObservation,
+    plan: Any,
+    elapsed_s: float,
+    fps: float,
+    left_ultrasonic_mm: Optional[float],
+    right_ultrasonic_mm: Optional[float],
+    motor_output_enabled: bool,
+    recording_path: Optional[Path],
+) -> Any:
+    state_color = parking_state_color(plan.state)
+    wall_time = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    recording_name = "OFF" if recording_path is None else recording_path.name
+    center_cm = (
+        None
+        if lidar.gap_center_y_back_mm is None
+        else lidar.gap_center_y_back_mm / 10.0
+    )
+    width_cm = None if lidar.gap_width_mm is None else lidar.gap_width_mm / 10.0
+    depth = (
+        "-"
+        if geometry.depth_remaining_px is None
+        else "%.1fpx" % geometry.depth_remaining_px
+    )
+    status_lines = (
+        "LIVE CAMERA | MOTOR=%s | REC=%s" % (
+            "ENABLED" if motor_output_enabled else "DISABLED",
+            recording_name,
+        ),
+        "STATE %-22s drive=%+3d steer=%+4d reason=%s" % (
+            plan.state.value,
+            plan.command.speed,
+            plan.command.steering,
+            plan.reason,
+        ),
+        "LiDAR cars=%d gap=%s centerY=%s cm width=%s cm" % (
+            lidar.car_count,
+            "CONFIRMED" if lidar.gap_confirmed else (
+                "candidate" if lidar.gap_found else "no"
+            ),
+            format_dashboard_value(center_cm, signed=True),
+            format_dashboard_value(width_cm),
+        ),
+        "FIRST CAR edgeY=%s cm targetErr=%s cm turn=%s" % (
+            format_dashboard_value(
+                None
+                if lidar.first_car_slot_edge_y_back_mm is None
+                else lidar.first_car_slot_edge_y_back_mm / 10.0,
+                signed=True,
+            ),
+            format_dashboard_value(
+                None
+                if lidar.first_car_turn_error_mm is None
+                else lidar.first_car_turn_error_mm / 10.0,
+                signed=True,
+            ),
+            "READY" if lidar.first_car_turn_reached else "waiting",
+        ),
+        "CAM lines=%d conf=%.2f lat=%+.2f head=%+.1f depth=%s (%s)" % (
+            geometry.observed_line_count,
+            geometry.confidence,
+            geometry.lateral_error_norm,
+            geometry.heading_error_deg,
+            depth,
+            geometry.reason,
+        ),
+        "ULTRASONIC LEFT=%s cm RIGHT=%s cm" % (
+            format_dashboard_value(
+                None if left_ultrasonic_mm is None else left_ultrasonic_mm / 10.0
+            ),
+            format_dashboard_value(
+                None if right_ultrasonic_mm is None else right_ultrasonic_mm / 10.0
+            ),
+        ),
+        "FPS=%.1f | elapsed=%.2fs | %s" % (fps, elapsed_s, wall_time),
+        "Colors: CYAN=left GREEN=right RED=back MAGENTA=unclassified | SPACE start/cancel R reset Q quit",
+    )
+    return compose_parking_dashboard(
+        cv2,
+        np,
+        rear_display,
+        bev_display,
+        lidar_display,
+        "LIVE %s | drive=%+d steer=%+d | t=%.2fs" % (
+            plan.state.value,
+            plan.command.speed,
+            plan.command.steering,
+            elapsed_s,
+        ),
+        state_color,
+        status_lines,
+    )
+
+
+def format_dashboard_value(value: Optional[float], signed: bool = False) -> str:
+    if value is None or not isfinite(value):
+        return "-"
+    return ("%+.1f" if signed else "%.1f") % value
+
+
+def parking_state_color(state: ParkingState) -> Tuple[int, int, int]:
+    if state in (ParkingState.EMERGENCY_STOP, ParkingState.ABORTED):
+        return (0, 0, 255)
+    if state == ParkingState.PARKED:
+        return (255, 255, 255)
+    if state in (
+        ParkingState.FOLLOW_ENTRY_CURVE,
+        ParkingState.FOLLOW_SLOT_CENTER,
+    ):
+        return (0, 255, 0)
+    if state in (
+        ParkingState.TRACK_GAP,
+        ParkingState.POSITION_REAR_AXLE,
+        ParkingState.PREALIGN_LEFT,
+        ParkingState.VERIFY_PARKING_LINES,
+        ParkingState.PLAN_REVERSE_PATH,
+    ):
+        return (0, 165, 255)
+    if state == ParkingState.SEARCH_CARS:
+        return (0, 220, 255)
+    return (180, 180, 180)
+
+
 def draw_debug(
     cv2: Any,
     np: Any,
@@ -322,12 +663,19 @@ def draw_debug(
     fps: float,
     left_ultrasonic_mm: Optional[float] = None,
     right_ultrasonic_mm: Optional[float] = None,
+    show_status: bool = True,
 ) -> Tuple[Any, Any]:
     display = frame.copy()
     for index, mask in enumerate(frame_masks):
         color = np.asarray(parking_mask_color(index, geometry), dtype=np.float32)
         selected = mask > 0
         display[selected] = (0.55 * display[selected] + 0.45 * color).astype(np.uint8)
+    polygon = (
+        transformer.src_polygon(frame.shape[:2])
+        .astype(np.int32)
+        .reshape((-1, 1, 2))
+    )
+    cv2.polylines(display, [polygon], True, (0, 255, 255), 2, cv2.LINE_AA)
 
     bev_display = transformer.warp_frame(frame)
     for index, mask in enumerate(bev_masks):
@@ -385,38 +733,39 @@ def draw_debug(
         ),
         "fps=%.1f | SPACE start/cancel | R reset | Q quit" % fps,
     )
-    for index, text in enumerate(lines):
+    if show_status:
+        for index, text in enumerate(lines):
+            cv2.putText(
+                display,
+                text,
+                (18, 32 + index * 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        legend = "CYAN=LEFT  GREEN=RIGHT  RED=BACK  MAGENTA=UNCLASSIFIED"
         cv2.putText(
             display,
-            text,
-            (18, 32 + index * 30),
+            legend,
+            (18, max(24, display.shape[0] - 18)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (0, 255, 255),
+            0.52,
+            (255, 255, 255),
             2,
             cv2.LINE_AA,
         )
-    legend = "CYAN=LEFT  GREEN=RIGHT  RED=BACK  MAGENTA=UNCLASSIFIED"
-    cv2.putText(
-        display,
-        legend,
-        (18, max(24, display.shape[0] - 18)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.52,
-        (255, 255, 255),
-        2,
-        cv2.LINE_AA,
-    )
-    cv2.putText(
-        bev_display,
-        legend,
-        (10, max(22, bev_display.shape[0] - 12)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.42,
-        (255, 255, 255),
-        1,
-        cv2.LINE_AA,
-    )
+        cv2.putText(
+            bev_display,
+            legend,
+            (10, max(22, bev_display.shape[0] - 12)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
     return display, bev_display
 
 
@@ -1109,6 +1458,23 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument("--frame-stride", type=int, default=1, help="video replay only: infer every Nth frame")
     parser.add_argument("--auto-start", action="store_true", help="start state machine at the beginning of video replay")
     parser.add_argument("--replay-delay-ms", type=int, default=1)
+    parser.add_argument(
+        "--record-dashboard",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="record the displayed dashboard; auto records numeric live-camera runs",
+    )
+    parser.add_argument(
+        "--parking-record-dir",
+        default="data/parking",
+        help="directory for timestamped live dashboard MP4 files",
+    )
+    parser.add_argument(
+        "--dashboard-record-fps",
+        type=float,
+        default=10.0,
+        help="dashboard MP4 frame rate",
+    )
     parser.add_argument("--bev-top-y", type=float, default=None, help="BEV source top y ratio")
     parser.add_argument("--bev-top-left-x", type=float, default=None, help="BEV source top-left x ratio")
     parser.add_argument("--bev-top-right-x", type=float, default=None, help="BEV source top-right x ratio")
@@ -1171,6 +1537,8 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         parser.error("--frame-stride must be at least 1")
     if args.imgsz is not None and args.imgsz < 32:
         parser.error("--imgsz must be at least 32")
+    if args.dashboard_record_fps <= 0.0 or args.dashboard_record_fps > 60.0:
+        parser.error("--dashboard-record-fps must be above 0 and at most 60")
     if args.conf is not None and not 0.0 <= args.conf <= 1.0:
         parser.error("--conf must be between 0 and 1")
     if (

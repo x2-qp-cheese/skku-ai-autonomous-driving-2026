@@ -49,6 +49,33 @@ CPU에서 mask가 불안정하면 `--imgsz 640 --frame-stride 1`로 되돌린다
 - `R`: 라이다·카메라 추정기와 상태 머신 초기화
 - `Q` 또는 `Esc`: 종료
 
+## 실시간 통합 화면과 자동 녹화
+
+숫자 카메라 소스로 실행하면 녹화 재생과 동일한 `1280 × 720` 통합 화면 하나를
+표시한다. 왼쪽은 후방카메라와 YOLO mask, 오른쪽 위는 BEV, 오른쪽 아래는
+LiDAR이며 아래쪽에는 상태 머신·출력 명령·초음파 값이 표시된다. 화면에 표시한
+동일 프레임은 별도 옵션 없이 자동으로 다음 경로에 저장된다.
+
+```text
+data/parking/YYYYMMDD_HHMMSS.mp4
+```
+
+macOS 실시간 실행 예시(포트명은 실제 장치명으로 교체):
+
+```bash
+python3 scripts/parking.py \
+  --source 1 \
+  --device mps \
+  --lidar-port /dev/tty.usbserial-LIDAR \
+  --serial \
+  --serial-port /dev/tty.usbmodem-ARDUINO
+```
+
+`--record-dashboard off`로 자동 녹화를 끌 수 있고, 녹화 영상 재생에서도 새
+대시보드 영상을 만들려면 `--record-dashboard on`을 사용한다. 저장 폴더와 FPS는
+각각 `--parking-record-dir`, `--dashboard-record-fps`로 바꾼다. `Q` 또는 `Esc`로
+종료하면 모터 정지 명령을 보낸 뒤 MP4를 정상적으로 닫는다.
+
 ## 디버그 화면
 
 후방카메라/BEV mask 색상:

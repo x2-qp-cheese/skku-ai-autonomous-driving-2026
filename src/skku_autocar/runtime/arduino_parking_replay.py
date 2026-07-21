@@ -23,6 +23,7 @@ from ..perception.yolo_lane import YoloLaneConfig, YoloLaneSegmenter
 from ..planning.t_parking_planner import ParkingPlan, ParkingState, TParkingPlanner
 from ..sensors.lidar import LidarScan, load_lidar_csv
 from .parking_app import (
+    compose_parking_dashboard,
     draw_lidar_debug,
     draw_parking_line,
     draw_reverse_path,
@@ -1161,22 +1162,6 @@ def draw_arduino_dashboard(
         ReplayParkingState.EMERGENCY_STOP: (0, 0, 255),
         ReplayParkingState.ABORTED: (0, 0, 255),
     }[command.state]
-    cv2.rectangle(rear_display, (0, 0), (rear_display.shape[1], 58), (0, 0, 0), -1)
-    cv2.putText(
-        rear_display,
-        "SHARED %s | drive=%+d steer=%+d | t=%.2fs" % (
-            controller.planner_state.value,
-            command.speed,
-            command.steering_deg,
-            elapsed_s,
-        ),
-        (18, 39),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.85,
-        state_color,
-        2,
-        cv2.LINE_AA,
-    )
 
     bev_display = transformer.warp_frame(frame)
     for index, mask in enumerate(bev_masks):
@@ -1209,13 +1194,6 @@ def draw_arduino_dashboard(
         config,
         lidar,
     )
-
-    dashboard = np.zeros((720, 1280, 3), dtype=np.uint8)
-    dashboard[0:495, 0:880] = cv2.resize(rear_display, (880, 495))
-    dashboard[0:360, 900:1260] = cv2.resize(bev_display, (360, 360))
-    dashboard[360:720, 900:1260] = cv2.resize(lidar_display, (360, 360))
-    cv2.putText(dashboard, "REAR + YOLO", (12, 487), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
-    cv2.putText(dashboard, "BEV", (905, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA)
 
     center_cm = (
         None if lidar.gap_center_y_back_mm is None
@@ -1270,19 +1248,21 @@ def draw_arduino_dashboard(
         "ULTRASONIC LEFT=N/A RIGHT=N/A (not present in this recording)",
         "Colors: CYAN=left GREEN=right RED=back MAGENTA=unclassified | SPACE pause Q quit",
     )
-    for index, text in enumerate(status_lines):
-        color = (0, 255, 255) if index == 0 else (220, 220, 220)
-        cv2.putText(
-            dashboard,
-            text,
-            (18, 510 + index * 26),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            color,
-            1,
-            cv2.LINE_AA,
-        )
-    return dashboard
+    return compose_parking_dashboard(
+        cv2,
+        np,
+        rear_display,
+        bev_display,
+        lidar_display,
+        "SHARED %s | drive=%+d steer=%+d | t=%.2fs" % (
+            controller.planner_state.value,
+            command.speed,
+            command.steering_deg,
+            elapsed_s,
+        ),
+        state_color,
+        status_lines,
+    )
 
 
 def format_optional(value: Optional[float], signed: bool = False) -> str:
