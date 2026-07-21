@@ -101,6 +101,7 @@ class TParkingPlannerTest(unittest.TestCase):
                 path_timeout_s=100.0,
                 entry_curve_timeout_s=100.0,
                 center_follow_timeout_s=100.0,
+                exit_straight_s=3.0,
             ),
             ReversePathConfig(maximum_curvature_per_px=0.05),
         )
@@ -170,6 +171,30 @@ class TParkingPlannerTest(unittest.TestCase):
             lidar_gap(0.0, reached=True),
             0.6,
         )
+        hold = planner.update(
+            geometry(heading=0.0, lateral=0.0, remaining=0.0),
+            lidar_gap(0.0, reached=True),
+            3.5,
+            right_ultrasonic_mm=500.0,
+        )
+        exit_right = planner.update(
+            geometry(heading=0.0, lateral=0.0, remaining=0.0),
+            lidar_gap(0.0, reached=True),
+            3.7,
+            right_ultrasonic_mm=500.0,
+        )
+        exit_straight = planner.update(
+            geometry(heading=0.0, lateral=0.0, remaining=0.0),
+            lidar_gap(0.0, reached=True),
+            5.4,
+            right_ultrasonic_mm=500.0,
+        )
+        exit_done = planner.update(
+            geometry(heading=0.0, lateral=0.0, remaining=0.0),
+            lidar_gap(0.0, reached=True),
+            8.5,
+            right_ultrasonic_mm=500.0,
+        )
 
         self.assertEqual(tracking.state, ParkingState.TRACK_GAP)
         self.assertEqual(positioned.state, ParkingState.POSITION_REAR_AXLE)
@@ -181,6 +206,65 @@ class TParkingPlannerTest(unittest.TestCase):
         self.assertLess(aligned.command.speed, 0)
         self.assertEqual(parked.state, ParkingState.PARKED)
         self.assertTrue(parked.command.brake)
+        self.assertEqual(hold.state, ParkingState.PARKED)
+        self.assertEqual(hold.reason, "parked_hold")
+        self.assertTrue(hold.command.brake)
+        self.assertEqual(exit_right.state, ParkingState.EXIT_RIGHT)
+        self.assertEqual(exit_right.command.speed, planner.config.exit_speed)
+        self.assertEqual(exit_right.command.steering, planner.config.exit_turn_steering)
+        self.assertEqual(exit_straight.state, ParkingState.EXIT_STRAIGHT)
+        self.assertEqual(exit_straight.command.speed, planner.config.exit_speed)
+        self.assertEqual(exit_straight.command.steering, 0)
+        self.assertEqual(exit_done.state, ParkingState.EXIT_DONE)
+        self.assertTrue(exit_done.command.brake)
+
+    def test_exit_right_waits_when_right_side_is_too_close(self):
+        planner = self.make_planner()
+        planner.start(0.0)
+        one_car = LidarParkingObservation(
+            timestamp=0.0,
+            valid=True,
+            observed_points=10,
+            car_count=1,
+            first_car_seen=True,
+            reason="one_parked_car",
+        )
+
+        planner.update(geometry(), one_car, 0.0)
+        planner.update(geometry(), lidar_gap(), 0.1)
+        planner.update(geometry(), lidar_gap(0.0, reached=True), 0.2)
+        planner.update(geometry(), lidar_gap(0.0, reached=True), 0.3)
+        planner.update(geometry(), lidar_gap(0.0, reached=True), 0.4)
+        planner.update(
+            geometry(heading=0.0, lateral=0.0),
+            lidar_gap(0.0, reached=True),
+            0.5,
+        )
+        planner.update(
+            geometry(heading=0.0, lateral=0.0, remaining=0.0),
+            lidar_gap(0.0, reached=True),
+            0.6,
+        )
+
+        blocked = planner.update(
+            geometry(heading=0.0, lateral=0.0, remaining=0.0),
+            lidar_gap(0.0, reached=True),
+            3.7,
+            right_ultrasonic_mm=150.0,
+        )
+        moving = planner.update(
+            geometry(heading=0.0, lateral=0.0, remaining=0.0),
+            lidar_gap(0.0, reached=True),
+            3.8,
+            right_ultrasonic_mm=500.0,
+        )
+
+        self.assertEqual(blocked.state, ParkingState.EXIT_RIGHT)
+        self.assertTrue(blocked.command.brake)
+        self.assertIn("exit_right_blocked", blocked.reason)
+        self.assertEqual(moving.state, ParkingState.EXIT_RIGHT)
+        self.assertFalse(moving.command.brake)
+        self.assertEqual(moving.command.steering, planner.config.exit_turn_steering)
 
     def test_search_drives_forward_while_waiting_for_lidar(self):
         planner = self.make_planner()

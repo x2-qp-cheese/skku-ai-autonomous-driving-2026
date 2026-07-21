@@ -55,8 +55,16 @@ class ParkingConfigTest(unittest.TestCase):
         self.assertEqual(config.planner.ultrasonic_emergency_mm, 100.0)
         self.assertEqual(config.planner.ultrasonic_max_correction, 35)
         self.assertEqual(config.planner.ultrasonic_stale_after_s, 0.8)
+        self.assertEqual(config.planner.park_hold_s, 3.0)
+        self.assertEqual(config.planner.exit_speed, 24)
+        self.assertEqual(config.planner.exit_turn_steering, 80)
+        self.assertEqual(config.planner.exit_turn_s, 1.6)
+        self.assertEqual(config.planner.exit_straight_s, 0.0)
+        self.assertEqual(config.planner.exit_right_min_clearance_mm, 180.0)
         self.assertEqual(tuple(config.bev.src_top_left), (0.18, 0.56))
         self.assertEqual(tuple(config.bev.src_top_right), (0.82, 0.56))
+        self.assertTrue(config.geometry.synthesize_back_from_side_pair)
+        self.assertAlmostEqual(config.geometry.synthetic_back_depth_to_width_ratio, 1.58)
 
     def test_recording_zip_finds_video_and_lidar_csv(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -108,6 +116,12 @@ class ParkingConfigTest(unittest.TestCase):
             "--prealign-speed", "42",
             "--prealign-steering", "-120",
             "--prealign-timeout-s", "7.5",
+            "--park-hold-s", "2.5",
+            "--exit-speed", "20",
+            "--exit-turn-steering", "70",
+            "--exit-turn-s", "1.2",
+            "--exit-straight-s", "0",
+            "--exit-right-min-clearance-cm", "22",
         ])
         original = load_parking_config(str(ROOT / "configs" / "parking.json"))
         config = apply_cli_overrides(original, args)
@@ -124,6 +138,12 @@ class ParkingConfigTest(unittest.TestCase):
         self.assertEqual(config.planner.prealign_steering, -120)
         self.assertEqual(config.planner.max_steering, original.planner.max_steering)
         self.assertEqual(config.planner.prealign_timeout_s, 7.5)
+        self.assertEqual(config.planner.park_hold_s, 2.5)
+        self.assertEqual(config.planner.exit_speed, 20)
+        self.assertEqual(config.planner.exit_turn_steering, 70)
+        self.assertEqual(config.planner.exit_turn_s, 1.2)
+        self.assertEqual(config.planner.exit_straight_s, 0.0)
+        self.assertEqual(config.planner.exit_right_min_clearance_mm, 220.0)
 
     def test_parking_mask_colors_follow_semantic_line_role(self):
         def line(index):

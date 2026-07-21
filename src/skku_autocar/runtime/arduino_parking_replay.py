@@ -444,7 +444,12 @@ class SharedParkingPlannerReplay:
 def replay_state_for_planner(state: ParkingState) -> ReplayParkingState:
     if state in (ParkingState.SEARCH_CARS, ParkingState.TRACK_GAP):
         return ReplayParkingState.SEARCHING
-    if state in (ParkingState.POSITION_REAR_AXLE, ParkingState.PREALIGN_LEFT):
+    if state in (
+        ParkingState.POSITION_REAR_AXLE,
+        ParkingState.PREALIGN_LEFT,
+        ParkingState.EXIT_RIGHT,
+        ParkingState.EXIT_STRAIGHT,
+    ):
         return ReplayParkingState.POSITIONING
     if state in (
         ParkingState.VERIFY_PARKING_LINES,
@@ -453,7 +458,7 @@ def replay_state_for_planner(state: ParkingState) -> ReplayParkingState:
         ParkingState.FOLLOW_SLOT_CENTER,
     ):
         return ReplayParkingState.REVERSING
-    if state == ParkingState.PARKED:
+    if state in (ParkingState.PARKED, ParkingState.EXIT_DONE):
         return ReplayParkingState.FINISHED
     if state == ParkingState.EMERGENCY_STOP:
         return ReplayParkingState.EMERGENCY_STOP

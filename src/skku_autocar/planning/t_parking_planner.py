@@ -26,6 +26,9 @@ class ParkingState(str, Enum):
     FOLLOW_ENTRY_CURVE = "follow_entry_curve"
     FOLLOW_SLOT_CENTER = "follow_slot_center"
     PARKED = "parked"
+    EXIT_RIGHT = "exit_right"
+    EXIT_STRAIGHT = "exit_straight"
+    EXIT_DONE = "exit_done"
     ABORTED = "aborted"
     EMERGENCY_STOP = "emergency_stop"
 
@@ -56,6 +59,12 @@ class ParkingPlannerConfig:
     ultrasonic_stale_after_s: float = 0.8
     reverse_entry_speed: int = -28
     reverse_center_speed: int = -18
+    park_hold_s: float = 3.0
+    exit_speed: int = 24
+    exit_turn_steering: int = 80
+    exit_turn_s: float = 1.6
+    exit_straight_s: float = 0.0
+    exit_right_min_clearance_mm: float = 180.0
     max_steering: int = 110
     reverse_steering_sign: float = -1.0
     geometry_confidence_min: float = 0.20
@@ -104,6 +113,7 @@ class TParkingPlanner:
             ParkingState.ABORTED,
             ParkingState.EMERGENCY_STOP,
             ParkingState.PARKED,
+            ParkingState.EXIT_DONE,
         ):
             return False
         self._enter(ParkingState.SEARCH_CARS, now)
@@ -136,7 +146,20 @@ class TParkingPlanner:
         if self.state == ParkingState.IDLE:
             return self._stop("waiting_for_start")
         if self.state == ParkingState.PARKED:
-            return self._stop("parked")
+            if self._state_elapsed(now) >= max(0.0, self.config.park_hold_s):
+                self._enter(ParkingState.EXIT_RIGHT, now)
+                if self._ultrasonic_emergency(left_ultrasonic_mm) or self._ultrasonic_emergency(
+                    right_ultrasonic_mm
+                ):
+                    self._enter(ParkingState.EMERGENCY_STOP, now)
+                    return self._stop(
+                        "side_ultrasonic_distance<=%.0fmm"
+                        % self.config.ultrasonic_emergency_mm
+                    )
+                return self._exit_right_plan(now, right_ultrasonic_mm)
+            return self._stop("parked_hold")
+        if self.state == ParkingState.EXIT_DONE:
+            return self._stop("exit_done")
         if self.state == ParkingState.ABORTED:
             return self._stop("parking_aborted")
         if self.state == ParkingState.EMERGENCY_STOP:
@@ -166,6 +189,18 @@ class TParkingPlanner:
             if lidar.unsafe:
                 self._enter(ParkingState.EMERGENCY_STOP, now)
                 return self._stop("lidar_safety_obstacle_during_prealign")
+
+        if self.state == ParkingState.EXIT_RIGHT:
+            return self._exit_right_plan(now, right_ultrasonic_mm)
+
+        if self.state == ParkingState.EXIT_STRAIGHT:
+            if (
+                self.config.exit_straight_s > 0.0
+                and self._state_elapsed(now) >= self.config.exit_straight_s
+            ):
+                self._enter(ParkingState.EXIT_DONE, now)
+                return self._stop("exit_complete")
+            return self._drive(self._exit_speed(), 0, "exit_straight")
 
         if self.state == ParkingState.SEARCH_CARS:
             if self._expired(now, self.config.search_timeout_s):
@@ -465,6 +500,13 @@ class TParkingPlanner:
             and float(value_mm) <= self.config.ultrasonic_emergency_mm
         )
 
+    def _exit_right_blocked(self, value_mm: Optional[float]) -> bool:
+        return (
+            self.config.exit_right_min_clearance_mm > 0.0
+            and self._usable_ultrasonic(value_mm)
+            and float(value_mm) <= self.config.exit_right_min_clearance_mm
+        )
+
     def _usable_ultrasonic(self, value_mm: Optional[float]) -> bool:
         return (
             value_mm is not None
@@ -473,6 +515,29 @@ class TParkingPlanner:
 
     def _prealign_steering(self) -> int:
         return int(self.config.prealign_steering)
+
+    def _exit_speed(self) -> int:
+        return abs(int(self.config.exit_speed))
+
+    def _exit_right_plan(
+        self,
+        now: float,
+        right_ultrasonic_mm: Optional[float],
+    ) -> ParkingPlan:
+        if self._exit_right_blocked(right_ultrasonic_mm):
+            self._state_started_at = now
+            return self._stop(
+                "exit_right_blocked<=%.0fmm"
+                % self.config.exit_right_min_clearance_mm
+            )
+        if self._state_elapsed(now) >= max(0.0, self.config.exit_turn_s):
+            self._enter(ParkingState.EXIT_STRAIGHT, now)
+            return self._drive(self._exit_speed(), 0, "exit_straight")
+        return self._drive(
+            self._exit_speed(),
+            int(self.config.exit_turn_steering),
+            "exit_right_turn",
+        )
 
     @staticmethod
     def _prealign_metrics(
@@ -510,6 +575,9 @@ class TParkingPlanner:
 
     def _expired(self, now: float, timeout_s: float) -> bool:
         return timeout_s > 0.0 and now - self._state_started_at >= timeout_s
+
+    def _state_elapsed(self, now: float) -> float:
+        return max(0.0, now - self._state_started_at)
 
     def _enter(self, state: ParkingState, now: float) -> None:
         self.state = state

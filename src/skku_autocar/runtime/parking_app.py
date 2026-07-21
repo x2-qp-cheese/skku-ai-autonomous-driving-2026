@@ -256,7 +256,11 @@ def run_prepared(args: argparse.Namespace) -> int:
             class_masks = segmenter.segment_class_masks(frame)
             parking_masks = list(class_masks.lane)
             bev_masks = [transformer.warp_mask(mask) for mask in parking_masks]
-            geometry = geometry_estimator.estimate(bev_masks, class_masks.lane_conf)
+            geometry_confidence = class_masks.lane_conf
+            if not bev_masks:
+                bev_masks = classical_parking_line_masks(cv2, np, transformer.warp_frame(frame))
+                geometry_confidence = 1.0 if bev_masks else 0.0
+            geometry = geometry_estimator.estimate(bev_masks, geometry_confidence)
 
             lidar_observation, lidar_scan = current_lidar_observation(
                 lidar_estimator,
@@ -405,6 +409,58 @@ def run_prepared(args: argparse.Namespace) -> int:
         cap.release()
         cv2.destroyAllWindows()
     return 0
+
+
+def classical_parking_line_masks(cv2: Any, np: Any, bev_frame: Any) -> list:
+    """Extract fallback parking-line masks from a rear-camera BEV frame.
+
+    The parking YOLO occasionally misses the faint gray/white taped lines in the
+    live venue. This fallback is deliberately narrow: it only looks for low
+    saturation, locally bright line segments in BEV, and it is only used when
+    YOLO produced no parking-line instances at all.
+    """
+
+    hsv = cv2.cvtColor(bev_frame, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(bev_frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (0, 0), 7)
+    local_bright = cv2.subtract(gray, blur)
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    candidates = (
+        (saturation < 70)
+        & ((local_bright > 8) | (value > 150))
+    ).astype(np.uint8) * 255
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    candidates = cv2.morphologyEx(candidates, cv2.MORPH_OPEN, kernel)
+    edges = cv2.Canny(candidates, 50, 150)
+    lines = cv2.HoughLinesP(
+        edges,
+        1,
+        np.pi / 180.0,
+        threshold=25,
+        minLineLength=55,
+        maxLineGap=25,
+    )
+    if lines is None:
+        return []
+
+    segments = []
+    for raw_line in lines:
+        x1, y1, x2, y2 = [int(value) for value in np.ravel(raw_line)[:4]]
+        length = float(((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5)
+        if length < 55.0:
+            continue
+        segments.append((length, x1, y1, x2, y2))
+
+    segments.sort(reverse=True)
+    masks = []
+    shape = bev_frame.shape[:2]
+    for _, x1, y1, x2, y2 in segments[:30]:
+        mask = np.zeros(shape, dtype=np.uint8)
+        cv2.line(mask, (x1, y1), (x2, y2), 255, 5)
+        masks.append(mask)
+    return masks
 
 
 def current_lidar_observation(
@@ -631,11 +687,13 @@ def format_dashboard_value(value: Optional[float], signed: bool = False) -> str:
 def parking_state_color(state: ParkingState) -> Tuple[int, int, int]:
     if state in (ParkingState.EMERGENCY_STOP, ParkingState.ABORTED):
         return (0, 0, 255)
-    if state == ParkingState.PARKED:
+    if state in (ParkingState.PARKED, ParkingState.EXIT_DONE):
         return (255, 255, 255)
     if state in (
         ParkingState.FOLLOW_ENTRY_CURVE,
         ParkingState.FOLLOW_SLOT_CENTER,
+        ParkingState.EXIT_RIGHT,
+        ParkingState.EXIT_STRAIGHT,
     ):
         return (0, 255, 0)
     if state in (
@@ -1281,10 +1339,12 @@ def open_vehicle(args: argparse.Namespace, config: ParkingAppConfig) -> SerialVe
             abs(config.planner.prealign_speed),
             abs(config.planner.reverse_entry_speed),
             abs(config.planner.reverse_center_speed),
+            abs(config.planner.exit_speed),
         ),
         max_steering=max(
             abs(config.planner.max_steering),
             abs(config.planner.prealign_steering),
+            abs(config.planner.exit_turn_steering),
         ),
     )
     client.connect()
@@ -1391,6 +1451,21 @@ def apply_cli_overrides(config: ParkingAppConfig, args: argparse.Namespace) -> P
         planner = replace(planner, prealign_steering=args.prealign_steering)
     if args.prealign_timeout_s is not None:
         planner = replace(planner, prealign_timeout_s=args.prealign_timeout_s)
+    if args.park_hold_s is not None:
+        planner = replace(planner, park_hold_s=args.park_hold_s)
+    if args.exit_speed is not None:
+        planner = replace(planner, exit_speed=args.exit_speed)
+    if args.exit_turn_steering is not None:
+        planner = replace(planner, exit_turn_steering=args.exit_turn_steering)
+    if args.exit_turn_s is not None:
+        planner = replace(planner, exit_turn_s=args.exit_turn_s)
+    if args.exit_straight_s is not None:
+        planner = replace(planner, exit_straight_s=args.exit_straight_s)
+    if args.exit_right_min_clearance_cm is not None:
+        planner = replace(
+            planner,
+            exit_right_min_clearance_mm=args.exit_right_min_clearance_cm * 10.0,
+        )
     if bev.src_top_left[0] >= bev.src_top_right[0]:
         raise ValueError("BEV top-left x must be smaller than top-right x")
     if bev.src_bottom_left[0] >= bev.src_bottom_right[0]:
@@ -1535,6 +1610,42 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         default=None,
         help="maximum seconds allowed for the LiDAR-closed-loop pre-alignment arc",
     )
+    parser.add_argument(
+        "--park-hold-s",
+        type=float,
+        default=None,
+        help="seconds to stay stopped in the parking bay before exiting",
+    )
+    parser.add_argument(
+        "--exit-speed",
+        type=int,
+        default=None,
+        help="forward speed for the post-parking exit sequence",
+    )
+    parser.add_argument(
+        "--exit-turn-steering",
+        type=int,
+        default=None,
+        help="signed steering command while leaving the slot; right is positive",
+    )
+    parser.add_argument(
+        "--exit-turn-s",
+        type=float,
+        default=None,
+        help="seconds to keep the right-turn command after parking",
+    )
+    parser.add_argument(
+        "--exit-straight-s",
+        type=float,
+        default=None,
+        help="seconds to drive straight after the exit turn; 0 keeps driving until cancelled",
+    )
+    parser.add_argument(
+        "--exit-right-min-clearance-cm",
+        type=float,
+        default=None,
+        help="stop exit turn while right ultrasonic distance is at or below this value",
+    )
     args = parser.parse_args(argv)
     if args.frame_stride < 1:
         parser.error("--frame-stride must be at least 1")
@@ -1580,6 +1691,21 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         parser.error("--prealign-steering must be between -150 and 150")
     if args.prealign_timeout_s is not None and args.prealign_timeout_s <= 0.0:
         parser.error("--prealign-timeout-s must be positive")
+    if args.park_hold_s is not None and args.park_hold_s < 0.0:
+        parser.error("--park-hold-s cannot be negative")
+    if args.exit_speed is not None and args.exit_speed <= 0:
+        parser.error("--exit-speed must be positive")
+    if args.exit_turn_steering is not None and abs(args.exit_turn_steering) > 150:
+        parser.error("--exit-turn-steering must be between -150 and 150")
+    if args.exit_turn_s is not None and args.exit_turn_s < 0.0:
+        parser.error("--exit-turn-s cannot be negative")
+    if args.exit_straight_s is not None and args.exit_straight_s < 0.0:
+        parser.error("--exit-straight-s cannot be negative")
+    if (
+        args.exit_right_min_clearance_cm is not None
+        and args.exit_right_min_clearance_cm < 0.0
+    ):
+        parser.error("--exit-right-min-clearance-cm cannot be negative")
     if (
         args.first_car_turn_target_cm is not None
         and not -250.0 <= args.first_car_turn_target_cm <= 250.0
