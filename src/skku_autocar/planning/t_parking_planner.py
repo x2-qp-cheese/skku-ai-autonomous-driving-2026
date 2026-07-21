@@ -21,7 +21,9 @@ class ParkingState(str, Enum):
     TRACK_GAP = "track_gap"
     POSITION_REAR_AXLE = "position_rear_axle"
     PREALIGN_LEFT = "prealign_left"
-    VERIFY_PARKING_LINES = "verify_parking_lines"
+    VERIFY_SLOT_BOX = "verify_slot_box"
+    # Backward-compatible alias for old replay integrations.
+    VERIFY_PARKING_LINES = "verify_slot_box"
     PLAN_REVERSE_PATH = "plan_reverse_path"
     FOLLOW_ENTRY_CURVE = "follow_entry_curve"
     FOLLOW_SLOT_CENTER = "follow_slot_center"
@@ -91,7 +93,7 @@ class ParkingPlan:
 
 
 class TParkingPlanner:
-    """LiDAR gap positioning followed by camera-guided reverse parking."""
+    """LiDAR gap positioning followed by LiDAR-box-guided reverse parking."""
 
     def __init__(
         self,
@@ -105,7 +107,7 @@ class TParkingPlanner:
         self._aligned_frames = 0
         self._prealign_aligned_frames = 0
         self._prealign_gap_acquired_at: Optional[float] = None
-        self._reverse_entry_mode = "camera_curve"
+        self._reverse_entry_mode = "lidar_box_curve"
 
     def start(self, now: float) -> bool:
         if self.state not in (
@@ -125,7 +127,7 @@ class TParkingPlanner:
         self._aligned_frames = 0
         self._prealign_aligned_frames = 0
         self._prealign_gap_acquired_at = None
-        self._reverse_entry_mode = "camera_curve"
+        self._reverse_entry_mode = "lidar_box_curve"
 
     @property
     def prealign_confirmed_frames(self) -> int:
@@ -171,15 +173,15 @@ class TParkingPlanner:
             self._enter(ParkingState.EMERGENCY_STOP, now)
             return self._stop("side_ultrasonic_distance<=%.0fmm" % self.config.ultrasonic_emergency_mm)
 
-        camera_and_reverse_states = (
-            ParkingState.VERIFY_PARKING_LINES,
+        slot_and_reverse_states = (
+            ParkingState.VERIFY_SLOT_BOX,
             ParkingState.PLAN_REVERSE_PATH,
             ParkingState.FOLLOW_ENTRY_CURVE,
             ParkingState.FOLLOW_SLOT_CENTER,
         )
-        if self.state in camera_and_reverse_states and not lidar.valid:
+        if self.state in slot_and_reverse_states and not lidar.valid:
             return self._stop("lidar_unavailable_during_reverse")
-        if lidar.unsafe and self.state in camera_and_reverse_states:
+        if lidar.unsafe and self.state in slot_and_reverse_states:
             self._enter(ParkingState.EMERGENCY_STOP, now)
             return self._stop("lidar_safety_obstacle")
 
@@ -295,7 +297,7 @@ class TParkingPlanner:
                         steering,
                         "rear_axle_at_gap_center:settling_max_left",
                     )
-                self._enter(ParkingState.VERIFY_PARKING_LINES, now)
+                self._enter(ParkingState.VERIFY_SLOT_BOX, now)
                 return self._stop("rear_axle_at_gap_center")
             direction = -1 if lidar.entry_error_mm > 0.0 else 1
             return self._drive(
@@ -351,7 +353,7 @@ class TParkingPlanner:
                 self.config.prealign_confirm_frames,
             ):
                 self._reverse_entry_mode = "direct_aligned"
-                self._enter(ParkingState.VERIFY_PARKING_LINES, now)
+                self._enter(ParkingState.VERIFY_SLOT_BOX, now)
                 return self._stop("prealign_direct_reverse_ready")
 
             overshot = (
@@ -363,8 +365,8 @@ class TParkingPlanner:
                 >= self.config.prealign_timeout_s
             )
             if overshot or timed_out:
-                self._reverse_entry_mode = "camera_curve_fallback"
-                self._enter(ParkingState.VERIFY_PARKING_LINES, now)
+                self._reverse_entry_mode = "lidar_box_curve_fallback"
+                self._enter(ParkingState.VERIFY_SLOT_BOX, now)
                 return self._stop(
                     "prealign_fallback:%s"
                     % ("heading_overshoot" if overshot else "timeout")
@@ -380,15 +382,15 @@ class TParkingPlanner:
                 return self._drive(0, steering, "steering_settle:" + reason)
             return self._drive(self.config.prealign_speed, steering, reason)
 
-        if self.state == ParkingState.VERIFY_PARKING_LINES:
+        if self.state == ParkingState.VERIFY_SLOT_BOX:
             if self._expired(now, self.config.verify_timeout_s):
-                return self._abort(now, "parking_line_verify_timeout")
+                return self._abort(now, "lidar_slot_box_verify_timeout")
             if not self._full_geometry_usable(geometry):
-                return self._stop("waiting_for_three_parking_lines")
+                return self._stop("waiting_for_lidar_slot_box")
             if now - self._state_started_at < self.config.verify_hold_s:
-                return self._stop("parking_line_verify_hold")
+                return self._stop("lidar_slot_box_verify_hold")
             self._enter(ParkingState.PLAN_REVERSE_PATH, now)
-            return self._stop("parking_bay_verified")
+            return self._stop("lidar_slot_box_verified")
 
         path = self.path_generator.generate(geometry)
 

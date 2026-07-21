@@ -46,10 +46,7 @@
     "smooth_alpha": 0.35,
     "max_lateral_jump_px": 100.0,
     "max_heading_jump_deg": 35.0,
-    "max_depth_jump_px": 160.0,
-    "synthesize_back_from_side_pair": true,
-    "synthetic_back_depth_to_width_ratio": 1.58,
-    "synthetic_back_quality_scale": 0.70
+    "max_depth_jump_px": 160.0
   },
   "lidar": {
     "quality_min": 8,

@@ -63,8 +63,6 @@ class ParkingConfigTest(unittest.TestCase):
         self.assertEqual(config.planner.exit_right_min_clearance_mm, 180.0)
         self.assertEqual(tuple(config.bev.src_top_left), (0.18, 0.56))
         self.assertEqual(tuple(config.bev.src_top_right), (0.82, 0.56))
-        self.assertTrue(config.geometry.synthesize_back_from_side_pair)
-        self.assertAlmostEqual(config.geometry.synthetic_back_depth_to_width_ratio, 1.58)
 
     def test_recording_zip_finds_video_and_lidar_csv(self):
         with tempfile.TemporaryDirectory() as directory:

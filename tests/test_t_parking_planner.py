@@ -198,7 +198,7 @@ class TParkingPlannerTest(unittest.TestCase):
 
         self.assertEqual(tracking.state, ParkingState.TRACK_GAP)
         self.assertEqual(positioned.state, ParkingState.POSITION_REAR_AXLE)
-        self.assertEqual(verifying.state, ParkingState.VERIFY_PARKING_LINES)
+        self.assertEqual(verifying.state, ParkingState.VERIFY_SLOT_BOX)
         self.assertEqual(path_plan.state, ParkingState.PLAN_REVERSE_PATH)
         self.assertEqual(armed.state, ParkingState.FOLLOW_ENTRY_CURVE)
         self.assertIsNotNone(armed.path)
@@ -386,11 +386,11 @@ class TParkingPlannerTest(unittest.TestCase):
         ready = planner.update(geometry(), aligned_lidar, 0.3)
 
         self.assertEqual(confirming.state, ParkingState.PREALIGN_LEFT)
-        self.assertEqual(ready.state, ParkingState.VERIFY_PARKING_LINES)
+        self.assertEqual(ready.state, ParkingState.VERIFY_SLOT_BOX)
         self.assertEqual(ready.reason, "prealign_direct_reverse_ready")
         self.assertTrue(ready.command.brake)
 
-    def test_prealign_timeout_stops_then_uses_camera_curve_fallback(self):
+    def test_prealign_timeout_stops_then_uses_lidar_box_curve_fallback(self):
         planner = self.make_prealign_planner()
         self.enter_prealign(planner)
 
@@ -400,7 +400,7 @@ class TParkingPlannerTest(unittest.TestCase):
             2.2,
         )
 
-        self.assertEqual(fallback.state, ParkingState.VERIFY_PARKING_LINES)
+        self.assertEqual(fallback.state, ParkingState.VERIFY_SLOT_BOX)
         self.assertEqual(fallback.reason, "prealign_fallback:timeout")
         self.assertTrue(fallback.command.brake)
 

@@ -60,19 +60,6 @@ class ParkingGeometryTest(unittest.TestCase):
         self.assertIsNone(geometry.depth_remaining_px)
         self.assertEqual(geometry.reason, "side_pair")
 
-    def test_side_pair_can_synthesize_back_line_for_live_fallback(self):
-        geometry = self.make_estimator(
-            synthesize_back_from_side_pair=True,
-            synthetic_back_depth_to_width_ratio=1.5,
-        ).estimate(parking_masks()[:2], confidence=1.0)
-
-        self.assertTrue(geometry.found)
-        self.assertTrue(geometry.has_side_pair)
-        self.assertTrue(geometry.has_back_line)
-        self.assertIsNotNone(geometry.depth_remaining_px)
-        self.assertIsNotNone(geometry.stop_target_x_px)
-        self.assertEqual(geometry.reason, "parking_bay_synthetic_back")
-
     def test_short_dropout_coasts_then_reports_lost(self):
         estimator = self.make_estimator(max_coast_frames=2)
         found = estimator.estimate(parking_masks(), confidence=1.0)

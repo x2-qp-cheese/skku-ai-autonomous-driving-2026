@@ -12,6 +12,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from ..estimation.lidar_slot_geometry import LidarSlotGeometryProjector
 from ..estimation.parking_geometry import ParkingGeometry, ParkingGeometryEstimator
 from ..estimation.parking_lidar import (
     LidarParkingObservation,
@@ -452,7 +453,7 @@ def replay_state_for_planner(state: ParkingState) -> ReplayParkingState:
     ):
         return ReplayParkingState.POSITIONING
     if state in (
-        ParkingState.VERIFY_PARKING_LINES,
+        ParkingState.VERIFY_SLOT_BOX,
         ParkingState.PLAN_REVERSE_PATH,
         ParkingState.FOLLOW_ENTRY_CURVE,
         ParkingState.FOLLOW_SLOT_CENTER,
@@ -612,6 +613,12 @@ def simulate_scans(
     constants: ArduinoReplayConstants,
 ) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
     lidar_estimator = LidarParkingSpaceEstimator(config.lidar)
+    slot_geometry_projector = LidarSlotGeometryProjector(
+        config.lidar,
+        config.geometry,
+        config.bev.out_width,
+        config.bev.out_height,
+    )
     controller = SharedParkingPlannerReplay(config)
     start = scans[0].timestamp
     rows: List[Dict[str, object]] = []
@@ -667,11 +674,7 @@ def simulate_scans(
             minimum_rear_cm = rear_cm if minimum_rear_cm is None else min(minimum_rear_cm, rear_cm)
         camera = latest_camera_sample(camera_samples, elapsed)
         line_error = camera.line_error_px if camera is not None and camera.found else None
-        geometry = (
-            camera.geometry
-            if camera is not None and camera.geometry is not None
-            else ParkingGeometry(reason="camera_not_sampled")
-        )
+        geometry = slot_geometry_projector.project(lidar)
         command = controller.update(lidar, geometry, elapsed)
         if command.state != previous_state:
             transitions.append(
@@ -797,6 +800,12 @@ def run_visual_replay(
     transformer = BevTransformer(config.bev)
     geometry_estimator = ParkingGeometryEstimator(config.geometry)
     lidar_estimator = LidarParkingSpaceEstimator(config.lidar)
+    slot_geometry_projector = LidarSlotGeometryProjector(
+        config.lidar,
+        config.geometry,
+        config.bev.out_width,
+        config.bev.out_height,
+    )
     controller = SharedParkingPlannerReplay(config)
 
     capture = cv2.VideoCapture(str(video_path))
@@ -832,6 +841,7 @@ def run_visual_replay(
         0,
         "searching_for_parked_cars",
     )
+    geometry = ParkingGeometry(reason="lidar_slot_box_unavailable")
     stopped_by_user = False
 
     try:
@@ -847,30 +857,33 @@ def run_visual_replay(
             if segmenter is None:
                 frame_masks = []
                 bev_masks = []
-                geometry = ParkingGeometry(reason="camera_disabled")
+                camera_geometry = ParkingGeometry(reason="camera_disabled")
                 camera = CameraSample(
                     elapsed,
                     None,
                     False,
                     "camera_disabled",
                     0.0,
-                    geometry=geometry,
+                    geometry=camera_geometry,
                 )
             else:
                 class_masks = segmenter.segment_class_masks(frame)
                 frame_masks = list(class_masks.lane)
                 bev_masks = [transformer.warp_mask(mask) for mask in frame_masks]
-                geometry = geometry_estimator.estimate(bev_masks, class_masks.lane_conf)
-                found = geometry.found and geometry.has_side_pair
+                camera_geometry = geometry_estimator.estimate(
+                    bev_masks,
+                    class_masks.lane_conf,
+                )
+                found = camera_geometry.found and camera_geometry.has_side_pair
                 camera = CameraSample(
                     elapsed_s=elapsed,
-                    line_error_px=geometry.lateral_error_px if found else None,
+                    line_error_px=camera_geometry.lateral_error_px if found else None,
                     found=found,
-                    reason=geometry.reason,
+                    reason=camera_geometry.reason,
                     inference_ms=class_masks.inference_ms,
                     detected_line_masks=len(frame_masks),
-                    fitted_line_count=geometry.observed_line_count,
-                    geometry=geometry,
+                    fitted_line_count=camera_geometry.observed_line_count,
+                    geometry=camera_geometry,
                 )
             camera_samples.append(camera)
 
@@ -883,6 +896,7 @@ def run_visual_replay(
                     current_scan,
                     now=current_scan.timestamp,
                 )
+                geometry = slot_geometry_projector.project(current_lidar)
                 current_rear_cm = rear_lidar_distance_cm(current_scan, config)
                 old_state = controller.state
                 current_command = controller.update(
@@ -1150,8 +1164,13 @@ def draw_arduino_dashboard(
     controller: SharedParkingPlannerReplay,
 ) -> object:
     rear_display = frame.copy()
+    mask_geometry = (
+        camera.geometry
+        if camera.geometry is not None
+        else ParkingGeometry(reason="camera_not_sampled")
+    )
     for index, mask in enumerate(frame_masks):
-        color = np.asarray(parking_mask_color(index, geometry), dtype=np.float32)
+        color = np.asarray(parking_mask_color(index, mask_geometry), dtype=np.float32)
         selected = mask > 0
         rear_display[selected] = (
             0.55 * rear_display[selected] + 0.45 * color
@@ -1170,7 +1189,7 @@ def draw_arduino_dashboard(
 
     bev_display = transformer.warp_frame(frame)
     for index, mask in enumerate(bev_masks):
-        color = np.asarray(parking_mask_color(index, geometry), dtype=np.float32)
+        color = np.asarray(parking_mask_color(index, mask_geometry), dtype=np.float32)
         selected = mask > 0
         bev_display[selected] = (
             0.45 * bev_display[selected] + 0.55 * color

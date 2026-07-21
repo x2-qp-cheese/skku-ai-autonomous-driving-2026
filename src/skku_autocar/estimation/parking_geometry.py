@@ -7,7 +7,7 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 @dataclass(frozen=True)
 class ParkingLine:
-    """A straight line fitted to one YOLO instance mask in rear-camera BEV."""
+    """A straight rear-BEV line fitted from a mask or projected from LiDAR."""
 
     center_x: float
     center_y: float
@@ -92,9 +92,6 @@ class ParkingGeometryConfig:
     max_lateral_jump_px: float = 90.0
     max_heading_jump_deg: float = 35.0
     max_depth_jump_px: float = 140.0
-    synthesize_back_from_side_pair: bool = False
-    synthetic_back_depth_to_width_ratio: float = 1500.0 / 950.0
-    synthetic_back_quality_scale: float = 0.70
 
 
 class ParkingGeometryEstimator:
@@ -328,31 +325,6 @@ class ParkingGeometryEstimator:
             mask_index=-1,
         )
 
-        synthetic_back = False
-        if back is None and self.config.synthesize_back_from_side_pair:
-            depth_px = separation * self.config.synthetic_back_depth_to_width_ratio
-            near_x = center_line.center_x - direction[0] * center_line.length_px / 2.0
-            near_y = center_line.center_y - direction[1] * center_line.length_px / 2.0
-            back_x = near_x + direction[0] * depth_px
-            back_y = near_y + direction[1] * depth_px
-            back_quality = (
-                (left.quality + right.quality)
-                / 2.0
-                * self.config.synthetic_back_quality_scale
-            )
-            back = ParkingLine(
-                center_x=back_x,
-                center_y=back_y,
-                direction_x=-direction[1],
-                direction_y=direction[0],
-                length_px=separation,
-                residual_px=(left.residual_px + right.residual_px) / 2.0,
-                quality=clip(back_quality, 0.0, 1.0),
-                point_count=left.point_count + right.point_count,
-                mask_index=-1,
-            )
-            synthetic_back = True
-
         depth = None
         remaining = None
         back_center_x = None
@@ -406,11 +378,7 @@ class ParkingGeometryEstimator:
             confidence=confidence,
             observed_line_count=line_count,
             reason=(
-                (
-                    "parking_bay_synthetic_back"
-                    if synthetic_back
-                    else ("parking_bay" if back is not None else "side_pair")
-                )
+                ("parking_bay" if back is not None else "side_pair")
                 if found
                 else "low_confidence"
             ),

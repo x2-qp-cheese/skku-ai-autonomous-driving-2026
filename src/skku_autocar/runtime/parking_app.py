@@ -18,6 +18,7 @@ from ..control.serial_vehicle import (
     UltrasonicReadings,
     parse_ultrasonic_line,
 )
+from ..estimation.lidar_slot_geometry import LidarSlotGeometryProjector
 from ..estimation.parking_geometry import ParkingGeometry, ParkingGeometryEstimator
 from ..estimation.parking_lidar import (
     LidarParkingObservation,
@@ -177,6 +178,12 @@ def run_prepared(args: argparse.Namespace) -> int:
     transformer = BevTransformer(config.bev)
     geometry_estimator = ParkingGeometryEstimator(config.geometry)
     lidar_estimator = LidarParkingSpaceEstimator(config.lidar)
+    slot_geometry_projector = LidarSlotGeometryProjector(
+        config.lidar,
+        config.geometry,
+        config.bev.out_width,
+        config.bev.out_height,
+    )
     planner = TParkingPlanner(config.planner, config.path)
 
     lidar_replay = LidarCsvReplay(str(resolve_path(args.lidar_csv))) if args.lidar_csv else None
@@ -256,11 +263,10 @@ def run_prepared(args: argparse.Namespace) -> int:
             class_masks = segmenter.segment_class_masks(frame)
             parking_masks = list(class_masks.lane)
             bev_masks = [transformer.warp_mask(mask) for mask in parking_masks]
-            geometry_confidence = class_masks.lane_conf
-            if not bev_masks:
-                bev_masks = classical_parking_line_masks(cv2, np, transformer.warp_frame(frame))
-                geometry_confidence = 1.0 if bev_masks else 0.0
-            geometry = geometry_estimator.estimate(bev_masks, geometry_confidence)
+            camera_geometry = geometry_estimator.estimate(
+                bev_masks,
+                class_masks.lane_conf,
+            )
 
             lidar_observation, lidar_scan = current_lidar_observation(
                 lidar_estimator,
@@ -269,6 +275,10 @@ def run_prepared(args: argparse.Namespace) -> int:
                 elapsed + args.lidar_offset + config.runtime.lidar_video_offset_s,
                 args.allow_no_lidar,
             )
+            # The orange LiDAR box is the single source of truth for reverse
+            # path geometry. Camera masks remain visible for model diagnostics,
+            # but their count or topology cannot arm a reverse path.
+            geometry = slot_geometry_projector.project(lidar_observation)
             ultrasonic_fresh = (
                 last_ultrasonic is not None
                 and monotonic_now - last_ultrasonic_at
@@ -317,6 +327,7 @@ def run_prepared(args: argparse.Namespace) -> int:
                 left_ultrasonic_mm,
                 right_ultrasonic_mm,
                 show_status=False,
+                mask_geometry=camera_geometry,
             )
             lidar_display = draw_lidar_debug(
                 cv2,
@@ -409,58 +420,6 @@ def run_prepared(args: argparse.Namespace) -> int:
         cap.release()
         cv2.destroyAllWindows()
     return 0
-
-
-def classical_parking_line_masks(cv2: Any, np: Any, bev_frame: Any) -> list:
-    """Extract fallback parking-line masks from a rear-camera BEV frame.
-
-    The parking YOLO occasionally misses the faint gray/white taped lines in the
-    live venue. This fallback is deliberately narrow: it only looks for low
-    saturation, locally bright line segments in BEV, and it is only used when
-    YOLO produced no parking-line instances at all.
-    """
-
-    hsv = cv2.cvtColor(bev_frame, cv2.COLOR_BGR2HSV)
-    gray = cv2.cvtColor(bev_frame, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (0, 0), 7)
-    local_bright = cv2.subtract(gray, blur)
-    saturation = hsv[:, :, 1]
-    value = hsv[:, :, 2]
-    candidates = (
-        (saturation < 70)
-        & ((local_bright > 8) | (value > 150))
-    ).astype(np.uint8) * 255
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    candidates = cv2.morphologyEx(candidates, cv2.MORPH_OPEN, kernel)
-    edges = cv2.Canny(candidates, 50, 150)
-    lines = cv2.HoughLinesP(
-        edges,
-        1,
-        np.pi / 180.0,
-        threshold=25,
-        minLineLength=55,
-        maxLineGap=25,
-    )
-    if lines is None:
-        return []
-
-    segments = []
-    for raw_line in lines:
-        x1, y1, x2, y2 = [int(value) for value in np.ravel(raw_line)[:4]]
-        length = float(((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5)
-        if length < 55.0:
-            continue
-        segments.append((length, x1, y1, x2, y2))
-
-    segments.sort(reverse=True)
-    masks = []
-    shape = bev_frame.shape[:2]
-    for _, x1, y1, x2, y2 in segments[:30]:
-        mask = np.zeros(shape, dtype=np.uint8)
-        cv2.line(mask, (x1, y1), (x2, y2), 255, 5)
-        masks.append(mask)
-    return masks
 
 
 def current_lidar_observation(
@@ -700,7 +659,7 @@ def parking_state_color(state: ParkingState) -> Tuple[int, int, int]:
         ParkingState.TRACK_GAP,
         ParkingState.POSITION_REAR_AXLE,
         ParkingState.PREALIGN_LEFT,
-        ParkingState.VERIFY_PARKING_LINES,
+        ParkingState.VERIFY_SLOT_BOX,
         ParkingState.PLAN_REVERSE_PATH,
     ):
         return (0, 165, 255)
@@ -723,10 +682,12 @@ def draw_debug(
     left_ultrasonic_mm: Optional[float] = None,
     right_ultrasonic_mm: Optional[float] = None,
     show_status: bool = True,
+    mask_geometry: Optional[ParkingGeometry] = None,
 ) -> Tuple[Any, Any]:
+    mask_roles = mask_geometry if mask_geometry is not None else geometry
     display = frame.copy()
     for index, mask in enumerate(frame_masks):
-        color = np.asarray(parking_mask_color(index, geometry), dtype=np.float32)
+        color = np.asarray(parking_mask_color(index, mask_roles), dtype=np.float32)
         selected = mask > 0
         display[selected] = (0.55 * display[selected] + 0.45 * color).astype(np.uint8)
     polygon = (
@@ -738,7 +699,7 @@ def draw_debug(
 
     bev_display = transformer.warp_frame(frame)
     for index, mask in enumerate(bev_masks):
-        color = np.asarray(parking_mask_color(index, geometry), dtype=np.float32)
+        color = np.asarray(parking_mask_color(index, mask_roles), dtype=np.float32)
         selected = mask > 0
         bev_display[selected] = (0.45 * bev_display[selected] + 0.55 * color).astype(np.uint8)
 
