@@ -3,12 +3,14 @@ import unittest
 from skku_autocar.estimation.lane_geometry import LaneGeometry
 from skku_autocar.planning.yolo_lane_follower import YoloLaneFollower, YoloLaneFollowerConfig
 from skku_autocar.planning.lane_change import LaneChangeConfig, LaneChangeController
+from skku_autocar.runtime.obstacle_mode import (
+    build_lane_change_config,
+    handle_lane_change_key,
+)
 from skku_autocar.runtime.yolo_drive_app import (
     CommandSafetyFilter,
     build_bev_corridor_config,
     build_follower_config,
-    build_lane_change_config,
-    handle_lane_change_key,
     parse_args,
 )
 from skku_autocar.types import ControlCommand

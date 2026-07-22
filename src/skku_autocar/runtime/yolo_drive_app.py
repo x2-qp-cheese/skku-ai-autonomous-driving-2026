@@ -14,15 +14,9 @@ from ..estimation.lane_geometry import LaneGeometry
 from ..perception.bev import BevConfig, BevTransformer
 from ..perception.traffic_light import TrafficLightConfig, TrafficLightController, TrafficLightObservation
 from ..perception.yolo_lane import YoloClassMasks, YoloLaneConfig, YoloLaneMask, YoloLaneSegmenter
-from ..planning.lane_change import LaneChangeConfig, LaneChangeController
-from ..planning.obstacle_fusion import (
-    FramePathGeometry,
-    ObstacleFusionConfig,
-    ObstacleFusionPlanner,
-)
 from ..planning.yolo_lane_follower import YoloLaneFollower, YoloLaneFollowerConfig
-from ..sensors.ultrasonic import UltrasonicConfig, UltrasonicFilter
 from ..types import ControlCommand
+from .obstacle_mode import ObstacleDriveMode, add_obstacle_arguments
 
 
 LOG = logging.getLogger("skku_autocar.yolo_drive")
@@ -63,9 +57,7 @@ def run(args: argparse.Namespace) -> int:
     follower_config = build_follower_config(args)
     follower = YoloLaneFollower(follower_config)
     command_filter = CommandSafetyFilter(args)
-    lane_change_controller = LaneChangeController(build_lane_change_config(args))
-    obstacle_planner = ObstacleFusionPlanner(build_obstacle_fusion_config(args))
-    ultrasonic_filter = UltrasonicFilter(build_ultrasonic_config(args))
+    obstacle_mode = ObstacleDriveMode(args, transformer, corridor_estimator)
     traffic_light = TrafficLightController(
         TrafficLightConfig(
             min_saturation=args.light_min_saturation,
@@ -82,6 +74,47 @@ def run(args: argparse.Namespace) -> int:
         )
     )
 
+    cap = open_camera(cv2, args.camera, args.width, args.height, args.fourcc)
+    # A video-file source (not a live camera index) should loop for review instead
+    # of erroring out at the end of the clip.
+    is_video_file = not str(args.camera).isdigit()
+    ok, first_frame = read_startup_frame(cap, 1 if is_video_file else 5)
+    if not ok:
+        cap.release()
+        raise RuntimeError("camera frame read failed")
+    try:
+        enforce_camera_contract(
+            first_frame.shape,
+            args.width,
+            args.height,
+            live_camera=not is_video_file,
+            policy=args.camera_resolution_policy,
+        )
+        if (
+            not is_video_file
+            and args.camera_resolution_policy == "allow"
+            and not args.no_serial
+        ):
+            raise RuntimeError(
+                "--camera-resolution-policy allow requires --no-serial; "
+                "calibration-mismatched frames cannot control the vehicle"
+            )
+    except Exception:
+        cap.release()
+        raise
+    actual_height, actual_width = first_frame.shape[:2]
+    LOG.info(
+        "camera=%s requested=%dx%d actual=%dx%d policy=%s",
+        args.camera,
+        args.width,
+        args.height,
+        actual_width,
+        actual_height,
+        args.camera_resolution_policy,
+    )
+
+    # Validate the calibrated image geometry before opening the motor serial
+    # connection. A camera fallback must never leave the vehicle controllable.
     vehicle = None
     if not args.no_serial:
         vehicle = SerialVehicleClient(
@@ -94,19 +127,10 @@ def run(args: argparse.Namespace) -> int:
             max_steering=args.max_steering,
         )
         vehicle.connect()
-        vehicle.write_line("USON")
+        obstacle_mode.start_serial(vehicle)
         LOG.info("serial connected: %s", vehicle.port)
     else:
         LOG.info("serial disabled: dry video/control preview mode")
-
-    cap = open_camera(cv2, args.camera, args.width, args.height, args.fourcc)
-    # A video-file source (not a live camera index) should loop for review instead
-    # of erroring out at the end of the clip.
-    is_video_file = not str(args.camera).isdigit()
-    ok, first_frame = cap.read()
-    if not ok:
-        cap.release()
-        raise RuntimeError("camera frame read failed")
 
     recorder = DriveRecorder(cv2, args, first_frame.shape)
     running = False
@@ -117,20 +141,17 @@ def run(args: argparse.Namespace) -> int:
     command = ControlCommand.stop("paused")
 
     LOG.info("model=%s device=%s camera=%s", model_path, segmenter.device, args.camera)
-    if args.obstacle_avoidance == "on" and not segmenter.has_obstacle_class:
-        LOG.warning(
-            "model has no 'obstacle' class; obstacle fusion cannot request a lane change"
-        )
-    if args.no_serial and args.obstacle_fusion_mode == "fused":
-        LOG.warning(
-            "fused obstacle mode requires Arduino ultrasonic data; use --obstacle-fusion-mode yolo only for video replay"
-        )
+    obstacle_mode.validate_runtime(segmenter, args.no_serial)
     log_effective_config(args, corridor_config, follower_config)
+    obstacle_mode.log_configuration(args)
     if recorder.enabled:
         LOG.info("recording raw video: %s", recorder.raw_video_path)
         if recorder.debug_video_path is not None:
             LOG.info("recording debug video: %s", recorder.debug_video_path)
-    LOG.info("space: start/stop toggle | l: manual lane-change / return | q or esc: quit")
+    if obstacle_mode.enabled:
+        LOG.info("space: start/stop | l: manual lane-change / return | q or esc: quit")
+    else:
+        LOG.info("space: start/stop | q or esc: quit")
 
     pending_frame = first_frame
     try:
@@ -146,10 +167,16 @@ def run(args: argparse.Namespace) -> int:
                 frame = pending_frame
                 pending_frame = None
 
+            enforce_camera_contract(
+                frame.shape,
+                args.width,
+                args.height,
+                live_camera=not is_video_file,
+                policy=args.camera_resolution_policy,
+            )
+
             now = time.monotonic()
-            if vehicle is not None:
-                ultrasonic_filter.update_lines(vehicle.read_lines(), now)
-            ultrasonic = ultrasonic_filter.snapshot(now)
+            obstacle_mode.update_serial(vehicle, now)
             dt = max(1e-6, now - last_frame_at)
             fps = 0.9 * fps + 0.1 * (1.0 / dt) if fps else 1.0 / dt
             last_frame_at = now
@@ -158,70 +185,42 @@ def run(args: argparse.Namespace) -> int:
             light_masks = ()
             class_masks = segmenter.segment_class_masks(frame)
             light_masks = class_masks.light
-            bev = warp_class_masks(transformer, class_masks)
+            bev = warp_class_masks(
+                transformer,
+                class_masks,
+                include_obstacle=obstacle_mode.enabled,
+            )
             lane = corridor_estimator.estimate(bev)
             bev_mask = fuse_masks([*bev.center, *bev.side, *bev.lane, *bev.crosswalk])
             mask_result = corridor_mask_result(class_masks, corridor_estimator, frame.shape)
-            lane_reliable = lane_change_geometry_reliable(mask_result, lane)
-            frame_paths = build_obstacle_frame_paths(
-                transformer,
-                corridor_estimator.last_centerline_bev,
-                obstacle_planner.config.lane_width_px,
-                frame.shape[:2],
-            )
-            event = obstacle_planner.update(
-                bev.obstacle,
-                bev.shape,
-                corridor_estimator.last_centerline_bev,
+            lane = obstacle_mode.update(
+                class_masks,
+                bev,
                 lane,
-                lane_change_controller,
-                ultrasonic,
+                mask_result,
+                frame.shape,
                 now,
                 running,
-                frame_obstacle_masks=class_masks.obstacle,
-                frame_paths=frame_paths,
-                solid_masks=bev.side,
-                obstacle_confidence=class_masks.obstacle_conf,
             )
-            if event:
-                LOG.info("%s", event)
-            lane_change = lane_change_controller.update(
-                lane,
-                corridor_estimator.last_lane_width_px,
-                bev.shape[1],
-                now,
-                running,
-                lane_reliable=lane_reliable,
-            )
-            lane = lane_change.lane
-            if lane_change.offset_px and corridor_estimator.last_centerline_bev:
-                corridor_estimator.last_centerline_bev = [
-                    (x + lane_change.offset_px, y)
-                    for x, y in corridor_estimator.last_centerline_bev
-                ]
             planned_command = follower.plan(lane) if running else ControlCommand.stop("paused")
-            planned_command = lane_change_controller.apply_steering_assist(planned_command, lane_change)
+            planned_command = obstacle_mode.apply_steering(planned_command)
             command = command_filter.apply(mask_result, lane, planned_command, running)
-            command = lane_change_controller.apply_speed_cap(command, lane_change_controller.speed_cap_active(lane_change))
+            command = obstacle_mode.apply_speed_cap(command)
             stop_crosswalk_masks = (
                 class_masks.crosswalk
                 if class_masks.crosswalk_conf >= args.light_crosswalk_min_conf
                 else ()
             )
-            lane_change_blocks_light_stop = (
-                args.light_stop_during_lane_change == "off"
-                and lane_change.state not in ("off", "lane2", "completed")
-            )
-            if lane_change_blocks_light_stop:
+            if obstacle_mode.blocks_light_stop:
                 stop_crosswalk_masks = ()
             light_observation = traffic_light.update(frame, light_masks, stop_crosswalk_masks)
-            if args.traffic_light == "on" and not lane_change_blocks_light_stop:
+            if args.traffic_light == "on" and not obstacle_mode.blocks_light_stop:
                 command = traffic_light.apply(command, running)
-            command = obstacle_planner.apply_safety(command, lane_change.state, running)
+            command = obstacle_mode.apply_safety(command, running)
 
             if vehicle is not None and now - last_command_at >= 1.0 / args.command_rate:
                 serial_lines = vehicle.send(command)
-                ultrasonic_filter.update_lines(serial_lines, now)
+                obstacle_mode.accept_serial_lines(serial_lines, now)
                 last_command_at = now
 
             display = draw_debug(
@@ -229,9 +228,9 @@ def run(args: argparse.Namespace) -> int:
                 transformer, corridor_estimator,
                 light_masks, light_observation,
                 args.light_stop_line_y,
-                lane_change.state,
-                obstacle_planner.status_text(),
-                class_masks.obstacle,
+                obstacle_mode.lane_change_state,
+                obstacle_mode.status_text,
+                obstacle_mode.frame_obstacle_masks,
             )
             recorder.write(frame, display)
             cv2.imshow("YOLO Drive", display)
@@ -241,7 +240,12 @@ def run(args: argparse.Namespace) -> int:
                 if bev_mask is not None:
                     cv2.imshow(
                         "BEV Lane Mask",
-                        draw_bev_mask_debug(cv2, bev_mask, lane, fuse_masks(list(bev.obstacle))),
+                        draw_bev_mask_debug(
+                            cv2,
+                            bev_mask,
+                            lane,
+                            fuse_masks(list(obstacle_mode.bev_obstacle_masks)),
+                        ),
                     )
                 elif mask_result is not None:
                     cv2.imshow("YOLO Lane Mask", mask_result.mask)
@@ -259,13 +263,13 @@ def run(args: argparse.Namespace) -> int:
                 if not running and vehicle is not None:
                     vehicle.stop("paused")
             if key == ord("l"):
-                action, message = handle_lane_change_key(lane_change_controller, running)
+                action, message = obstacle_mode.handle_key(running)
                 if action.startswith("ignored"):
                     LOG.info(
                         "%s: mode=%s state=%s",
                         message,
                         args.lane_change_mode,
-                        lane_change_controller.state,
+                        obstacle_mode.lane_change_state,
                     )
                 else:
                     LOG.info("%s", message)
@@ -274,7 +278,7 @@ def run(args: argparse.Namespace) -> int:
         if vehicle is not None:
             try:
                 try:
-                    vehicle.write_line("USOFF")
+                    obstacle_mode.stop_serial(vehicle)
                     vehicle.stop("shutdown")
                 except Exception as exc:
                     LOG.warning("serial stop failed during shutdown: %s", exc)
@@ -361,21 +365,6 @@ def corridor_mask_result(
     )
 
 
-def lane_change_geometry_reliable(
-    mask_result: Optional[YoloLaneMask],
-    lane: LaneGeometry,
-) -> bool:
-    if mask_result is None or not lane.found:
-        return False
-    name = mask_result.class_name
-    if "virtual" not in name:
-        return True
-    # Tier 2 still has the real center line, which is exactly the anchor used
-    # for a one-lane lateral offset. Treat it as reliable for arrival only;
-    # CommandSafetyFilter continues to apply its virtual-lane speed guards.
-    return "center+virtual-right-side" in name
-
-
 def build_follower_config(args: argparse.Namespace) -> YoloLaneFollowerConfig:
     return YoloLaneFollowerConfig(
         base_speed=args.speed,
@@ -408,117 +397,6 @@ def build_follower_config(args: argparse.Namespace) -> YoloLaneFollowerConfig:
         pure_pursuit_gain=args.pp_gain,
         pure_pursuit_full_angle=args.pp_full_angle,
     )
-
-
-def build_lane_change_config(args: argparse.Namespace) -> LaneChangeConfig:
-    steering_cap = args.lane_change_steering_cap
-    if steering_cap is None:
-        steering_cap = args.max_steering
-    return LaneChangeConfig(
-        mode=args.lane_change_mode,
-        trigger_seconds=args.lane_change_trigger_seconds,
-        transition_seconds=args.lane_change_transition_seconds,
-        hold_seconds=args.lane_change_hold_seconds,
-        max_straight_heading=args.lane_change_max_heading,
-        speed_cap=args.lane_change_speed_cap,
-        steering_min=args.lane_change_steering_min,
-        steering_boost=args.lane_change_steering_boost,
-        steering_cap=steering_cap,
-        steering_override=args.lane_change_steering_override == "on",
-        stable_lateral_error=args.lane_change_stable_lateral_error,
-        stable_near_lateral_error=args.lane_change_stable_near_error,
-        stable_heading_error=args.lane_change_stable_heading_error,
-        stable_required_frames=args.lane_change_stable_frames,
-        target_lane_width_px=args.lane_change_target_width_px,
-        target_capture_error=args.lane_change_target_capture_error,
-        target_capture_frames=args.lane_change_target_capture_frames,
-        allow_virtual_stabilize=args.lane_change_allow_virtual_stabilize == "on",
-    )
-
-
-def build_obstacle_frame_paths(
-    transformer: BevTransformer,
-    base_centerline: list,
-    lane_width_px: float,
-    frame_hw: tuple,
-) -> Optional[FramePathGeometry]:
-    if len(base_centerline) < 2:
-        return None
-    width = max(0.0, float(lane_width_px))
-    lane2_bev = [(float(x), float(y)) for x, y in base_centerline]
-    lane1_bev = [(float(x) - width, float(y)) for x, y in base_centerline]
-    lane1_frame = transformer.bev_to_frame(lane1_bev, frame_hw)
-    lane2_frame = transformer.bev_to_frame(lane2_bev, frame_hw)
-    return FramePathGeometry(
-        lane1=tuple((float(x), float(y)) for x, y in lane1_frame),
-        lane2=tuple((float(x), float(y)) for x, y in lane2_frame),
-    )
-
-
-def build_obstacle_fusion_config(args: argparse.Namespace) -> ObstacleFusionConfig:
-    return ObstacleFusionConfig(
-        enabled=args.obstacle_avoidance == "on",
-        fusion_mode=args.obstacle_fusion_mode,
-        lane_width_px=args.lane_change_target_width_px,
-        visual_trigger_y_ratio=args.obstacle_visual_trigger_y,
-        target_block_y_ratio=args.obstacle_target_block_y,
-        frame_visual_trigger_y_ratio=args.obstacle_frame_visual_trigger_y,
-        frame_target_block_y_ratio=args.obstacle_frame_target_block_y,
-        visual_emergency_y_ratio=args.obstacle_visual_emergency_y,
-        frame_visual_emergency_y_ratio=args.obstacle_frame_visual_emergency_y,
-        path_half_width_px=args.obstacle_path_half_width_px,
-        frame_path_half_width_scale=args.obstacle_frame_path_width_scale,
-        min_path_overlap_ratio=args.obstacle_min_overlap,
-        contact_band_ratio=args.obstacle_contact_band,
-        visual_action_confidence=args.obstacle_action_confidence,
-        visual_confirm_frames=args.obstacle_visual_confirm_frames,
-        visual_clear_frames=args.obstacle_visual_clear_frames,
-        ultrasonic_trigger_mm=args.obstacle_trigger_mm,
-        ultrasonic_clear_mm=args.obstacle_clear_mm,
-        ultrasonic_stop_mm=args.obstacle_stop_mm,
-        blocked_stop_mm=args.obstacle_blocked_stop_mm,
-        min_front_sensors=args.obstacle_min_front_sensors,
-        range_confirm_frames=args.obstacle_range_confirm_frames,
-        range_clear_frames=args.obstacle_range_clear_frames,
-        rearm_clear_frames=args.obstacle_rearm_clear_frames,
-        ttc_trigger_seconds=args.obstacle_ttc_seconds,
-        min_closing_rate_mm_s=args.obstacle_min_closing_rate,
-        side_clearance_mm=args.obstacle_side_clearance_mm,
-        solid_crossing_margin_px=args.obstacle_solid_crossing_margin_px,
-        solid_min_overlap_ratio=args.obstacle_solid_min_overlap,
-        approach_speed_cap=args.obstacle_approach_speed_cap,
-        speed_cap=args.obstacle_speed_cap,
-        cooldown_seconds=args.obstacle_cooldown_seconds,
-    )
-
-
-def build_ultrasonic_config(args: argparse.Namespace) -> UltrasonicConfig:
-    return UltrasonicConfig(
-        min_valid_mm=args.ultrasonic_min_valid_mm,
-        max_valid_mm=args.ultrasonic_max_valid_mm,
-        median_window=args.ultrasonic_median_window,
-        max_age_seconds=args.ultrasonic_max_age,
-    )
-
-
-def handle_lane_change_key(
-    lane_change_controller: LaneChangeController,
-    running: bool,
-) -> tuple:
-    if not running:
-        return "ignored_not_running", "lane-change key ignored while paused"
-
-    if lane_change_controller.state in ("lane2", "completed"):
-        if lane_change_controller.request("operator"):
-            return "request", "lane-change request armed: waiting for a straight frame"
-        return "ignored_request", "lane-change request ignored"
-
-    if lane_change_controller.state in ("changing_to_lane1", "lane1"):
-        if lane_change_controller.request_return("operator_return"):
-            return "return", "lane-change return requested: waiting for a straight frame"
-        return "ignored_return", "lane-change return ignored"
-
-    return "ignored_busy", "lane-change key ignored while transition is busy"
 
 
 def log_effective_config(
@@ -577,67 +455,11 @@ def log_effective_config(
         args.lane_lost_speed_cap,
     )
     LOG.info(
-        "traffic_light=%s confirm_frames=%d stop_line_y=%.3f contact_min_row_width=%.2f stop_during_lane_change=%s",
+        "traffic_light=%s confirm_frames=%d stop_line_y=%.3f contact_min_row_width=%.2f",
         args.traffic_light,
         args.light_confirm_frames,
         args.light_stop_line_y,
         args.light_contact_min_row_width_ratio,
-        args.light_stop_during_lane_change,
-    )
-    LOG.info(
-        "lane_change_mode=%s trigger=%.1fs transition=%.1fs stable_err=%.2f/%.2f stable_head=%.2f stable_frames=%d target_width=%.0fpx capture=%.2f/%d hold=%.1fs max_heading=%.3f speed_cap=%d steer_min=%d steer_boost=%d steer_cap=%s override=%s",
-        args.lane_change_mode,
-        args.lane_change_trigger_seconds,
-        args.lane_change_transition_seconds,
-        args.lane_change_stable_lateral_error,
-        args.lane_change_stable_near_error,
-        args.lane_change_stable_heading_error,
-        args.lane_change_stable_frames,
-        args.lane_change_target_width_px,
-        args.lane_change_target_capture_error,
-        args.lane_change_target_capture_frames,
-        args.lane_change_hold_seconds,
-        args.lane_change_max_heading,
-        args.lane_change_speed_cap,
-        args.lane_change_steering_min,
-        args.lane_change_steering_boost,
-        args.lane_change_steering_cap if args.lane_change_steering_cap is not None else args.max_steering,
-        args.lane_change_steering_override,
-    )
-    LOG.info(
-        "obstacle_fusion=%s/%s bev_y=%.2f/%.2f frame_y=%.2f/%.2f emergency=%.2f/%.2f path_half=%.0fpx overlap=%.2f action_conf=%.2f visual_frames=%d range=%.0f/%.0fmm range_frames=%d/%d rearm=%d stop=%.0fmm blocked_stop=%.0fmm front_quorum=%d ttc=%.1fs side=%.0fmm speed_cap=%d/%d solid_crossing_margin=%.0fpx",
-        args.obstacle_avoidance,
-        args.obstacle_fusion_mode,
-        args.obstacle_visual_trigger_y,
-        args.obstacle_target_block_y,
-        args.obstacle_frame_visual_trigger_y,
-        args.obstacle_frame_target_block_y,
-        args.obstacle_visual_emergency_y,
-        args.obstacle_frame_visual_emergency_y,
-        args.obstacle_path_half_width_px,
-        args.obstacle_min_overlap,
-        args.obstacle_action_confidence,
-        args.obstacle_visual_confirm_frames,
-        args.obstacle_trigger_mm,
-        args.obstacle_clear_mm,
-        args.obstacle_range_confirm_frames,
-        args.obstacle_range_clear_frames,
-        args.obstacle_rearm_clear_frames,
-        args.obstacle_stop_mm,
-        args.obstacle_blocked_stop_mm,
-        args.obstacle_min_front_sensors,
-        args.obstacle_ttc_seconds,
-        args.obstacle_side_clearance_mm,
-        args.obstacle_approach_speed_cap,
-        args.obstacle_speed_cap,
-        args.obstacle_solid_crossing_margin_px,
-    )
-    LOG.info(
-        "ultrasonic valid=%d..%dmm median=%d max_age=%.2fs",
-        args.ultrasonic_min_valid_mm,
-        args.ultrasonic_max_valid_mm,
-        args.ultrasonic_median_window,
-        args.ultrasonic_max_age,
     )
 
 
@@ -855,12 +677,6 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         default=TrafficLightConfig.contact_min_row_width_ratio,
         help="minimum frame-width ratio a crosswalk/contact mask row must occupy before it can trigger stop contact",
     )
-    parser.add_argument(
-        "--light-stop-during-lane-change",
-        choices=("on", "off"),
-        default="off",
-        help="allow traffic-light braking while a lane change is active; off prevents far-red false stops during obstacle bypass",
-    )
     parser.add_argument("--light-min-saturation", type=int, default=TrafficLightConfig.min_saturation)
     parser.add_argument("--light-min-value", type=int, default=TrafficLightConfig.min_value)
     parser.add_argument("--light-min-color-pixels", type=int, default=TrafficLightConfig.min_color_pixels)
@@ -872,10 +688,20 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         default=TrafficLightConfig.stop_line_y_ratio,
         help="frame y ratio of the virtual crosswalk contact line; confirmed RED brakes when the crosswalk mask bottom reaches this line",
     )
-    parser.add_argument("--camera", default="0", help="camera index or video path")
+    parser.add_argument(
+        "--camera",
+        default="1",
+        help="front camera index or video path (default: 1; macOS index 0 is usually the built-in camera)",
+    )
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--fourcc", default="MJPG")
+    parser.add_argument(
+        "--camera-resolution-policy",
+        choices=("strict", "allow"),
+        default="strict",
+        help="strict refuses a live-camera size that differs from --width/--height; allow is for calibration/debug only",
+    )
     parser.add_argument("--serial-port", default=None, help="Arduino port, e.g. COM3 or /dev/cu.usbmodemXXXX")
     parser.add_argument("--baudrate", type=int, default=115200)
     parser.add_argument("--ready-timeout", type=float, default=3.0)
@@ -889,306 +715,7 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     )
     parser.add_argument("--max-speed", type=int, default=170)
     parser.add_argument("--min-curve-speed", type=int, default=60)
-    parser.add_argument(
-        "--lane-change-mode",
-        choices=("off", "external", "timed"),
-        default="external",
-        help="external accepts sensor-fusion or L-key requests; timed runs an automatic round trip; off disables lane changes",
-    )
-    parser.add_argument("--lane-change-trigger-seconds", type=float, default=LaneChangeConfig.trigger_seconds)
-    parser.add_argument("--lane-change-transition-seconds", type=float, default=LaneChangeConfig.transition_seconds)
-    parser.add_argument("--lane-change-hold-seconds", type=float, default=LaneChangeConfig.hold_seconds)
-    parser.add_argument(
-        "--lane-change-max-heading",
-        type=float,
-        default=LaneChangeConfig.max_straight_heading,
-        help="start each transition only when absolute BEV heading error is below this straightness threshold",
-    )
-    parser.add_argument("--lane-change-speed-cap", type=int, default=LaneChangeConfig.speed_cap)
-    parser.add_argument(
-        "--lane-change-steering-min",
-        type=int,
-        default=LaneChangeConfig.steering_min,
-        help="minimum absolute steering forced while actively changing lanes; 0 disables the minimum",
-    )
-    parser.add_argument(
-        "--lane-change-steering-boost",
-        type=int,
-        default=LaneChangeConfig.steering_boost,
-        help="extra steering added in the lane-change direction while actively changing lanes",
-    )
-    parser.add_argument(
-        "--lane-change-steering-cap",
-        type=int,
-        default=None,
-        help="absolute steering cap for lane-change assist; default follows --max-steering",
-    )
-    parser.add_argument(
-        "--lane-change-steering-override",
-        choices=("on", "off"),
-        default="off",
-        help="on = ignore lane-follow steering and command the lane-change direction at the steering cap while changing",
-    )
-    parser.add_argument(
-        "--lane-change-stable-lateral-error",
-        type=float,
-        default=LaneChangeConfig.stable_lateral_error,
-        help="after a lane change, require absolute lateral error below this value before accepting the new lane as stable",
-    )
-    parser.add_argument(
-        "--lane-change-stable-heading-error",
-        type=float,
-        default=LaneChangeConfig.stable_heading_error,
-        help="after a lane change, require absolute heading error below this value before accepting the new lane as stable",
-    )
-    parser.add_argument(
-        "--lane-change-stable-near-error",
-        type=float,
-        default=LaneChangeConfig.stable_near_lateral_error,
-        help="near-field target error required together with lookahead error after an obstacle-avoidance shift",
-    )
-    parser.add_argument(
-        "--lane-change-stable-frames",
-        type=int,
-        default=LaneChangeConfig.stable_required_frames,
-        help="consecutive stable frames required before leaving stabilizing_lane1/stabilizing_lane2",
-    )
-    parser.add_argument(
-        "--lane-change-target-width-px",
-        type=float,
-        default=LaneChangeConfig.target_lane_width_px,
-        help="fixed BEV lateral distance for obstacle avoidance; 0 uses the detected width at trigger time",
-    )
-    parser.add_argument(
-        "--lane-change-target-capture-error",
-        "--lane-change-target-clearance-margin",
-        dest="lane_change_target_capture_error",
-        type=float,
-        default=LaneChangeConfig.target_capture_error,
-        help="near-field normalized target error that releases priority steering to closed-loop lane following; the old clearance-margin name is accepted as an alias",
-    )
-    parser.add_argument(
-        "--lane-change-target-capture-frames",
-        type=int,
-        default=LaneChangeConfig.target_capture_frames,
-        help="consecutive near-field target-capture frames required before closed-loop target-lane following takes over",
-    )
-    parser.add_argument(
-        "--lane-change-allow-virtual-stabilize",
-        choices=("on", "off"),
-        default="off",
-        help="off requires a non-virtual YOLO mask before a new lane can be marked stable",
-    )
-    parser.add_argument(
-        "--obstacle-avoidance",
-        choices=("on", "off"),
-        default="on",
-        help="enable YOLO and ultrasonic obstacle fusion",
-    )
-    parser.add_argument(
-        "--obstacle-fusion-mode",
-        choices=("fused", "yolo"),
-        default="fused",
-        help="fused requires YOLO path occupancy and ultrasonic range; yolo is for offline video replay",
-    )
-    parser.add_argument(
-        "--obstacle-visual-trigger-y",
-        type=float,
-        default=ObstacleFusionConfig.visual_trigger_y_ratio,
-        help="BEV y ratio where current-path obstacle occupancy becomes actionable",
-    )
-    parser.add_argument(
-        "--obstacle-target-block-y",
-        type=float,
-        default=ObstacleFusionConfig.target_block_y_ratio,
-        help="BEV y ratio where destination-lane occupancy blocks a lane change",
-    )
-    parser.add_argument(
-        "--obstacle-frame-visual-trigger-y",
-        type=float,
-        default=ObstacleFusionConfig.frame_visual_trigger_y_ratio,
-        help="frame-space obstacle bottom-y ratio that starts early path tracking before the BEV ROI",
-    )
-    parser.add_argument(
-        "--obstacle-frame-target-block-y",
-        type=float,
-        default=ObstacleFusionConfig.frame_target_block_y_ratio,
-        help="frame-space bottom-y ratio where destination-path YOLO occupancy vetoes a lane change",
-    )
-    parser.add_argument(
-        "--obstacle-visual-emergency-y",
-        type=float,
-        default=ObstacleFusionConfig.visual_emergency_y_ratio,
-        help="visual emergency-stop threshold in BEV y ratio",
-    )
-    parser.add_argument(
-        "--obstacle-frame-visual-emergency-y",
-        type=float,
-        default=ObstacleFusionConfig.frame_visual_emergency_y_ratio,
-        help="frame-space obstacle bottom-y ratio that forces a visual emergency stop",
-    )
-    parser.add_argument(
-        "--obstacle-path-half-width-px",
-        type=float,
-        default=ObstacleFusionConfig.path_half_width_px,
-        help="half-width of each BEV path-occupancy corridor",
-    )
-    parser.add_argument(
-        "--obstacle-frame-path-width-scale",
-        type=float,
-        default=ObstacleFusionConfig.frame_path_half_width_scale,
-        help="fraction of projected lane spacing used as each frame-space path half-width",
-    )
-    parser.add_argument(
-        "--obstacle-min-overlap",
-        type=float,
-        default=ObstacleFusionConfig.min_path_overlap_ratio,
-        help="minimum obstacle contact-mask overlap required to occupy a path",
-    )
-    parser.add_argument(
-        "--obstacle-contact-band",
-        type=float,
-        default=ObstacleFusionConfig.contact_band_ratio,
-        help="lower fraction of each obstacle mask used as its ground-contact region",
-    )
-    parser.add_argument(
-        "--obstacle-action-confidence",
-        type=float,
-        default=ObstacleFusionConfig.visual_action_confidence,
-        help="minimum obstacle confidence allowed to participate in a lane-change request; lower-confidence masks only slow or stop",
-    )
-    parser.add_argument(
-        "--obstacle-visual-confirm-frames",
-        type=int,
-        default=ObstacleFusionConfig.visual_confirm_frames,
-        help="consecutive current-path YOLO detections required for fusion",
-    )
-    parser.add_argument(
-        "--obstacle-visual-clear-frames",
-        type=int,
-        default=ObstacleFusionConfig.visual_clear_frames,
-        help="consecutive clear YOLO frames required to arm the next detection",
-    )
-    parser.add_argument(
-        "--obstacle-trigger-mm",
-        type=float,
-        default=ObstacleFusionConfig.ultrasonic_trigger_mm,
-        help="front ultrasonic distance that confirms a visual obstacle",
-    )
-    parser.add_argument(
-        "--obstacle-clear-mm",
-        type=float,
-        default=ObstacleFusionConfig.ultrasonic_clear_mm,
-        help="front distance that clears the ultrasonic hazard latch",
-    )
-    parser.add_argument(
-        "--obstacle-stop-mm",
-        type=float,
-        default=ObstacleFusionConfig.ultrasonic_stop_mm,
-        help="close-range emergency threshold; 0 disables ultrasonic emergency stop",
-    )
-    parser.add_argument(
-        "--obstacle-blocked-stop-mm",
-        type=float,
-        default=ObstacleFusionConfig.blocked_stop_mm,
-        help="stop distance when the destination path, solid boundary, or side sonar blocks avoidance",
-    )
-    parser.add_argument(
-        "--obstacle-min-front-sensors",
-        type=int,
-        default=ObstacleFusionConfig.min_front_sensors,
-        help="fresh front ultrasonic sensor quorum required for range confirmation",
-    )
-    parser.add_argument(
-        "--obstacle-range-confirm-frames",
-        type=int,
-        default=ObstacleFusionConfig.range_confirm_frames,
-        help="consecutive ultrasonic danger frames required to confirm lane-change range",
-    )
-    parser.add_argument(
-        "--obstacle-range-clear-frames",
-        type=int,
-        default=ObstacleFusionConfig.range_clear_frames,
-        help="consecutive ultrasonic clear or stale frames required to release the range latch",
-    )
-    parser.add_argument(
-        "--obstacle-rearm-clear-frames",
-        type=int,
-        default=ObstacleFusionConfig.rearm_clear_frames,
-        help="stable-lane frames with both YOLO and ultrasonic clear before a different obstacle can trigger another lane change",
-    )
-    parser.add_argument(
-        "--obstacle-ttc-seconds",
-        type=float,
-        default=ObstacleFusionConfig.ttc_trigger_seconds,
-        help="time-to-collision threshold that can confirm an approaching visual obstacle",
-    )
-    parser.add_argument(
-        "--obstacle-min-closing-rate",
-        type=float,
-        default=ObstacleFusionConfig.min_closing_rate_mm_s,
-        help="minimum ultrasonic closing rate used for TTC confirmation",
-    )
-    parser.add_argument(
-        "--obstacle-side-clearance-mm",
-        type=float,
-        default=ObstacleFusionConfig.side_clearance_mm,
-        help="minimum destination-side clearance before a lane change",
-    )
-    parser.add_argument(
-        "--obstacle-solid-crossing-margin-px",
-        type=float,
-        default=ObstacleFusionConfig.solid_crossing_margin_px,
-        help="BEV tolerance around the two center trajectories when checking for an intervening lane-side solid line",
-    )
-    parser.add_argument(
-        "--obstacle-solid-min-overlap",
-        type=float,
-        default=ObstacleFusionConfig.solid_min_overlap_ratio,
-        help="minimum solid-mask overlap with the corridor between lane-center trajectories that vetoes a lane change",
-    )
-    parser.add_argument(
-        "--obstacle-approach-speed-cap",
-        type=int,
-        default=ObstacleFusionConfig.approach_speed_cap,
-        help="speed cap while a far current-path YOLO obstacle is tracked before range confirmation",
-    )
-    parser.add_argument(
-        "--obstacle-speed-cap",
-        type=int,
-        default=ObstacleFusionConfig.speed_cap,
-        help="speed cap while an obstacle or avoidance maneuver is active",
-    )
-    parser.add_argument(
-        "--obstacle-cooldown-seconds",
-        type=float,
-        default=ObstacleFusionConfig.cooldown_seconds,
-        help="minimum time between avoidance requests",
-    )
-    parser.add_argument(
-        "--ultrasonic-min-valid-mm",
-        type=int,
-        default=UltrasonicConfig.min_valid_mm,
-        help="reject nonzero ultrasonic readings below this distance as noise",
-    )
-    parser.add_argument(
-        "--ultrasonic-max-valid-mm",
-        type=int,
-        default=UltrasonicConfig.max_valid_mm,
-        help="reject ultrasonic readings above this sensor range",
-    )
-    parser.add_argument(
-        "--ultrasonic-median-window",
-        type=int,
-        default=UltrasonicConfig.median_window,
-        help="per-sensor median filter window",
-    )
-    parser.add_argument(
-        "--ultrasonic-max-age",
-        type=float,
-        default=UltrasonicConfig.max_age_seconds,
-        help="maximum age of a reading used by sensor fusion",
-    )
+    add_obstacle_arguments(parser)
     parser.add_argument("--max-steering", type=int, default=120)
     parser.add_argument("--steering-rate-limit", type=int, default=110)
     parser.add_argument("--min-steering-rate-limit", type=int, default=40)
@@ -1570,13 +1097,47 @@ def open_camera(cv2: Any, camera: str, width: int, height: int, fourcc: str) -> 
         cap = cv2.VideoCapture(source, cv2.CAP_AVFOUNDATION)
     else:
         cap = cv2.VideoCapture(source)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     if fourcc:
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     if not cap.isOpened():
         raise RuntimeError("camera could not be opened: %s" % camera)
     return cap
+
+
+def read_startup_frame(cap: Any, attempts: int) -> tuple:
+    """Drain startup frames so a newly selected UVC mode can take effect."""
+    ok = False
+    frame = None
+    for _ in range(max(1, int(attempts))):
+        ok, candidate = cap.read()
+        if ok:
+            frame = candidate
+    return frame is not None, frame
+
+
+def enforce_camera_contract(
+    frame_shape: tuple,
+    expected_width: int,
+    expected_height: int,
+    live_camera: bool,
+    policy: str,
+) -> None:
+    if not live_camera or policy == "allow":
+        return
+    actual_height, actual_width = frame_shape[:2]
+    if actual_width == expected_width and actual_height == expected_height:
+        return
+    raise RuntimeError(
+        "camera resolution mismatch: requested %dx%d but received %dx%d; "
+        "BEV calibration is invalid for this frame, so driving was refused. "
+        "Check --camera, close other camera apps, and verify the mode with "
+        "scripts/camera_check.py."
+        % (expected_width, expected_height, actual_width, actual_height)
+    )
 
 
 def draw_debug(

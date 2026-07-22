@@ -45,7 +45,7 @@ const int US_FRONT_CENTER_TRIG = 30, US_FRONT_CENTER_ECHO = 31;
 const int US_SIDE_RIGHT_TRIG   = 26, US_SIDE_RIGHT_ECHO   = 27;
 const int US_SIDE_LEFT_TRIG    = 28, US_SIDE_LEFT_ECHO    = 29;
 
-const unsigned long US_ECHO_TIMEOUT_US = 12000UL;  // 약 2m. 근거리 장애물 확인용으로 루프 블로킹을 줄임.
+const unsigned long US_ECHO_TIMEOUT_US = 18000UL;  // 약 3.1m. YOLO 조기 인식 뒤 원거리 회피 승인을 허용.
 const unsigned long US_SAMPLE_INTERVAL_MS = 30;
 const unsigned long US_STREAM_INTERVAL_MS = 150;
 const int US_SENSOR_COUNT = 5;

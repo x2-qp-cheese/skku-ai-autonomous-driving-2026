@@ -13,7 +13,7 @@ FRONT_KEYS = ("FC", "FR", "FL")
 @dataclass(frozen=True)
 class UltrasonicConfig:
     min_valid_mm: int = 50
-    max_valid_mm: int = 2500
+    max_valid_mm: int = 3200
     median_window: int = 3
     max_age_seconds: float = 0.6
 

@@ -174,7 +174,11 @@ class BevClassMasks:
     shape: Tuple[int, int] = (0, 0)  # (height, width) of the BEV canvas
 
 
-def warp_class_masks(transformer: Any, class_masks: Any) -> BevClassMasks:
+def warp_class_masks(
+    transformer: Any,
+    class_masks: Any,
+    include_obstacle: bool = True,
+) -> BevClassMasks:
     """Warp a frame-space YoloClassMasks bundle into BEV, preserving instances."""
     out_w, out_h = transformer.out_size
     return BevClassMasks(
@@ -182,12 +186,20 @@ def warp_class_masks(transformer: Any, class_masks: Any) -> BevClassMasks:
         side=[transformer.warp_mask(m) for m in class_masks.side],
         lane=[transformer.warp_mask(m) for m in class_masks.lane],
         crosswalk=[transformer.warp_mask(m) for m in getattr(class_masks, "crosswalk", ())],
-        obstacle=[transformer.warp_mask(m) for m in getattr(class_masks, "obstacle", ())],
+        obstacle=(
+            [transformer.warp_mask(m) for m in getattr(class_masks, "obstacle", ())]
+            if include_obstacle
+            else []
+        ),
         center_conf=class_masks.center_conf,
         side_conf=class_masks.side_conf,
         lane_conf=class_masks.lane_conf,
         crosswalk_conf=getattr(class_masks, "crosswalk_conf", 0.0),
-        obstacle_conf=getattr(class_masks, "obstacle_conf", 0.0),
+        obstacle_conf=(
+            getattr(class_masks, "obstacle_conf", 0.0)
+            if include_obstacle
+            else 0.0
+        ),
         shape=(out_h, out_w),
     )
 

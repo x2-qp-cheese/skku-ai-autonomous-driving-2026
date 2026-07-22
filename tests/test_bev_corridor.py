@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -6,6 +7,7 @@ from skku_autocar.estimation.bev_corridor import (
     BevClassMasks,
     BevCorridorConfig,
     BevCorridorLaneEstimator,
+    warp_class_masks,
 )
 
 
@@ -94,6 +96,38 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
         self.assertAlmostEqual(lane.center_x, 131.5, delta=0.2)
         self.assertEqual(lane.reason, "corridor_tier3")
         self.assertEqual(estimator.last_class_name, "crosswalk-right-side-b")
+
+    def test_disabled_obstacle_mode_skips_obstacle_bev_warp(self):
+        transformer = CountingTransformer()
+        masks = SimpleNamespace(
+            center=[],
+            side=[],
+            lane=[],
+            crosswalk=[],
+            obstacle=[np.ones((2, 2), dtype=np.uint8)],
+            center_conf=0.0,
+            side_conf=0.0,
+            lane_conf=0.0,
+            crosswalk_conf=0.0,
+            obstacle_conf=0.9,
+        )
+
+        bev = warp_class_masks(transformer, masks, include_obstacle=False)
+
+        self.assertEqual(transformer.warp_calls, 0)
+        self.assertEqual(bev.obstacle, [])
+        self.assertEqual(bev.obstacle_conf, 0.0)
+
+
+class CountingTransformer:
+    out_size = (20, 10)
+
+    def __init__(self):
+        self.warp_calls = 0
+
+    def warp_mask(self, mask):
+        self.warp_calls += 1
+        return mask
 
 
 if __name__ == "__main__":

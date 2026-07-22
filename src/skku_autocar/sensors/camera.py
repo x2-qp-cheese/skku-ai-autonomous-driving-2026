@@ -17,10 +17,12 @@ class Camera:
             cap = cv2.VideoCapture(self.config.index, cv2.CAP_DSHOW)
         else:
             cap = cv2.VideoCapture(self.config.index)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
         if self.config.fourcc:
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*self.config.fourcc))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
+        if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         if not cap.isOpened():
             raise RuntimeError("camera index %s could not be opened" % self.config.index)
         self._cap = cap

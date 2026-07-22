@@ -32,17 +32,19 @@ class ObstacleFusionConfig:
     visual_confirm_frames: int = 2
     visual_clear_frames: int = 2
 
-    # The firmware sees roughly 2 m. Start the maneuver on the first stable
-    # long-range echo rather than waiting until the old 1 m threshold.
-    ultrasonic_trigger_mm: float = 2000.0
-    ultrasonic_clear_mm: float = 2300.0
+    # YOLO tracks first, but range confirmation owns maneuver timing. At full
+    # competition speed the front-sonar estimate can jump by more than 1 m as
+    # adjacent beams acquire the obstacle, so commit while it is still within
+    # the reliable 3.2 m firmware range instead of waiting for a 2 m sample.
+    ultrasonic_trigger_mm: float = 2600.0
+    ultrasonic_clear_mm: float = 2900.0
     ultrasonic_stop_mm: float = 300.0
     blocked_stop_mm: float = 650.0
     min_front_sensors: int = 2
     range_confirm_frames: int = 1
     range_clear_frames: int = 2
     rearm_clear_frames: int = 3
-    ttc_trigger_seconds: float = 1.8
+    ttc_trigger_seconds: float = 0.0
     min_closing_rate_mm_s: float = 120.0
     side_clearance_mm: float = 300.0
 
@@ -53,6 +55,7 @@ class ObstacleFusionConfig:
     solid_check_min_y_ratio: float = 0.20
     solid_min_overlap_ratio: float = 0.05
 
+    visual_slowdown_enabled: bool = False
     approach_speed_cap: int = 120
     speed_cap: int = 120
     cooldown_seconds: float = 0.4
@@ -81,6 +84,8 @@ class ObstacleFusionObservation:
     solid_blocked: bool = False
     side_clear: bool = False
     emergency: bool = False
+    maneuver_active: bool = False
+    clearing_source: bool = False
     path_lane: int = 2
     closest_y_ratio: float = 0.0
     frame_y_ratio: float = 0.0
@@ -91,6 +96,8 @@ class ObstacleFusionObservation:
     range_frames: int = 0
     closing_rate_mm_s: float = 0.0
     ttc_seconds: Optional[float] = None
+    plan_ready: bool = False
+    planned_target_lane: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -109,7 +116,7 @@ class PathAssessment:
 
 
 class ObstacleFusionPlanner:
-    """Early YOLO tracking followed by range-confirmed lane-change commitment.
+    """Early map-based path planning followed by range-confirmed execution.
 
     Frame-space YOLO masks provide lookahead before an obstacle enters the BEV
     source trapezoid. BEV masks still provide the near-field path association.
@@ -130,6 +137,9 @@ class ObstacleFusionPlanner:
         self._range_clear_frames = 0
         self._rearm_frames = 0
         self._consumed = False
+        self._last_trigger_path_lane: Optional[int] = None
+        self._planned_from_lane: Optional[int] = None
+        self._planned_target_lane: Optional[int] = None
         self._last_trigger_at = -1e9
         self._last_front_mm: Optional[int] = None
         self._last_front_at: Optional[float] = None
@@ -146,6 +156,8 @@ class ObstacleFusionPlanner:
         self._range_clear_frames = 0
         self._rearm_frames = 0
         self._consumed = False
+        self._last_trigger_path_lane = None
+        self._clear_path_plan()
         self._last_front_mm = None
         self._last_front_at = None
         self._closing_rate_mm_s = 0.0
@@ -173,13 +185,14 @@ class ObstacleFusionPlanner:
 
         if path_lane != self._path_lane:
             consumed = self._consumed
+            last_trigger_path_lane = self._last_trigger_path_lane
             self._path_lane = path_lane
             self.reset()
-            # A path switch is part of the same avoidance event. Keep it
-            # consumed until the new lane is stable and both sensors are clear,
-            # otherwise the old obstacle can be interpreted as an immediate
-            # request to return to the lane that was just vacated.
+            # Preserve event identity across the path switch. The old source-lane
+            # obstacle cannot trigger a return, while a mapped obstacle on the
+            # new stable current path may create a different-path plan.
             self._consumed = consumed
+            self._last_trigger_path_lane = last_trigger_path_lane
 
         bev_assessment = self._measure_bev_paths(
             obstacle_masks,
@@ -251,11 +264,25 @@ class ObstacleFusionPlanner:
         self._update_visual_state(visual)
         self._update_range_state(ultrasonic, now)
         self._update_rearm_state(raw_visual, stable_lane)
+        self._update_path_plan(
+            path_lane,
+            stable_lane,
+            target_blocked,
+            solid_blocked,
+        )
         range_confirmed = (
             self.config.fusion_mode == "yolo" or self._range_hazard
         )
         fused_hazard = self._visual_confirmed and range_confirmed
         blocked = target_blocked or solid_blocked or not side_clear
+        different_path_event = (
+            self._consumed
+            and self._last_trigger_path_lane is not None
+            and path_lane != self._last_trigger_path_lane
+        )
+        # Immediately after an avoidance, one nearby source obstacle can span
+        # both projected paths. It is not a new obstacle in the destination.
+        clearing_source = different_path_event and target_blocked
         emergency = self._emergency_present(
             raw_visual,
             bev_assessment.closest_y_ratio,
@@ -263,7 +290,7 @@ class ObstacleFusionPlanner:
             ultrasonic,
             fused_hazard,
             blocked,
-            maneuver_active,
+            maneuver_active or clearing_source,
         )
         self.observation = ObstacleFusionObservation(
             visual_detected=raw_visual,
@@ -276,6 +303,8 @@ class ObstacleFusionPlanner:
             solid_blocked=solid_blocked,
             side_clear=side_clear,
             emergency=emergency,
+            maneuver_active=maneuver_active,
+            clearing_source=clearing_source,
             path_lane=path_lane,
             closest_y_ratio=bev_assessment.closest_y_ratio,
             frame_y_ratio=frame_assessment.closest_y_ratio,
@@ -289,18 +318,23 @@ class ObstacleFusionPlanner:
             range_frames=self._range_frames,
             closing_rate_mm_s=self._closing_rate_mm_s,
             ttc_seconds=self._ttc_seconds,
+            plan_ready=self._path_plan_ready(path_lane),
+            planned_target_lane=self._planned_target_lane,
         )
 
         if (
             fused_hazard
             and stable_lane
-            and not self._consumed
+            and self._path_plan_ready(path_lane)
+            and (not self._consumed or different_path_event)
             and not blocked
             and now - self._last_trigger_at >= max(0.0, self.config.cooldown_seconds)
         ):
             event = self._request_lane_change(lane_change, now)
             if event is not None:
                 self._consumed = True
+                self._last_trigger_path_lane = path_lane
+                self._clear_path_plan()
                 return event
         return None
 
@@ -321,7 +355,10 @@ class ObstacleFusionPlanner:
         active = self._lane_change_active(lane_change_state)
         if active or self.observation.fused_hazard:
             cap = max(0, int(self.config.speed_cap))
-        elif self.observation.visual_detected:
+        elif (
+            self.config.visual_slowdown_enabled
+            and self.observation.visual_detected
+        ):
             cap = max(0, int(self.config.approach_speed_cap))
         else:
             return command
@@ -343,6 +380,10 @@ class ObstacleFusionPlanner:
         ttc = "n/a" if obs.ttc_seconds is None else "%.1f" % obs.ttc_seconds
         if obs.emergency:
             state = "STOP"
+        elif obs.maneuver_active:
+            state = "COMMITTED"
+        elif obs.clearing_source:
+            state = "CLEARING_SOURCE"
         elif obs.fused_hazard and obs.solid_blocked:
             state = "SOLID_BLOCKED"
         elif obs.fused_hazard and obs.target_blocked:
@@ -364,9 +405,15 @@ class ObstacleFusionPlanner:
             state = "WAIT_NEW"
         else:
             state = "clear"
-        return "L%d %s by=%.2f fy=%.2f conf=%.2f front=%s q=%d r=%d ttc=%s side=%s" % (
+        plan = (
+            "-"
+            if obs.planned_target_lane is None
+            else "L%d" % obs.planned_target_lane
+        )
+        return "L%d %s plan=%s by=%.2f fy=%.2f conf=%.2f front=%s q=%d r=%d ttc=%s side=%s" % (
             obs.path_lane,
             state,
+            plan,
             obs.closest_y_ratio,
             obs.frame_y_ratio,
             obs.visual_confidence,
@@ -399,7 +446,35 @@ class ObstacleFusionPlanner:
             self._rearm_frames = 0
         if self._rearm_frames >= max(1, int(self.config.rearm_clear_frames)):
             self._consumed = False
+            self._last_trigger_path_lane = None
             self._rearm_frames = 0
+
+    def _update_path_plan(
+        self,
+        path_lane: int,
+        stable_lane: bool,
+        target_blocked: bool,
+        solid_blocked: bool,
+    ) -> None:
+        if not stable_lane or not self._visual_confirmed:
+            self._clear_path_plan()
+            return
+        if target_blocked or solid_blocked:
+            self._clear_path_plan()
+            return
+        self._planned_from_lane = path_lane
+        self._planned_target_lane = 1 if path_lane == 2 else 2
+
+    def _path_plan_ready(self, path_lane: int) -> bool:
+        return (
+            self._planned_from_lane == path_lane
+            and self._planned_target_lane in (1, 2)
+            and self._planned_target_lane != path_lane
+        )
+
+    def _clear_path_plan(self) -> None:
+        self._planned_from_lane = None
+        self._planned_target_lane = None
 
     def _update_range_state(
         self,
@@ -477,24 +552,25 @@ class ObstacleFusionPlanner:
         ultrasonic: UltrasonicSnapshot,
         fused_hazard: bool,
         blocked: bool,
-        maneuver_active: bool,
+        avoidance_committed: bool,
     ) -> bool:
         visual_close = visual and (
             closest_bev_y >= self.config.visual_emergency_y_ratio
             or closest_frame_y >= self.config.frame_visual_emergency_y_ratio
         )
+        if avoidance_committed:
+            # Neither front sonar nor frame-path overlap is spatially reliable
+            # while crossing lanes or clearing the source obstacle immediately
+            # afterward. Once a destination passes the pre-commit safety gates,
+            # braking here only prevents the lateral escape from completing.
+            return False
+
         required = max(1, int(self.config.min_front_sensors))
         if not ultrasonic.front_ready(required):
             return visual_close
 
         close_count = ultrasonic.front_close_count(self.config.ultrasonic_stop_mm)
-        # Once committed, front sonar may keep seeing the obstacle in the lane
-        # being vacated. Do not stop halfway across a clear destination path for
-        # that unassociated echo; a current-path YOLO mask still stops the car.
-        if maneuver_active and not visual:
-            range_close = False
-        else:
-            range_close = close_count >= 2 or (visual and close_count >= 1)
+        range_close = close_count >= 2 or (visual and close_count >= 1)
         distance = ultrasonic.front_min_mm
         blocked_close = (
             fused_hazard

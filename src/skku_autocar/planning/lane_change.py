@@ -18,11 +18,15 @@ class LaneChangeConfig:
     steering_boost: int = 25
     steering_cap: int = 120
     steering_override: bool = False
+    unreliable_speed_cap: int = 70
+    unreliable_steering_cap: int = 90
+    stabilizing_steering_min: int = 70
     stable_lateral_error: float = 0.12
     stable_near_lateral_error: float = 0.18
     stable_heading_error: float = 0.18
     stable_required_frames: int = 5
     target_lane_width_px: float = 150.0
+    target_approach_error: float = 0.32
     target_capture_error: float = 0.20
     target_capture_frames: int = 2
     allow_virtual_stabilize: bool = False
@@ -37,6 +41,7 @@ class LaneChangeResult:
     direction: int = 0
     progress: float = 0.0
     stable_frames: int = 0
+    lane_reliable: bool = True
 
 
 class LaneChangeController:
@@ -45,8 +50,9 @@ class LaneChangeController:
     The normal BEV corridor produces the center of lane 2, on the right side of
     the center line. Lane 1's center is one physical BEV lane width to the left.
     Keyboard/timer changes move that target with a smoothstep profile. Obstacle
-    avoidance selects the complete adjacent-lane target immediately and lets
-    the normal lateral/heading controller close the measured target error.
+    avoidance selects the complete adjacent-lane target immediately, preserves
+    direction-priority steering until the vehicle reaches that target, and then
+    releases steering to the normal controller for parallel stabilization.
     """
 
     def __init__(self, config: LaneChangeConfig = LaneChangeConfig()):
@@ -152,9 +158,16 @@ class LaneChangeController:
         ):
             self.request("timer")
 
-        straight = lane.found and abs(lane.heading_error) <= max(0.0, self.config.max_straight_heading)
+        straight = (
+            lane.found
+            and lane_reliable
+            and abs(lane.heading_error)
+            <= max(0.0, self.config.max_straight_heading)
+        )
         priority_request = self._request_profile == "avoidance"
-        if self.state == "armed" and (straight or (priority_request and lane.found)):
+        if self.state == "armed" and (
+            straight or (priority_request and lane.found and lane_reliable)
+        ):
             self.state = "changing_to_lane1"
             self._phase_started_at = now
             self._lock_lane_width(lane_width_px, self._request_profile)
@@ -188,7 +201,9 @@ class LaneChangeController:
                 and now - self._phase_started_at >= max(0.0, self.config.hold_seconds)
             )
             priority_return = self._return_profile == "avoidance"
-            return_path_ready = straight or (priority_return and lane.found)
+            return_path_ready = straight or (
+                priority_return and lane.found and lane_reliable
+            )
             if return_path_ready and (timed_return or self._return_requested):
                 self.state = "changing_to_lane2"
                 self._phase_started_at = now
@@ -211,9 +226,12 @@ class LaneChangeController:
 
         offset_px = offset_ratio * self._effective_lane_width(lane_width_px)
         shifted = self._shift_lane(lane, offset_px, bev_width_px) if lane.found else lane
+        if not lane_reliable and self._uses_target_arrival(self.state):
+            self._target_capture_frames = 0
         if (
             self.state == "changing_to_lane1"
             and self._uses_target_arrival(self.state)
+            and lane_reliable
             and self._target_captured(shifted, -1)
         ):
             direction = 0
@@ -221,6 +239,7 @@ class LaneChangeController:
         elif (
             self.state == "changing_to_lane2"
             and self._uses_target_arrival(self.state)
+            and lane_reliable
             and self._target_captured(shifted, 1)
         ):
             direction = 0
@@ -249,6 +268,7 @@ class LaneChangeController:
             direction=direction,
             progress=progress,
             stable_frames=self._stable_frames,
+            lane_reliable=lane_reliable,
         )
 
     def apply_control_adjustments(
@@ -256,7 +276,11 @@ class LaneChangeController:
         command: ControlCommand,
         result: LaneChangeResult,
     ) -> ControlCommand:
-        command = self.apply_speed_cap(command, self.speed_cap_active(result))
+        command = self.apply_speed_cap(
+            command,
+            self.speed_cap_active(result),
+            lane_reliable=result.lane_reliable,
+        )
         return self.apply_steering_assist(command, result)
 
     @staticmethod
@@ -269,12 +293,20 @@ class LaneChangeController:
             "stabilizing_lane2",
         ) or result.direction != 0
 
-    def apply_speed_cap(self, command: ControlCommand, active: bool) -> ControlCommand:
+    def apply_speed_cap(
+        self,
+        command: ControlCommand,
+        active: bool,
+        lane_reliable: bool = True,
+    ) -> ControlCommand:
         if not active or command.brake:
             return command
         cap = max(0, int(self.config.speed_cap))
+        if not lane_reliable:
+            cap = min(cap, max(0, int(self.config.unreliable_speed_cap)))
         speed = max(-cap, min(cap, command.speed))
-        reason = "%s:lane_change" % command.reason if command.reason else "lane_change"
+        suffix = "lane_change" if lane_reliable else "lane_change_unreliable"
+        reason = "%s:%s" % (command.reason, suffix) if command.reason else suffix
         return ControlCommand(speed=speed, steering=command.steering, brake=False, reason=reason)
 
     def apply_steering_assist(
@@ -282,7 +314,25 @@ class LaneChangeController:
         command: ControlCommand,
         result: LaneChangeResult,
     ) -> ControlCommand:
-        if command.brake or result.direction == 0:
+        if command.brake:
+            return command
+        if not result.lane_reliable and self.speed_cap_active(result):
+            cap = max(0, int(self.config.unreliable_steering_cap))
+            steering = self._clip(command.steering, -cap, cap)
+            reason = (
+                "%s:lane_change_unreliable" % command.reason
+                if command.reason
+                else "lane_change_unreliable"
+            )
+            return ControlCommand(
+                speed=command.speed,
+                steering=steering,
+                brake=False,
+                reason=reason,
+            )
+        if self._uses_avoidance_profile(result.state):
+            return self._apply_stabilizing_steering(command, result)
+        if result.direction == 0:
             return command
         if self.config.steering_min <= 0 and self.config.steering_boost <= 0:
             return command
@@ -290,25 +340,30 @@ class LaneChangeController:
         direction = -1 if result.direction < 0 else 1
         minimum = max(0, int(self.config.steering_min))
         cap = max(0, int(self.config.steering_cap))
-        force_target_lane = self._uses_target_arrival(result.state)
-        if force_target_lane:
-            # The avoidance target is already the complete adjacent lane.
-            # Preserve the follower's feedback command so large errors
-            # naturally saturate and smaller/heading errors are corrected
-            # without an open-loop steering script.
+        if (
+            result.lane_reliable
+            and self._uses_target_arrival(result.state)
+            and self._target_approach_reached(result.lane, direction)
+        ):
+            steering = command.steering
+            if cap > 0:
+                steering = self._clip(steering, -cap, cap)
+            reason = (
+                "%s:lane_change_capture_feedback" % command.reason
+                if command.reason
+                else "lane_change_capture_feedback"
+            )
             return ControlCommand(
                 speed=command.speed,
-                steering=command.steering,
+                steering=steering,
                 brake=False,
-                reason=(
-                    "%s:lane_change_feedback" % command.reason
-                    if command.reason
-                    else "lane_change_feedback"
-                ),
+                reason=reason,
             )
         if self.config.steering_override:
             steering = direction * (cap if cap > 0 else minimum)
         else:
+            # Heading feedback may not countersteer until target capture changes
+            # the result direction to zero and starts parallel stabilization.
             steering = command.steering
             if steering * direction < 0:
                 steering = 0
@@ -321,6 +376,48 @@ class LaneChangeController:
             steering = self._clip(steering, -cap, cap)
         reason = "%s:lane_change_steer" % command.reason if command.reason else "lane_change_steer"
         return ControlCommand(speed=command.speed, steering=steering, brake=False, reason=reason)
+
+    def _apply_stabilizing_steering(
+        self,
+        command: ControlCommand,
+        result: LaneChangeResult,
+    ) -> ControlCommand:
+        """Amplify lane feedback until both target-center errors are settled."""
+        if self._stable_now(result.lane, result.lane_reliable):
+            return command
+
+        lane = result.lane
+        lateral = lane.lateral_error_norm
+        near = (
+            lane.near_lateral_error_norm
+            if lane.near_lateral_error_norm is not None
+            else lateral
+        )
+        minimum = max(0, int(self.config.stabilizing_steering_min))
+        steering = int(command.steering)
+        if steering != 0:
+            direction = -1 if steering < 0 else 1
+        else:
+            # Let the normal lane follower choose the direction whenever it has
+            # a signal. The position errors are only a zero-command fallback.
+            correction = near if abs(near) > abs(lateral) else lateral
+            direction = -1 if correction < 0.0 else 1
+        if abs(steering) < minimum:
+            steering = direction * minimum
+        cap = max(0, int(self.config.steering_cap))
+        if cap > 0:
+            steering = self._clip(steering, -cap, cap)
+        reason = (
+            "%s:lane_change_stabilize" % command.reason
+            if command.reason
+            else "lane_change_stabilize"
+        )
+        return ControlCommand(
+            speed=command.speed,
+            steering=steering,
+            brake=False,
+            reason=reason,
+        )
 
     def _progress(self, now: float) -> float:
         duration = max(0.05, self.config.transition_seconds)
@@ -397,6 +494,25 @@ class LaneChangeController:
             self._target_capture_frames = 0
         required = max(1, int(self.config.target_capture_frames))
         return self._target_capture_frames >= required
+
+    def _target_approach_reached(
+        self,
+        lane: LaneGeometry,
+        direction: int,
+    ) -> bool:
+        if not lane.found or direction == 0:
+            return False
+        lateral_error = (
+            lane.near_lateral_error_norm
+            if lane.near_lateral_error_norm is not None
+            else lane.lateral_error_norm
+        )
+        remaining_error = lateral_error * direction
+        threshold = max(
+            max(0.0, float(self.config.target_capture_error)),
+            max(0.0, float(self.config.target_approach_error)),
+        )
+        return remaining_error <= threshold
 
     def _uses_avoidance_profile(self, state: str) -> bool:
         if state == "stabilizing_lane1":
