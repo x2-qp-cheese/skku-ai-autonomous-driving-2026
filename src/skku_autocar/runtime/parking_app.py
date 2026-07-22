@@ -226,7 +226,7 @@ def run_prepared(args: argparse.Namespace) -> int:
         LOG.info("parking mission auto-started for replay")
 
     LOG.info("source=%s model=%s device=%s", source, model_path, segmenter.device)
-    LOG.info("controls: SPACE=start/cancel | R=reset | Q/ESC=quit")
+    LOG.info("controls: SPACE=start/resume | R=stop/reset | Q/ESC=quit")
     if not args.serial:
         LOG.info("serial output disabled; pass --serial only after replay/calibration checks")
 
@@ -374,16 +374,19 @@ def run_prepared(args: argparse.Namespace) -> int:
             if key in (ord("q"), 27):
                 break
             if key == ord(" "):
-                if planner.state == ParkingState.IDLE:
+                if planner.state in (
+                    ParkingState.IDLE,
+                    ParkingState.ABORTED,
+                    ParkingState.EMERGENCY_STOP,
+                    ParkingState.PARKED,
+                    ParkingState.EXIT_DONE,
+                ):
                     planner.start(elapsed)
                     geometry_estimator.reset()
                     lidar_estimator.reset()
                     LOG.info("parking mission started")
                 else:
-                    planner.reset(elapsed)
-                    if vehicle is not None:
-                        vehicle.stop("operator_cancel")
-                    LOG.info("parking mission cancelled")
+                    LOG.info("parking mission already running; SPACE ignored, press R to stop/reset")
             elif key == ord("r"):
                 planner.reset(elapsed)
                 geometry_estimator.reset()
@@ -618,7 +621,7 @@ def draw_live_dashboard(
             ),
         ),
         "FPS=%.1f | elapsed=%.2fs | %s" % (fps, elapsed_s, wall_time),
-        "Colors: CYAN=left GREEN=right RED=back MAGENTA=unclassified | SPACE start/cancel R reset Q quit",
+        "Colors: CYAN=left GREEN=right RED=back MAGENTA=unclassified | SPACE start/resume R stop/reset Q quit",
     )
     return compose_parking_dashboard(
         cv2,
@@ -751,7 +754,7 @@ def draw_debug(
             "-" if left_ultrasonic_mm is None else "%.0fmm" % left_ultrasonic_mm,
             "-" if right_ultrasonic_mm is None else "%.0fmm" % right_ultrasonic_mm,
         ),
-        "fps=%.1f | SPACE start/cancel | R reset | Q quit" % fps,
+        "fps=%.1f | SPACE start/resume | R stop/reset | Q quit" % fps,
     )
     if show_status:
         for index, text in enumerate(lines):
@@ -1300,11 +1303,14 @@ def open_vehicle(args: argparse.Namespace, config: ParkingAppConfig) -> SerialVe
             abs(config.planner.prealign_speed),
             abs(config.planner.reverse_entry_speed),
             abs(config.planner.reverse_center_speed),
+            abs(config.planner.correction_forward_speed),
+            abs(config.planner.correction_reverse_speed),
             abs(config.planner.exit_speed),
         ),
         max_steering=max(
             abs(config.planner.max_steering),
             abs(config.planner.prealign_steering),
+            abs(config.planner.correction_steering),
             abs(config.planner.exit_turn_steering),
         ),
     )
@@ -1406,6 +1412,13 @@ def apply_cli_overrides(config: ParkingAppConfig, args: argparse.Namespace) -> P
             ),
         )
     planner = config.planner
+    if args.first_car_preemptive_turn is not None:
+        planner = replace(
+            planner,
+            first_car_preemptive_turn_enabled=(
+                args.first_car_preemptive_turn == "on"
+            ),
+        )
     if args.prealign_speed is not None:
         planner = replace(planner, prealign_speed=args.prealign_speed)
     if args.prealign_steering is not None:
@@ -1558,6 +1571,12 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         type=float,
         default=None,
         help="vehicle-frame yBack trigger for the first car; negative is ahead",
+    )
+    parser.add_argument(
+        "--first-car-preemptive-turn",
+        choices=("on", "off"),
+        default=None,
+        help="turn left at the first car before the second car is confirmed",
     )
     parser.add_argument(
         "--prealign-steering",

@@ -47,20 +47,33 @@ class ParkingConfigTest(unittest.TestCase):
         self.assertEqual(config.lidar.first_car_turn_target_y_back_mm, -650.0)
         self.assertEqual(config.lidar.first_car_confirm_scans, 2)
         self.assertTrue(config.planner.first_car_preemptive_turn_enabled)
-        self.assertEqual(config.planner.first_car_approach_speed, 10)
+        self.assertEqual(config.planner.start_forward_s, 0.8)
+        self.assertEqual(config.planner.first_car_approach_speed, 24)
+        self.assertEqual(config.planner.first_car_straight_s, 1.0)
         self.assertTrue(config.planner.prealign_enabled)
         self.assertEqual(config.planner.prealign_speed, 35)
         self.assertEqual(config.planner.prealign_steering, -150)
+        self.assertEqual(config.planner.prealign_gap_acquire_timeout_s, 0.0)
         self.assertEqual(config.planner.prealign_timeout_s, 6.0)
         self.assertEqual(config.planner.ultrasonic_emergency_mm, 100.0)
         self.assertEqual(config.planner.ultrasonic_max_correction, 35)
         self.assertEqual(config.planner.ultrasonic_stale_after_s, 0.8)
+        self.assertEqual(config.planner.max_steering, 130)
+        self.assertEqual(config.planner.reverse_entry_min_steering, 90)
+        self.assertTrue(config.planner.correction_enabled)
+        self.assertEqual(config.planner.correction_forward_speed, 18)
+        self.assertEqual(config.planner.correction_reverse_speed, -24)
+        self.assertEqual(config.planner.correction_steering, 130)
+        self.assertEqual(config.planner.correction_depth_trigger_px, 760.0)
+        self.assertEqual(config.planner.correction_trigger_frames, 3)
+        self.assertEqual(config.planner.correction_max_attempts, 3)
         self.assertEqual(config.planner.park_hold_s, 3.0)
         self.assertEqual(config.planner.exit_speed, 24)
         self.assertEqual(config.planner.exit_turn_steering, 80)
         self.assertEqual(config.planner.exit_turn_s, 1.6)
         self.assertEqual(config.planner.exit_straight_s, 0.0)
         self.assertEqual(config.planner.exit_right_min_clearance_mm, 180.0)
+        self.assertEqual(config.planner.reverse_steering_sign, 1.0)
         self.assertEqual(tuple(config.bev.src_top_left), (0.18, 0.56))
         self.assertEqual(tuple(config.bev.src_top_right), (0.82, 0.56))
 
@@ -111,6 +124,7 @@ class ParkingConfigTest(unittest.TestCase):
             "--lidar-behind-vehicle-rear-cm", "8",
             "--lidar-to-rear-axle-cm", "-28",
             "--first-car-turn-target-cm", "-72",
+            "--first-car-preemptive-turn", "on",
             "--prealign-speed", "42",
             "--prealign-steering", "-120",
             "--prealign-timeout-s", "7.5",
@@ -132,6 +146,7 @@ class ParkingConfigTest(unittest.TestCase):
         self.assertEqual(config.lidar.angle_offset_deg, 5.0)
         self.assertEqual(config.lidar.sensor_to_rear_axle_y_back_mm, -280.0)
         self.assertEqual(config.lidar.first_car_turn_target_y_back_mm, -720.0)
+        self.assertTrue(config.planner.first_car_preemptive_turn_enabled)
         self.assertEqual(config.planner.prealign_speed, 42)
         self.assertEqual(config.planner.prealign_steering, -120)
         self.assertEqual(config.planner.max_steering, original.planner.max_steering)
