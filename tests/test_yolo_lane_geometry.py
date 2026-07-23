@@ -315,6 +315,8 @@ class YoloLaneGeometryTest(unittest.TestCase):
                 "0.04",
                 "--center-lock-min-steering",
                 "95",
+                "--corridor-max-heading-jump",
+                "0.16",
             ]
         )
 
@@ -327,6 +329,19 @@ class YoloLaneGeometryTest(unittest.TestCase):
         self.assertTrue(follower_config.center_lock_enabled)
         self.assertAlmostEqual(follower_config.center_lock_error_threshold, 0.04)
         self.assertEqual(follower_config.center_lock_min_steering, 95)
+        self.assertAlmostEqual(bev_config.max_heading_jump, 0.16)
+
+    def test_crosswalk_cache_defaults_hold_preliminary_run_geometry(self):
+        args = parse_args([])
+
+        bev_config = build_bev_corridor_config(args)
+        follower_config = build_follower_config(args)
+
+        self.assertEqual(bev_config.max_coast_frames, 10)
+        self.assertAlmostEqual(bev_config.max_center_jump_px, 80.0)
+        self.assertAlmostEqual(bev_config.crosswalk_max_center_jump_px, 30.0)
+        self.assertEqual(follower_config.lane_lost_hold_frames, 10)
+        self.assertEqual(follower_config.lane_lost_steering_release_rate_limit, 0)
 
     def test_lane_change_cli_defaults_are_external_ready_and_aggressive(self):
         args = parse_args([])
@@ -359,6 +374,8 @@ class YoloLaneGeometryTest(unittest.TestCase):
                 "110",
                 "--virtual-lane-speed-cap",
                 "220",
+                "--fixed-speed",
+                "off",
                 "--virtual-lane-warmup-frames",
                 "0",
                 "--virtual-lane-min-reliable-frames",
@@ -382,6 +399,8 @@ class YoloLaneGeometryTest(unittest.TestCase):
                 "110",
                 "--virtual-lane-speed-cap",
                 "220",
+                "--fixed-speed",
+                "off",
                 "--virtual-lane-warmup-frames",
                 "2",
                 "--virtual-lane-min-reliable-frames",
@@ -404,7 +423,7 @@ class YoloLaneGeometryTest(unittest.TestCase):
         self.assertIn("virtual_hold", guarded.reason)
 
     def test_lane_lost_command_speed_is_capped(self):
-        args = parse_args(["--lane-lost-speed-cap", "200"])
+        args = parse_args(["--fixed-speed", "off", "--lane-lost-speed-cap", "200"])
         safety = CommandSafetyFilter(args)
         lost = LaneGeometry(
             found=False,
@@ -534,6 +553,8 @@ class YoloLaneGeometryTest(unittest.TestCase):
                 "140",
                 "--virtual-lane-max-steering",
                 "90",
+                "--fixed-speed",
+                "off",
             ]
         )
         safety = CommandSafetyFilter(args)

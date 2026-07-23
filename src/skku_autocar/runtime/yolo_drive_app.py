@@ -293,7 +293,7 @@ def build_bev_corridor_config(args: argparse.Namespace) -> BevCorridorConfig:
     defaults = BevCorridorConfig()
     return BevCorridorConfig(
         lane_width_px=args.corridor_lane_width_px,
-        lookahead_y_ratio=_first_set(args.bev_lookahead, args.lookahead, defaults.lookahead_y_ratio),
+        lookahead_y_ratio=_first_set(args.lookahead, args.bev_lookahead, defaults.lookahead_y_ratio),
         lane_change_near_y_ratio=args.bev_lane_change_near_y,
         vehicle_center_x_offset_ratio=args.vehicle_center_offset,
         heading_gain=args.bev_heading_gain,
@@ -301,6 +301,7 @@ def build_bev_corridor_config(args: argparse.Namespace) -> BevCorridorConfig:
         heading_smooth_alpha=args.bev_heading_smooth,
         center_anchor=args.corridor_center_anchor == "on",
         max_center_jump_px=args.corridor_max_center_jump,
+        max_heading_jump=args.corridor_max_heading_jump,
         max_coast_frames=args.corridor_max_coast_frames,
         max_width_jump_px=args.corridor_max_width_jump,
         crosswalk_halt=args.crosswalk_halt == "on",
@@ -639,14 +640,14 @@ class CommandSafetyFilter:
 def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="YOLOv8 segmentation autonomous driving runtime")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="trained YOLO segmentation model path")
-    parser.add_argument("--device", default="auto", help="auto, mps, cpu, 0, cuda, ...")
+    parser.add_argument("--device", default="mps", help="auto, mps, cpu, 0, cuda, ...")
     parser.add_argument("--conf", type=float, default=0.35, help="YOLO confidence threshold")
     parser.add_argument("--imgsz", type=int, default=640, help="YOLO inference image size")
     parser.add_argument(
         "--traffic-light", choices=("on", "off"), default="on",
         help="compare red/green pixels inside YOLO 'light' masks and latch stop on red until green is confirmed",
     )
-    parser.add_argument("--light-confirm-frames", type=int, default=TrafficLightConfig.confirm_frames)
+    parser.add_argument("--light-confirm-frames", type=int, default=1)
     parser.add_argument(
         "--light-red-confirm-frames",
         type=int,
@@ -685,13 +686,13 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument(
         "--light-stop-line-y",
         type=float,
-        default=TrafficLightConfig.stop_line_y_ratio,
+        default=0.80,
         help="frame y ratio of the virtual crosswalk contact line; confirmed RED brakes when the crosswalk mask bottom reaches this line",
     )
     parser.add_argument(
         "--camera",
-        default="1",
-        help="front camera index or video path (default: 1; macOS index 0 is usually the built-in camera)",
+        default="0",
+        help="front camera index or video path",
     )
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
@@ -706,44 +707,44 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument("--baudrate", type=int, default=115200)
     parser.add_argument("--ready-timeout", type=float, default=3.0)
     parser.add_argument("--no-serial", action="store_true", help="run without Arduino output")
-    parser.add_argument("--speed", type=int, default=105)
+    parser.add_argument("--speed", type=int, default=255)
     parser.add_argument(
         "--fixed-speed",
         choices=("on", "off"),
-        default="off",
+        default="on",
         help="force every non-brake driving command to --speed after steering safety filters",
     )
-    parser.add_argument("--max-speed", type=int, default=170)
-    parser.add_argument("--min-curve-speed", type=int, default=60)
+    parser.add_argument("--max-speed", type=int, default=255)
+    parser.add_argument("--min-curve-speed", type=int, default=255)
     add_obstacle_arguments(parser)
-    parser.add_argument("--max-steering", type=int, default=120)
-    parser.add_argument("--steering-rate-limit", type=int, default=110)
-    parser.add_argument("--min-steering-rate-limit", type=int, default=40)
-    parser.add_argument("--steering-release-rate-limit", type=int, default=22)
-    parser.add_argument("--kp-lateral", type=float, default=190.0)
-    parser.add_argument("--kd-lateral", type=float, default=45.0)
-    parser.add_argument("--kp-heading", type=float, default=12.0)
-    parser.add_argument("--kd-heading", type=float, default=4.0)
-    parser.add_argument("--speed-curve-slowdown", type=int, default=70)
+    parser.add_argument("--max-steering", type=int, default=150)
+    parser.add_argument("--steering-rate-limit", type=int, default=150)
+    parser.add_argument("--min-steering-rate-limit", type=int, default=35)
+    parser.add_argument("--steering-release-rate-limit", type=int, default=10)
+    parser.add_argument("--kp-lateral", type=float, default=205.0)
+    parser.add_argument("--kd-lateral", type=float, default=75.0)
+    parser.add_argument("--kp-heading", type=float, default=1.5)
+    parser.add_argument("--kd-heading", type=float, default=0.3)
+    parser.add_argument("--speed-curve-slowdown", type=int, default=0)
     parser.add_argument(
         "--lateral-priority-threshold",
         type=float,
-        default=0.10,
+        default=0.16,
         help="ignore conflicting heading only when lateral error is above this threshold",
     )
     parser.add_argument(
         "--curve-strength-alpha",
         type=float,
-        default=0.35,
+        default=0.45,
         help="curve strength smoothing alpha; lower keeps curve state longer",
     )
-    parser.add_argument("--straight-steering-scale", type=float, default=0.45)
-    parser.add_argument("--curve-steering-scale", type=float, default=1.45)
-    parser.add_argument("--center-recovery-error-threshold", type=float, default=0.14)
-    parser.add_argument("--center-recovery-steering-boost", type=float, default=2.0)
-    parser.add_argument("--center-recovery-min-steering", type=int, default=85)
-    parser.add_argument("--center-recovery-rate-limit", type=int, default=120)
-    parser.add_argument("--center-recovery-max-speed", type=int, default=50)
+    parser.add_argument("--straight-steering-scale", type=float, default=0.50)
+    parser.add_argument("--curve-steering-scale", type=float, default=1.68)
+    parser.add_argument("--center-recovery-error-threshold", type=float, default=0.12)
+    parser.add_argument("--center-recovery-steering-boost", type=float, default=1.20)
+    parser.add_argument("--center-recovery-min-steering", type=int, default=70)
+    parser.add_argument("--center-recovery-rate-limit", type=int, default=150)
+    parser.add_argument("--center-recovery-max-speed", type=int, default=255)
     parser.add_argument(
         "--center-lock",
         choices=("on", "off"),
@@ -765,49 +766,49 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument(
         "--lane-lost-hold-frames",
         type=int,
-        default=20,
+        default=10,
         help="keep the last steering/speed for up to this many frames when the lane is not detected (e.g. crosswalks) before stopping",
     )
     parser.add_argument(
         "--lane-lost-steering-release-rate-limit",
         type=int,
-        default=None,
+        default=0,
         help="during lane-lost hold, release cached steering toward 0 by this many units/frame; default=max(min-steering-rate-limit, steering-release-rate-limit), 0 keeps the old cached steering",
     )
     parser.add_argument(
         "--lane-lost-speed-cap",
         type=int,
-        default=180,
+        default=255,
         help="cap speed while the planner is holding a lane-lost command",
     )
     parser.add_argument(
         "--virtual-lane-max-steering",
         type=int,
-        default=90,
+        default=150,
         help="cap absolute steering when YOLO uses a virtual lane fallback",
     )
     parser.add_argument(
         "--virtual-lane-speed-cap",
         type=int,
-        default=180,
+        default=255,
         help="cap speed when YOLO uses a virtual lane fallback",
     )
     parser.add_argument(
         "--virtual-lane-warmup-frames",
         type=int,
-        default=3,
+        default=0,
         help="for the first N consecutive virtual-lane frames, reuse the last reliable steering before applying the virtual cap",
     )
     parser.add_argument(
         "--virtual-lane-steering-blend",
         type=float,
-        default=0.20,
+        default=1.00,
         help="after warmup, blend virtual-lane steering with the last reliable steering. 0=ignore virtual steering, 1=trust raw virtual steering",
     )
     parser.add_argument(
         "--virtual-lane-max-steering-step",
         type=int,
-        default=20,
+        default=100,
         help="max steering change per frame while in virtual-lane fallback; 0 disables this guard",
     )
     parser.add_argument(
@@ -819,13 +820,13 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument(
         "--virtual-lane-min-reliable-frames",
         type=int,
-        default=3,
+        default=1,
         help="require this many real non-virtual lane frames before trusting virtual-lane steering; before that, hold the last reliable command",
     )
     parser.add_argument(
         "--virtual-lane-bootstrap-speed-cap",
         type=int,
-        default=150,
+        default=255,
         help="speed cap while virtual-lane steering is blocked because there are not enough reliable real-lane frames yet",
     )
     # Compatibility no-op for existing launch commands. BEV corridor is now the
@@ -854,15 +855,21 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         help="[--bev-corridor] reject and coast a frame whose lookahead center_x jumps more than this many BEV px (lower = smoother, more likely to briefly coast on real fast curves)",
     )
     parser.add_argument(
+        "--corridor-max-heading-jump",
+        type=float,
+        default=BevCorridorConfig.max_heading_jump,
+        help="[--bev-corridor] reject and coast a frame whose heading jumps more than this normalized amount",
+    )
+    parser.add_argument(
         "--corridor-max-coast-frames",
         type=int,
-        default=BevCorridorConfig.max_coast_frames,
+        default=10,
         help="[--bev-corridor] hold the last good geometry for at most this many rejected frames before declaring the lane lost",
     )
     parser.add_argument(
         "--corridor-max-width-jump",
         type=float,
-        default=BevCorridorConfig.max_width_jump_px,
+        default=40.0,
         help="[--bev-corridor] reject a measured lane width that jumps more than this many px from the current smoothed value",
     )
     parser.add_argument(
@@ -874,7 +881,7 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument(
         "--corridor-virtual-hold",
         choices=("on", "off"),
-        default="on",
+        default="off",
         help="[--bev-corridor] when the lane is fully lost, hold a vehicle-width virtual lane and keep centered (guarded by the virtual-lane safety caps) instead of braking immediately",
     )
     parser.add_argument(
@@ -892,7 +899,7 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument(
         "--corridor-centerline-bias",
         type=float,
-        default=BevCorridorConfig.centerline_bias,
+        default=0.40,
         help="[--bev-corridor] driving line position between boundaries: 0=center line, 0.5=midpoint, 1=outer side line. Raise if the car rides too far inside",
     )
     parser.add_argument(
@@ -904,7 +911,7 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument(
         "--corridor-crosswalk-center-smooth",
         type=float,
-        default=BevCorridorConfig.crosswalk_center_smooth_alpha,
+        default=0.10,
         help="[--bev-corridor] center-x EMA factor while a crosswalk is visible (lower = steadier)",
     )
     parser.add_argument(
@@ -916,19 +923,19 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument(
         "--corridor-crosswalk-option",
         choices=("a", "b"),
-        default=BevCorridorConfig.crosswalk_option,
+        default="b",
         help="[--bev-corridor] a=center-line virtual corridor, b=detected right boundary with fixed inward offset",
     )
     parser.add_argument(
         "--corridor-crosswalk-right-offset-px",
         type=float,
-        default=BevCorridorConfig.crosswalk_right_offset_px,
+        default=90.0,
         help="[--bev-corridor] option B target distance leftward from the detected right boundary in BEV pixels",
     )
     parser.add_argument(
         "--bev-lookahead",
         type=float,
-        default=None,
+        default=0.55,
         help="BEV row ratio where lateral error is measured; defaults to --lookahead when provided, otherwise BEV default",
     )
     parser.add_argument(
@@ -940,13 +947,13 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument(
         "--bev-center-smooth",
         type=float,
-        default=BevCorridorConfig.center_smooth_alpha,
+        default=0.60,
         help="BEV lane-center EMA factor (0..1). 1.0 = no smoothing (target dot sits on the raw line, fast/jittery), lower = smoother/laggier",
     )
     parser.add_argument(
         "--bev-heading-smooth",
         type=float,
-        default=BevCorridorConfig.heading_smooth_alpha,
+        default=0.30,
         help="BEV heading EMA factor (0..1). 1.0 = no smoothing, lower = smoother",
     )
     parser.add_argument("--bev-heading-gain", type=float, default=BevCorridorConfig.heading_gain)
@@ -959,7 +966,7 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument(
         "--vehicle-center-offset",
         type=float,
-        default=BevCorridorConfig.vehicle_center_x_offset_ratio,
+        default=0.085,
         help="vehicle center x offset as frame width ratio; positive shifts the vehicle center right (camera is mounted left of the car centerline), so centered targets steer left. Default matches the last good run (~0.585 frame x)",
     )
     parser.add_argument(
@@ -981,15 +988,15 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     )
     parser.add_argument("--command-rate", type=float, default=20.0)
     parser.add_argument("--log-interval", type=float, default=0.5)
-    parser.add_argument("--show-mask", action="store_true")
-    parser.add_argument("--record", choices=("on", "off"), default="off")
+    parser.add_argument("--show-mask", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--record", choices=("on", "off"), default="on")
     parser.add_argument("--record-dir", default="data/raw/drive_recordings")
     parser.add_argument("--record-fps", type=float, default=30.0)
     parser.add_argument("--record-fourcc", default="mp4v")
     parser.add_argument(
         "--record-debug",
         choices=("on", "off", "auto"),
-        default="auto",
+        default="on",
         help="save the annotated debug screen. auto=follow --record (on when --record on), on=always, off=never",
     )
     parser.add_argument("--debug-dir", default="data/processed", help="output dir for the debug screen video")

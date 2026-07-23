@@ -50,8 +50,8 @@ class CameraRuntimeContractTest(unittest.TestCase):
     def test_competition_default_is_strict(self):
         self.assertEqual(parse_args([]).camera_resolution_policy, "strict")
 
-    def test_competition_default_uses_external_front_camera(self):
-        self.assertEqual(parse_args([]).camera, "1")
+    def test_competition_default_uses_contest_front_camera(self):
+        self.assertEqual(parse_args([]).camera, "0")
 
 
 if __name__ == "__main__":

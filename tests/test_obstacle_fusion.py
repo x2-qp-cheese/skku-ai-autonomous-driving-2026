@@ -20,6 +20,7 @@ from skku_autocar.runtime.obstacle_mode import (
     build_lane_change_config,
     build_obstacle_fusion_config,
     lane_change_geometry_reliable,
+    resolve_lane_change_target_width_px,
 )
 from skku_autocar.runtime.yolo_drive_app import (
     parse_args,
@@ -128,6 +129,36 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertIn("lane2 -> lane1", second)
         self.assertEqual(change.state, "armed")
         self.assertEqual(change.request_source, "obstacle_fusion")
+
+    def test_target_dominant_obstacle_does_not_trigger_current_lane_avoidance(self):
+        fusion = planner()
+        change = controller()
+        target_dominant = obstacle_mask(96, 121, 45, 70)
+
+        fusion.update(
+            [target_dominant],
+            SHAPE,
+            CENTERLINE,
+            lane(),
+            change,
+            ultrasound(),
+            1.0,
+            True,
+        )
+        event = fusion.update(
+            [target_dominant],
+            SHAPE,
+            CENTERLINE,
+            lane(),
+            change,
+            ultrasound(),
+            1.1,
+            True,
+        )
+
+        self.assertIsNone(event)
+        self.assertFalse(fusion.observation.visual_detected)
+        self.assertFalse(fusion.observation.fused_hazard)
 
     def test_frame_obstacle_caps_speed_before_it_enters_bev_roi(self):
         fusion = planner(
@@ -326,7 +357,7 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertFalse(fusion.observation.visual_confirmed)
         self.assertEqual(guarded.speed, 255)
 
-    def test_close_low_confidence_visual_stops_instead_of_changing_lane(self):
+    def test_close_low_confidence_visual_does_not_stop_when_emergency_disabled(self):
         fusion = planner(
             visual_action_confidence=0.75,
             frame_visual_trigger_y_ratio=0.15,
@@ -345,7 +376,9 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         )
 
         self.assertFalse(fusion.observation.visual_actionable)
-        self.assertTrue(guarded.brake)
+        self.assertFalse(fusion.observation.emergency)
+        self.assertFalse(guarded.brake)
+        self.assertEqual(guarded.speed, 255)
         self.assertEqual(change.state, "lane2")
 
     def test_ultrasonic_without_visual_occupancy_does_not_change_lane(self):
@@ -479,6 +512,7 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         fusion = planner(
             ultrasonic_trigger_mm=1600.0,
             blocked_stop_mm=650.0,
+            emergency_stop_enabled=True,
         )
         change = controller()
         current = obstacle_mask(130, 151, 45, 70)
@@ -553,7 +587,7 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertFalse(fusion.observation.side_clear)
 
     def test_one_close_sensor_stops_when_visual_obstacle_agrees(self):
-        fusion = planner()
+        fusion = planner(emergency_stop_enabled=True)
         change = controller()
         mask = obstacle_mask(130, 151, 45, 70)
         fusion.update(
@@ -568,7 +602,7 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertIn("obstacle_fusion_stop", guarded.reason)
 
     def test_two_close_front_sensors_provide_independent_emergency_stop(self):
-        fusion = planner()
+        fusion = planner(emergency_stop_enabled=True)
         change = controller()
         fusion.update(
             [], SHAPE, CENTERLINE, lane(), change, ultrasound(fc=200, fr=220), 1.0, True
@@ -886,12 +920,16 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
                 "0.22",
                 "--lane-change-target-capture-frames",
                 "3",
+                "--lane-change-target-width-px",
+                "142",
                 "--lane-change-stable-near-error",
                 "0.19",
                 "--lane-change-stabilizing-steering-min",
                 "75",
                 "--obstacle-side-clearance-mm",
                 "350",
+                "--obstacle-emergency-stop",
+                "on",
             ]
         )
         config = build_obstacle_fusion_config(args)
@@ -907,8 +945,11 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertAlmostEqual(config.ttc_trigger_seconds, 1.6)
         self.assertEqual(config.solid_crossing_margin_px, 7.0)
         self.assertEqual(config.side_clearance_mm, 350.0)
+        self.assertTrue(config.emergency_stop_enabled)
+        self.assertEqual(config.lane_width_px, 142.0)
         self.assertAlmostEqual(lane_config.target_capture_error, 0.22)
         self.assertEqual(lane_config.target_capture_frames, 3)
+        self.assertEqual(lane_config.target_lane_width_px, 142.0)
         self.assertAlmostEqual(lane_config.stable_near_lateral_error, 0.19)
         self.assertEqual(lane_config.stabilizing_steering_min, 75)
 
@@ -920,7 +961,23 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
 
         self.assertEqual(fusion.ultrasonic_trigger_mm, 2600.0)
         self.assertEqual(fusion.ultrasonic_clear_mm, 2900.0)
-        self.assertEqual(lane_config.stabilizing_steering_min, 70)
+        self.assertAlmostEqual(resolve_lane_change_target_width_px(args), 120.0)
+        self.assertEqual(lane_config.target_lane_width_px, 0.0)
+        self.assertEqual(fusion.lane_width_px, 120.0)
+        self.assertEqual(fusion.speed_cap, 255)
+        self.assertEqual(fusion.approach_speed_cap, 255)
+        self.assertAlmostEqual(fusion.frame_visual_trigger_y_ratio, 0.10)
+        self.assertAlmostEqual(fusion.target_block_y_ratio, 0.65)
+        self.assertAlmostEqual(fusion.frame_target_block_y_ratio, 0.65)
+        self.assertEqual(fusion.blocked_stop_mm, 300.0)
+        self.assertFalse(fusion.emergency_stop_enabled)
+        self.assertEqual(lane_config.speed_cap, 255)
+        self.assertEqual(lane_config.steering_min, 150)
+        self.assertEqual(lane_config.steering_cap, 150)
+        self.assertTrue(lane_config.steering_override)
+        self.assertEqual(lane_config.unreliable_speed_cap, 255)
+        self.assertEqual(lane_config.stabilizing_steering_min, 90)
+        self.assertAlmostEqual(lane_config.target_approach_error, 0.20)
 
     def test_old_clearance_cli_name_maps_to_capture_error(self):
         args = parse_args(
@@ -932,8 +989,8 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
             0.17,
         )
 
-    def test_obstacle_mode_is_disabled_and_side_effect_free_by_default(self):
-        args = parse_args([])
+    def test_obstacle_mode_can_be_disabled_and_is_side_effect_free(self):
+        args = parse_args(["--obstacle-avoidance", "off"])
         mode = ObstacleDriveMode(args, object(), object())
         vehicle = RecordingVehicle()
         command = ControlCommand(speed=120, steering=-30, brake=False, reason="lane")
@@ -948,8 +1005,8 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertEqual(mode.apply_speed_cap(command), command)
         self.assertEqual(mode.apply_safety(command, True), command)
 
-    def test_obstacle_mode_enables_ultrasonic_stream_only_when_requested(self):
-        args = parse_args(["--obstacle-avoidance", "on"])
+    def test_obstacle_mode_enables_ultrasonic_stream_by_default(self):
+        args = parse_args([])
         mode = ObstacleDriveMode(args, object(), object())
         vehicle = RecordingVehicle()
 

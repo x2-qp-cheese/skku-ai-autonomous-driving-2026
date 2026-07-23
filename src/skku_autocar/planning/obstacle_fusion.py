@@ -18,9 +18,9 @@ class ObstacleFusionConfig:
     # BEV is reliable near the car, while frame-space masks see obstacles before
     # they enter the ground-plane homography. Both assessments are used.
     visual_trigger_y_ratio: float = 0.05
-    target_block_y_ratio: float = 0.20
+    target_block_y_ratio: float = 0.65
     frame_visual_trigger_y_ratio: float = 0.18
-    frame_target_block_y_ratio: float = 0.20
+    frame_target_block_y_ratio: float = 0.65
     visual_emergency_y_ratio: float = 0.88
     frame_visual_emergency_y_ratio: float = 0.72
     path_half_width_px: float = 65.0
@@ -39,7 +39,8 @@ class ObstacleFusionConfig:
     ultrasonic_trigger_mm: float = 2600.0
     ultrasonic_clear_mm: float = 2900.0
     ultrasonic_stop_mm: float = 300.0
-    blocked_stop_mm: float = 650.0
+    blocked_stop_mm: float = 300.0
+    emergency_stop_enabled: bool = False
     min_front_sensors: int = 2
     range_confirm_frames: int = 1
     range_clear_frames: int = 2
@@ -554,6 +555,9 @@ class ObstacleFusionPlanner:
         blocked: bool,
         avoidance_committed: bool,
     ) -> bool:
+        if not self.config.emergency_stop_enabled:
+            return False
+
         visual_close = visual and (
             closest_bev_y >= self.config.visual_emergency_y_ratio
             or closest_frame_y >= self.config.frame_visual_emergency_y_ratio
@@ -783,6 +787,7 @@ class ObstacleFusionPlanner:
             for item in measurements
             if item.bottom_y_ratio >= current_y_threshold
             and item.current_overlap >= overlap_min
+            and item.current_overlap >= item.target_overlap
         ]
         target_blocked = any(
             item.bottom_y_ratio >= target_y_threshold

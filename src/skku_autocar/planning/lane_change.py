@@ -25,7 +25,7 @@ class LaneChangeConfig:
     stable_near_lateral_error: float = 0.18
     stable_heading_error: float = 0.18
     stable_required_frames: int = 5
-    target_lane_width_px: float = 150.0
+    target_lane_width_px: float = 0.0
     target_approach_error: float = 0.32
     target_capture_error: float = 0.20
     target_capture_frames: int = 2
@@ -47,9 +47,9 @@ class LaneChangeResult:
 class LaneChangeController:
     """Reusable 2 -> 1 -> 2 lane-change trajectory controller.
 
-    The normal BEV corridor produces the center of lane 2, on the right side of
-    the center line. Lane 1's center is one physical BEV lane width to the left.
-    Keyboard/timer changes move that target with a smoothstep profile. Obstacle
+    The normal BEV corridor produces the lane-2 driving target. Lane changes
+    shift that target by the effective adjacent-lane offset supplied by the
+    runtime. Keyboard/timer changes move with a smoothstep profile. Obstacle
     avoidance selects the complete adjacent-lane target immediately, preserves
     direction-priority steering until the vehicle reaches that target, and then
     releases steering to the normal controller for parallel stabilization.

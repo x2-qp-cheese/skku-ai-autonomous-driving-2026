@@ -176,7 +176,7 @@ class ObstacleDriveMode:
 
         result = self._lane_change.update(
             lane,
-            self._corridor_estimator.last_lane_width_px,
+            self._lane_change_width_px(self._corridor_estimator.last_lane_width_px),
             bev.shape[1],
             now,
             running,
@@ -220,6 +220,16 @@ class ObstacleDriveMode:
             return command
         return self._planner.apply_safety(command, self.lane_change_state, running)
 
+    def _lane_change_width_px(self, lane_width_px: float) -> float:
+        configured = max(0.0, float(self._lane_change.config.target_lane_width_px))
+        if configured > 0.0:
+            return configured
+        bias = max(
+            0.0,
+            min(1.0, float(self._corridor_estimator.config.centerline_bias)),
+        )
+        return max(0.0, float(lane_width_px)) * 2.0 * bias
+
     def handle_key(self, running: bool) -> tuple:
         if not self.enabled:
             return "ignored_disabled", "lane-change key ignored: obstacle mode is off"
@@ -231,13 +241,14 @@ class ObstacleDriveMode:
             return
         LOG.info(
             "obstacle_avoidance=on fusion=%s local_map=%s lane_change=%s target_width=%.0fpx "
-            "range=%.0f/%.0fmm visual_slowdown=%s speed_cap=%d/%d",
+            "range=%.0f/%.0fmm emergency_stop=%s visual_slowdown=%s speed_cap=%d/%d",
             args.obstacle_fusion_mode,
             args.obstacle_local_map,
             args.lane_change_mode,
-            args.lane_change_target_width_px,
+            self._lane_change_width_px(self._corridor_estimator.last_lane_width_px),
             args.obstacle_trigger_mm,
             args.obstacle_clear_mm,
+            args.obstacle_emergency_stop,
             args.obstacle_visual_slowdown,
             args.obstacle_approach_speed_cap,
             args.obstacle_speed_cap,
@@ -316,6 +327,14 @@ def build_lane_change_config(args: argparse.Namespace) -> LaneChangeConfig:
     )
 
 
+def resolve_lane_change_target_width_px(args: argparse.Namespace) -> float:
+    configured = max(0.0, float(args.lane_change_target_width_px))
+    if configured > 0.0:
+        return configured
+    bias = max(0.0, min(1.0, float(args.corridor_centerline_bias)))
+    return max(0.0, float(args.corridor_lane_width_px)) * 2.0 * bias
+
+
 def build_obstacle_frame_paths(
     transformer: BevTransformer,
     base_centerline: list,
@@ -339,7 +358,7 @@ def build_obstacle_fusion_config(args: argparse.Namespace) -> ObstacleFusionConf
     return ObstacleFusionConfig(
         enabled=args.obstacle_avoidance == "on",
         fusion_mode=args.obstacle_fusion_mode,
-        lane_width_px=args.lane_change_target_width_px,
+        lane_width_px=resolve_lane_change_target_width_px(args),
         visual_trigger_y_ratio=args.obstacle_visual_trigger_y,
         target_block_y_ratio=args.obstacle_target_block_y,
         frame_visual_trigger_y_ratio=args.obstacle_frame_visual_trigger_y,
@@ -357,6 +376,7 @@ def build_obstacle_fusion_config(args: argparse.Namespace) -> ObstacleFusionConf
         ultrasonic_clear_mm=args.obstacle_clear_mm,
         ultrasonic_stop_mm=args.obstacle_stop_mm,
         blocked_stop_mm=args.obstacle_blocked_stop_mm,
+        emergency_stop_enabled=args.obstacle_emergency_stop == "on",
         min_front_sensors=args.obstacle_min_front_sensors,
         range_confirm_frames=args.obstacle_range_confirm_frames,
         range_clear_frames=args.obstacle_range_clear_frames,
@@ -412,7 +432,7 @@ def handle_lane_change_key(
 def add_obstacle_arguments(parser: argparse.ArgumentParser) -> None:
     group = parser.add_argument_group("optional obstacle avoidance")
     group.add_argument(
-        "--obstacle-avoidance", choices=("on", "off"), default="off",
+        "--obstacle-avoidance", choices=("on", "off"), default="on",
         help="enable the optional YOLO and ultrasonic obstacle-avoidance module",
     )
     group.add_argument(
@@ -444,28 +464,28 @@ def add_obstacle_arguments(parser: argparse.ArgumentParser) -> None:
 
     lane_specs = (
         ("--lane-change-trigger-seconds", float, LaneChangeConfig.trigger_seconds),
-        ("--lane-change-transition-seconds", float, LaneChangeConfig.transition_seconds),
+        ("--lane-change-transition-seconds", float, 1.0),
         ("--lane-change-hold-seconds", float, LaneChangeConfig.hold_seconds),
         ("--lane-change-max-heading", float, LaneChangeConfig.max_straight_heading),
-        ("--lane-change-speed-cap", int, LaneChangeConfig.speed_cap),
-        ("--lane-change-steering-min", int, LaneChangeConfig.steering_min),
-        ("--lane-change-steering-boost", int, LaneChangeConfig.steering_boost),
-        ("--lane-change-unreliable-speed-cap", int, LaneChangeConfig.unreliable_speed_cap),
-        ("--lane-change-unreliable-steering-cap", int, LaneChangeConfig.unreliable_steering_cap),
-        ("--lane-change-stabilizing-steering-min", int, LaneChangeConfig.stabilizing_steering_min),
+        ("--lane-change-speed-cap", int, 255),
+        ("--lane-change-steering-min", int, 150),
+        ("--lane-change-steering-boost", int, 35),
+        ("--lane-change-unreliable-speed-cap", int, 255),
+        ("--lane-change-unreliable-steering-cap", int, 150),
+        ("--lane-change-stabilizing-steering-min", int, 90),
         ("--lane-change-stable-lateral-error", float, LaneChangeConfig.stable_lateral_error),
         ("--lane-change-stable-heading-error", float, LaneChangeConfig.stable_heading_error),
         ("--lane-change-stable-near-error", float, LaneChangeConfig.stable_near_lateral_error),
         ("--lane-change-stable-frames", int, LaneChangeConfig.stable_required_frames),
         ("--lane-change-target-width-px", float, LaneChangeConfig.target_lane_width_px),
-        ("--lane-change-target-approach-error", float, LaneChangeConfig.target_approach_error),
+        ("--lane-change-target-approach-error", float, 0.20),
         ("--lane-change-target-capture-frames", int, LaneChangeConfig.target_capture_frames),
     )
     for name, value_type, default in lane_specs:
         group.add_argument(name, type=value_type, default=default)
-    group.add_argument("--lane-change-steering-cap", type=int, default=None)
+    group.add_argument("--lane-change-steering-cap", type=int, default=150)
     group.add_argument(
-        "--lane-change-steering-override", choices=("on", "off"), default="off"
+        "--lane-change-steering-override", choices=("on", "off"), default="on"
     )
     group.add_argument(
         "--lane-change-target-capture-error",
@@ -483,7 +503,7 @@ def add_obstacle_arguments(parser: argparse.ArgumentParser) -> None:
     obstacle_specs = (
         ("--obstacle-visual-trigger-y", float, ObstacleFusionConfig.visual_trigger_y_ratio),
         ("--obstacle-target-block-y", float, ObstacleFusionConfig.target_block_y_ratio),
-        ("--obstacle-frame-visual-trigger-y", float, ObstacleFusionConfig.frame_visual_trigger_y_ratio),
+        ("--obstacle-frame-visual-trigger-y", float, 0.10),
         ("--obstacle-frame-target-block-y", float, ObstacleFusionConfig.frame_target_block_y_ratio),
         ("--obstacle-visual-emergency-y", float, ObstacleFusionConfig.visual_emergency_y_ratio),
         ("--obstacle-frame-visual-emergency-y", float, ObstacleFusionConfig.frame_visual_emergency_y_ratio),
@@ -492,10 +512,10 @@ def add_obstacle_arguments(parser: argparse.ArgumentParser) -> None:
         ("--obstacle-min-overlap", float, ObstacleFusionConfig.min_path_overlap_ratio),
         ("--obstacle-contact-band", float, ObstacleFusionConfig.contact_band_ratio),
         ("--obstacle-action-confidence", float, ObstacleFusionConfig.visual_action_confidence),
-        ("--obstacle-visual-confirm-frames", int, ObstacleFusionConfig.visual_confirm_frames),
+        ("--obstacle-visual-confirm-frames", int, 2),
         ("--obstacle-visual-clear-frames", int, ObstacleFusionConfig.visual_clear_frames),
-        ("--obstacle-trigger-mm", float, ObstacleFusionConfig.ultrasonic_trigger_mm),
-        ("--obstacle-clear-mm", float, ObstacleFusionConfig.ultrasonic_clear_mm),
+        ("--obstacle-trigger-mm", float, 2600.0),
+        ("--obstacle-clear-mm", float, 2900.0),
         ("--obstacle-stop-mm", float, ObstacleFusionConfig.ultrasonic_stop_mm),
         ("--obstacle-blocked-stop-mm", float, ObstacleFusionConfig.blocked_stop_mm),
         ("--obstacle-min-front-sensors", int, ObstacleFusionConfig.min_front_sensors),
@@ -507,12 +527,18 @@ def add_obstacle_arguments(parser: argparse.ArgumentParser) -> None:
         ("--obstacle-side-clearance-mm", float, ObstacleFusionConfig.side_clearance_mm),
         ("--obstacle-solid-crossing-margin-px", float, ObstacleFusionConfig.solid_crossing_margin_px),
         ("--obstacle-solid-min-overlap", float, ObstacleFusionConfig.solid_min_overlap_ratio),
-        ("--obstacle-approach-speed-cap", int, ObstacleFusionConfig.approach_speed_cap),
-        ("--obstacle-speed-cap", int, ObstacleFusionConfig.speed_cap),
+        ("--obstacle-approach-speed-cap", int, 255),
+        ("--obstacle-speed-cap", int, 255),
         ("--obstacle-cooldown-seconds", float, ObstacleFusionConfig.cooldown_seconds),
     )
     for name, value_type, default in obstacle_specs:
         group.add_argument(name, type=value_type, default=default)
+    group.add_argument(
+        "--obstacle-emergency-stop",
+        choices=("on", "off"),
+        default="off",
+        help="stop on near obstacle emergency conditions instead of forcing avoidance",
+    )
 
     map_specs = (
         ("--obstacle-map-decay-seconds", float, LocalOccupancyConfig.decay_seconds),

@@ -2,11 +2,12 @@
 
 현재 경기 런타임은 항상 YOLO 클래스별 mask를 BEV로 변환한 뒤 2차선 corridor를 계산합니다.
 별도의 `--bev-corridor` 옵션은 필요하지 않습니다.
+기본 실행은 2026-07-16 18:51 성공 주행 옵션을 바탕으로 하되, 일반 주행과 장애물 회피 모두 `255` 속도를 유지하도록 회피 cap을 올린 설정입니다. 장애물 비상 정지는 기본값에서 꺼져 있어, 회피 모듈이 정지 명령 대신 차선 변경을 우선합니다.
 
 ## 속도 측정 미션
 
 ```powershell
-..\venv\Scripts\python.exe scripts\drive.py --camera 0 --traffic-light off
+..\venv\Scripts\python.exe scripts\drive.py --traffic-light off --obstacle-avoidance off
 ```
 
 ## 신호등 미션
@@ -44,8 +45,9 @@ YOLO 장애물 감지 없이 차선 변경을 연습할 때는 주행 중 `l` �
 `--lane-change-steering-override on`은 차선 변경 구간에서 차선 추종 조향을 섞지 않고 변경 방향 조향을 우선합니다.
 현재 차선 변경 완료 판정은 시간만 보지 않고 `stabilizing_lane1/stabilizing_lane2` 상태에서 새 차선 중심 안정도를 확인합니다.
 기본적으로 실제(non-virtual) 차선에서 `abs(err) <= 0.12`, `abs(head) <= 0.18`이 5프레임 연속 유지되어야 다음 차선 상태로 확정됩니다.
-속도 제한은 차선 변경 중에만 적용되고, 차선 1에 도착한 뒤에는 기존 `--fixed-speed on --speed 255` 설정대로 다시 255가 나갑니다.
+기본값은 차선 변경 중에도 `--lane-change-speed-cap 255`라서 속도를 낮추지 않습니다.
 기본값 `--light-stop-during-lane-change off`는 차선 변경/차선 1 유지 중 먼 빨간불 contact 오검출로 정지하지 않게 합니다.
+사람이나 횡단보도가 lane mask를 가려서 center/heading fit이 갑자기 튀면 `--corridor-max-coast-frames 10` 동안 직전 정상 BEV geometry를 유지합니다. 차선이 완전히 lost로 떨어진 경우도 `--lane-lost-hold-frames 10 --lane-lost-steering-release-rate-limit 0`으로 마지막 조향을 유지합니다.
 
 ## YOLO + 초음파 장애물 회피
 
@@ -55,22 +57,24 @@ YOLO 장애물 감지 없이 차선 변경을 연습할 때는 주행 중 `l` �
 판단 순서는 다음과 같습니다.
 
 1. 카메라 obstacle mask를 BEV Bayesian 점유 지도에 누적하고 connected component별 장애물로 분리합니다. 기본값에서는 이 단계에서 감속하거나 차선을 변경하지 않습니다.
-2. 현재 차선과 반대 차선 후보 경로를 점유 지도와 실선 mask로 미리 평가해 목표 차선을 `plan=L1/L2`로 저장합니다. 목적 차선 점유가 바뀌면 저장된 계획도 즉시 취소하거나 다시 계산합니다.
-3. 신뢰도 0.75 이상의 현재 경로 점유가 유지된 상태에서 전방 초음파가 2600mm 이내로 들어오면, 저장된 계획을 측면 초음파와 최신 점유 지도로 재검증한 뒤 같은 프레임에서 감속과 회피를 시작합니다. 기본 TTC 선행 트리거는 꺼져 있으므로 2600mm보다 먼 거리에서는 실행하지 않습니다.
+2. 현재 차선과 반대 차선 후보 경로를 점유 지도와 실선 mask로 미리 평가해 목표 차선을 `plan=L1/L2`로 저장합니다. 회피 트리거는 현재 차선 경로와 더 많이 겹치는 obstacle만 사용하며, 목적 차선 점유가 가까운 영역까지 내려오면 저장된 계획도 즉시 취소하거나 다시 계산합니다.
+3. 신뢰도 0.75 이상의 현재 경로 점유가 유지된 상태에서 전방 초음파가 2600mm 이내로 들어오면, 저장된 계획을 측면 초음파와 최신 점유 지도로 재검증한 뒤 같은 프레임에서 회피를 시작합니다. 기본 TTC 선행 트리거는 꺼져 있으므로 2600mm보다 먼 거리에서는 실행하지 않습니다.
 4. 목적 경로의 YOLO 점유, 목적 방향 측면 초음파, 두 차선 중심 사이의 `lane-side` 실선 검사를 모두 통과해야 변경을 시작합니다. 목적 차선 바깥의 정상 외곽 실선은 변경을 차단하지 않습니다.
-5. 목적 경로가 막힌 상태로 650mm 이내까지 접근하면 정지합니다. 변경 전에는 전방 센서 2개가 300mm 이내여도 독립 비상 정지합니다.
-6. 변경을 시작하면 시간 보간 없이 목적 차선 전체 중심선을 목표로 설정합니다. 근거리 목표 오차가 0.32보다 크면 변경 방향 우선 조향을 유지하고, 0.32 이내에서는 차선 추종 피드백을 허용해 횡방향 오버슈트를 줄입니다. 0.20 이내로 2프레임 들어와야 안정화로 전환하며, 근거리와 원거리 목표 오차가 함께 안정될 때만 정상 주행으로 복귀합니다.
+5. 기본값 `--obstacle-emergency-stop off`에서는 목적 경로가 막히거나 전방 초음파가 가까워져도 장애물 모듈이 정지 명령을 내리지 않습니다. 필요할 때만 `--obstacle-emergency-stop on`을 켜면 전방 300mm급 근접 조건에서 정지 안전장치가 동작합니다.
+6. 변경을 시작하면 시간 보간 없이 목적 차선 전체 중심선을 목표로 설정합니다. 기본값 `--lane-change-target-width-px 0`은 auto 모드라 `2 * --corridor-centerline-bias * measured_lane_width`를 이동량으로 사용합니다. 기본 `centerline_bias=0.40`, `lane_width=150px`에서는 120px 이동하므로, 오른쪽 차선 목표가 중앙선 쪽으로 치우친 만큼 왼쪽 차선 목표도 대칭으로 잡습니다. `--lane-change-steering-override on`이라 근거리 목표 오차가 0.20 이내로 들어오기 전까지 최대 조향 150을 즉시 넣습니다. 0.20 이내로 2프레임 들어와야 안정화로 전환하며, 근거리와 원거리 목표 오차가 함께 안정될 때만 정상 주행으로 복귀합니다.
 7. 변경 중 원래 차선 장애물의 초음파 잔여 에코와 큰 근접 mask는 중간 제동을 만들지 않습니다. 완료 직후 동일 mask가 두 경로에 걸치면 `CLEARING_SOURCE`로 통과한 뒤 새 장애물을 판단합니다.
 8. 한 장애물 이벤트는 차선 변경과 안정화가 끝날 때까지 한 번만 소비됩니다. 원래 차선에 남은 같은 component는 재요청하지 않지만, 새 차선이 안정된 뒤 새 현재 경로에서 별도 장애물이 잡히고 반대 경로가 비어 있으면 clear 구간 없이 다음 목표 차선을 미리 계획합니다.
 
 라이브 카메라는 BEV를 보정한 `1280x720` 프레임과 정확히 일치해야 합니다. 카메라가 `640x480` 같은 다른 모드로 열리면 아두이노 연결 전에 실행을 거부합니다. `--camera-resolution-policy allow`는 `--no-serial` 보정 작업에서만 사용할 수 있습니다.
 
 초음파 단독 신호는 경로와 물체 종류를 알 수 없으므로 차선 변경을 시작하지 않습니다.
-신뢰도 0.75 미만의 obstacle mask는 추적 정보에만 사용하며 선제 감속이나 차선 변경 요청에는 사용하지 않습니다. 가까운 저신뢰도 물체는 비상 정지 대상으로는 유지합니다.
+신뢰도 0.75 미만의 obstacle mask는 추적 정보에만 사용하며 선제 감속이나 차선 변경 요청에는 사용하지 않습니다.
 
 ```powershell
-..\venv\Scripts\python.exe scripts\drive.py --camera 1 --width 1280 --height 720 --fourcc MJPG --camera-resolution-policy strict --traffic-light on --obstacle-avoidance on --obstacle-local-map on --obstacle-visual-slowdown off --obstacle-fusion-mode fused --obstacle-action-confidence 0.75 --obstacle-frame-visual-trigger-y 0.12 --obstacle-visual-trigger-y 0.05 --obstacle-trigger-mm 2600 --obstacle-clear-mm 2900 --ultrasonic-max-valid-mm 3200 --obstacle-min-front-sensors 2 --obstacle-range-confirm-frames 1 --obstacle-rearm-clear-frames 3 --obstacle-ttc-seconds 0 --obstacle-stop-mm 300 --obstacle-blocked-stop-mm 650 --obstacle-side-clearance-mm 300 --obstacle-speed-cap 135 --obstacle-solid-crossing-margin-px 8 --lane-change-transition-seconds 1.0 --lane-change-speed-cap 135 --lane-change-steering-min 150 --lane-change-steering-cap 150 --lane-change-unreliable-speed-cap 70 --lane-change-unreliable-steering-cap 90 --lane-change-stabilizing-steering-min 70 --lane-change-target-approach-error 0.32 --lane-change-target-capture-error 0.20 --lane-change-target-capture-frames 2 --lane-change-stable-lateral-error 0.12 --lane-change-stable-near-error 0.18 --lane-change-stable-heading-error 0.18 --lane-change-stable-frames 5
+..\venv\Scripts\python.exe scripts\drive.py
 ```
+
+핵심 기본값은 `--camera 0 --device mps --record on --record-debug on --show-mask --traffic-light on --fixed-speed on --speed 255 --max-speed 255 --min-curve-speed 255 --max-steering 150 --corridor-max-coast-frames 10 --corridor-max-center-jump 80 --corridor-max-heading-jump 0.22 --corridor-crosswalk-max-center-jump 30 --lane-lost-hold-frames 10 --lane-lost-steering-release-rate-limit 0 --obstacle-avoidance on --obstacle-fusion-mode fused --obstacle-trigger-mm 2600 --obstacle-clear-mm 2900 --obstacle-emergency-stop off --obstacle-target-block-y 0.65 --obstacle-frame-target-block-y 0.65 --obstacle-speed-cap 255 --lane-change-speed-cap 255 --lane-change-target-width-px 0 --lane-change-steering-min 150 --lane-change-steering-cap 150 --lane-change-steering-override on`입니다.
 
 `--obstacle-path-half-width-px`는 차량이 점유할 BEV 충돌 경로의 반폭입니다.
 `--obstacle-min-overlap`은 obstacle 접지 mask가 경로와 겹쳐야 하는 최소 비율입니다.

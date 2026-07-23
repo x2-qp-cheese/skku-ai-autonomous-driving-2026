@@ -126,12 +126,13 @@ class BevCorridorConfig:
     max_width_jump_px: float = 40.0
 
     # Temporal gating (Plan C). EMA follows an outlier alpha-much every frame; a
-    # low-confidence YOLO fit shows up as a big lookahead center_x jump. Reject
-    # any frame that jumps more than max_center_jump_px from the last ACCEPTED
-    # frame and coast on the last good geometry for up to max_coast_frames before
-    # declaring the lane lost. Coast confidence decays each held frame.
+    # low-confidence YOLO fit shows up as a big lookahead center_x or heading
+    # jump. Reject those frames and coast on the last good geometry for up to
+    # max_coast_frames before declaring the lane lost. Coast confidence decays
+    # each held frame.
     max_center_jump_px: float = 80.0
-    max_coast_frames: int = 5
+    max_heading_jump: float = 0.22
+    max_coast_frames: int = 10
     coast_confidence_decay: float = 0.8
 
     # Vehicle-width virtual-lane hold (last resort). When NO lane evidence is left
@@ -225,6 +226,7 @@ class BevCorridorLaneEstimator:
         self._coast_frames: int = 0
         self._last_lane: Optional[LaneGeometry] = None
         self._last_raw_center_x: Optional[float] = None
+        self._last_raw_heading: Optional[float] = None
         self._last_overlays: Tuple[list, list, list] = ([], [], [])
 
         # Vehicle-width virtual-lane hold state.
@@ -283,16 +285,19 @@ class BevCorridorLaneEstimator:
         raw_near_center_x = float(np.polyval(centerline_fit["fit"], near_target_y))
         raw_heading = self._heading_error(centerline_fit["fit"], height)
 
-        # Temporal gate: an outlier fit shows up as a big lookahead center_x jump.
-        # Reject the frame and coast on the last good geometry instead of letting
-        # the EMA follow it.
+        # Temporal gate: outlier fits show up as a big lookahead center_x or
+        # heading jump. Reject the frame and coast on the last good geometry
+        # instead of letting the EMA follow it.
         if self._is_center_jump(raw_center_x):
             return self._coast_or_lost(bev.shape, "center_jump")
+        if self._is_heading_jump(raw_heading):
+            return self._coast_or_lost(bev.shape, "heading_jump")
 
         self._coast_frames = 0
         self._virtual_hold_frames = 0
         self._virtual_center_x = None
         self._last_raw_center_x = raw_center_x
+        self._last_raw_heading = raw_heading
         self.last_class_name = class_name
         self.last_tier = tier
         self.last_centerline_bev = centerline_fit["points"]
@@ -629,6 +634,14 @@ class BevCorridorLaneEstimator:
         )
         return abs(raw_center_x - self._last_raw_center_x) > max_jump
 
+    def _is_heading_jump(self, raw_heading: float) -> bool:
+        if self._last_raw_heading is None:
+            return False
+        return (
+            abs(raw_heading - self._last_raw_heading)
+            > max(0.0, float(self.config.max_heading_jump))
+        )
+
     def _coast_or_lost(self, bev_shape: Tuple[int, int], reason: str) -> LaneGeometry:
         had_last = self._last_lane is not None
         # 1) Coast on the last good geometry for a few frames (momentary YOLO miss).
@@ -713,6 +726,7 @@ class BevCorridorLaneEstimator:
         self._smoothed_center_x = center_x
         self._smoothed_near_center_x = center_x
         self._last_raw_center_x = center_x
+        self._last_raw_heading = 0.0
         self._smoothed_heading = 0.0
 
         lateral_error_px = center_x - vehicle_center_x
@@ -738,6 +752,7 @@ class BevCorridorLaneEstimator:
         self._coast_frames = 0
         self._last_lane = None
         self._last_raw_center_x = None
+        self._last_raw_heading = None
         self._smoothed_center_x = None
         self._smoothed_near_center_x = None
         self._smoothed_heading = None

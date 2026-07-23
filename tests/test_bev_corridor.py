@@ -17,6 +17,16 @@ def line_mask(x: int, shape=(100, 200)) -> np.ndarray:
     return mask
 
 
+def slanted_line_mask(x_at_target: float, slope: float, shape=(100, 200)) -> np.ndarray:
+    mask = np.zeros(shape, dtype=np.uint8)
+    target_y = shape[0] * BevCorridorConfig.lookahead_y_ratio
+    for y in range(shape[0]):
+        x = int(round(x_at_target + slope * (y - target_y)))
+        if 0 <= x < shape[1] - 3:
+            mask[y, x : x + 4] = 255
+    return mask
+
+
 def crosswalk_mask(shape=(100, 200)) -> np.ndarray:
     mask = np.zeros(shape, dtype=np.uint8)
     mask[40:60, :] = 255
@@ -71,6 +81,30 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
 
         self.assertAlmostEqual(outlier.center_x, before.center_x)
         self.assertTrue(outlier.reason.startswith("coast:center_jump"))
+        self.assertEqual(estimator.last_class_name, "coast")
+
+    def test_heading_jump_gate_coasts_on_slanted_outlier(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lane_width_px=60.0,
+                center_smooth_alpha=1.0,
+                max_center_jump_px=80.0,
+                max_heading_jump=0.08,
+                vehicle_center_x_offset_ratio=0.0,
+            )
+        )
+
+        before = estimator.estimate(bev_at(60, crosswalk=False))
+        outlier = estimator.estimate(
+            BevClassMasks(
+                center=[slanted_line_mask(60.0, 0.25)],
+                center_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+
+        self.assertAlmostEqual(outlier.center_x, before.center_x)
+        self.assertTrue(outlier.reason.startswith("coast:heading_jump"))
         self.assertEqual(estimator.last_class_name, "coast")
 
     def test_crosswalk_option_b_follows_right_boundary_offset(self):
