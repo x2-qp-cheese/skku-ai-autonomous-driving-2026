@@ -337,11 +337,33 @@ class YoloLaneGeometryTest(unittest.TestCase):
         bev_config = build_bev_corridor_config(args)
         follower_config = build_follower_config(args)
 
-        self.assertEqual(bev_config.max_coast_frames, 10)
-        self.assertAlmostEqual(bev_config.max_center_jump_px, 80.0)
-        self.assertAlmostEqual(bev_config.crosswalk_max_center_jump_px, 30.0)
+        self.assertEqual(bev_config.max_coast_frames, 3)
+        self.assertAlmostEqual(bev_config.max_center_jump_px, 150.0)
+        self.assertAlmostEqual(bev_config.crosswalk_max_center_jump_px, 150.0)
         self.assertEqual(follower_config.lane_lost_hold_frames, 10)
-        self.assertEqual(follower_config.lane_lost_steering_release_rate_limit, 0)
+        self.assertEqual(follower_config.lane_lost_steering_release_rate_limit, 35)
+
+    def test_default_lane_following_uses_last_known_good_drive_tuning(self):
+        args = parse_args([])
+
+        bev_config = build_bev_corridor_config(args)
+        follower_config = build_follower_config(args)
+
+        self.assertAlmostEqual(bev_config.centerline_bias, 0.50)
+        self.assertAlmostEqual(bev_config.vehicle_center_x_offset_ratio, 0.04)
+        self.assertAlmostEqual(bev_config.max_heading_jump, 0.32)
+        self.assertEqual(follower_config.base_speed, 255)
+        self.assertEqual(follower_config.max_speed, 255)
+        self.assertEqual(follower_config.min_curve_speed, 255)
+        self.assertEqual(follower_config.max_steering, 150)
+        self.assertAlmostEqual(follower_config.kp_lateral, 205.0)
+        self.assertAlmostEqual(follower_config.kd_lateral, 75.0)
+        self.assertAlmostEqual(follower_config.curve_strength_alpha, 0.45)
+        self.assertAlmostEqual(follower_config.straight_steering_scale, 0.50)
+        self.assertAlmostEqual(follower_config.curve_steering_scale, 1.68)
+        self.assertAlmostEqual(follower_config.center_recovery_error_threshold, 0.12)
+        self.assertAlmostEqual(follower_config.center_recovery_steering_boost, 1.20)
+        self.assertEqual(follower_config.center_recovery_min_steering, 70)
 
     def test_lane_change_cli_defaults_are_external_ready_and_aggressive(self):
         args = parse_args([])

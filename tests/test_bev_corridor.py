@@ -131,6 +131,69 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
         self.assertEqual(lane.reason, "corridor_tier3")
         self.assertEqual(estimator.last_class_name, "crosswalk-right-side-b")
 
+    def test_crosswalk_option_b_holds_previous_right_lane_geometry(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lane_width_px=60.0,
+                crosswalk_option="b",
+                crosswalk_right_offset_px=30.0,
+                center_smooth_alpha=1.0,
+                crosswalk_center_smooth_alpha=1.0,
+                vehicle_center_x_offset_ratio=0.0,
+            )
+        )
+
+        before = estimator.estimate(
+            BevClassMasks(
+                center=[line_mask(60)],
+                side=[line_mask(120)],
+                center_conf=1.0,
+                side_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+        during = estimator.estimate(
+            BevClassMasks(
+                side=[line_mask(90)],
+                crosswalk=[crosswalk_mask()],
+                side_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+
+        self.assertTrue(during.found)
+        self.assertAlmostEqual(during.center_x, before.center_x, delta=0.2)
+        self.assertAlmostEqual(during.lateral_error_norm, before.lateral_error_norm)
+        self.assertEqual(estimator.last_class_name, "crosswalk-hold-right-lane")
+
+    def test_center_anchor_does_not_push_target_past_detected_right_boundary(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lane_width_px=120.0,
+                min_lane_width_px=60.0,
+                center_anchor=True,
+                centerline_bias=0.5,
+                center_smooth_alpha=1.0,
+                vehicle_center_x_offset_ratio=0.0,
+            )
+        )
+
+        lane = estimator.estimate(
+            BevClassMasks(
+                center=[line_mask(60)],
+                side=[line_mask(110)],
+                center_conf=1.0,
+                side_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+
+        self.assertTrue(lane.found)
+        self.assertEqual(lane.reason, "corridor_tier1")
+        self.assertEqual(estimator.last_class_name, "center+right-side")
+        self.assertAlmostEqual(lane.center_x, 86.5, delta=0.2)
+        self.assertLess(lane.center_x, 111.5)
+
     def test_disabled_obstacle_mode_skips_obstacle_bev_warp(self):
         transformer = CountingTransformer()
         masks = SimpleNamespace(

@@ -160,6 +160,118 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertFalse(fusion.observation.visual_detected)
         self.assertFalse(fusion.observation.fused_hazard)
 
+    def test_range_backed_visual_fallback_handles_ambiguous_path_overlap(self):
+        fusion = planner(
+            path_half_width_px=10.0,
+            range_visual_fallback_confidence=0.90,
+        )
+        change = controller()
+        ambiguous_path = obstacle_mask(158, 171, 45, 70)
+
+        first = fusion.update(
+            [ambiguous_path],
+            SHAPE,
+            CENTERLINE,
+            lane(),
+            change,
+            ultrasound(fc=850, fr=870, fl=890),
+            1.0,
+            True,
+            obstacle_confidence=0.95,
+        )
+        second = fusion.update(
+            [ambiguous_path],
+            SHAPE,
+            CENTERLINE,
+            lane(),
+            change,
+            ultrasound(fc=820, fr=840, fl=860),
+            1.1,
+            True,
+            obstacle_confidence=0.95,
+        )
+
+        self.assertIsNone(first)
+        self.assertIn("lane2 -> lane1", second)
+        self.assertTrue(fusion.observation.visual_detected)
+        self.assertTrue(fusion.observation.visual_confirmed)
+        self.assertEqual(change.state, "armed")
+
+    def test_outside_current_lane_obstacle_does_not_trigger_range_fallback(self):
+        fusion = planner(
+            min_path_overlap_ratio=0.10,
+            range_visual_fallback_confidence=0.90,
+        )
+        change = controller()
+        outside_lane = obstacle_mask(160, 199, 45, 70)
+
+        first = fusion.update(
+            [outside_lane],
+            SHAPE,
+            CENTERLINE,
+            lane(),
+            change,
+            ultrasound(fc=650, fr=670, fl=690),
+            1.0,
+            True,
+            obstacle_confidence=0.98,
+        )
+        second = fusion.update(
+            [outside_lane],
+            SHAPE,
+            CENTERLINE,
+            lane(),
+            change,
+            ultrasound(fc=620, fr=640, fl=660),
+            1.1,
+            True,
+            obstacle_confidence=0.98,
+        )
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertFalse(fusion.observation.visual_detected)
+        self.assertFalse(fusion.observation.fused_hazard)
+        self.assertEqual(change.state, "lane2")
+
+    def test_range_backed_visual_fallback_ignores_target_lane_obstacle(self):
+        fusion = planner(
+            visual_trigger_y_ratio=0.30,
+            target_block_y_ratio=0.95,
+            range_visual_fallback_confidence=0.90,
+        )
+        change = controller()
+        target_lane = obstacle_mask(70, 95, 35, 50)
+
+        first = fusion.update(
+            [target_lane],
+            SHAPE,
+            CENTERLINE,
+            lane(),
+            change,
+            ultrasound(fc=850, fr=870, fl=890),
+            1.0,
+            True,
+            obstacle_confidence=0.95,
+        )
+        second = fusion.update(
+            [target_lane],
+            SHAPE,
+            CENTERLINE,
+            lane(),
+            change,
+            ultrasound(fc=820, fr=840, fl=860),
+            1.1,
+            True,
+            obstacle_confidence=0.95,
+        )
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertTrue(fusion.observation.target_blocked)
+        self.assertFalse(fusion.observation.visual_detected)
+        self.assertEqual(change.state, "lane2")
+
     def test_frame_obstacle_caps_speed_before_it_enters_bev_roi(self):
         fusion = planner(
             visual_trigger_y_ratio=0.80,
@@ -904,6 +1016,12 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
                 "0.16",
                 "--obstacle-action-confidence",
                 "0.78",
+                "--obstacle-range-visual-fallback",
+                "off",
+                "--obstacle-range-visual-confidence",
+                "0.92",
+                "--obstacle-current-path-max-distance-ratio",
+                "0.54",
                 "--obstacle-trigger-mm",
                 "900",
                 "--obstacle-min-front-sensors",
@@ -938,6 +1056,9 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertAlmostEqual(config.visual_trigger_y_ratio, 0.60)
         self.assertAlmostEqual(config.frame_visual_trigger_y_ratio, 0.16)
         self.assertAlmostEqual(config.visual_action_confidence, 0.78)
+        self.assertFalse(config.range_visual_fallback_enabled)
+        self.assertAlmostEqual(config.range_visual_fallback_confidence, 0.92)
+        self.assertAlmostEqual(config.max_current_path_distance_ratio, 0.54)
         self.assertEqual(config.ultrasonic_trigger_mm, 900.0)
         self.assertEqual(config.min_front_sensors, 2)
         self.assertEqual(config.range_confirm_frames, 3)
@@ -962,10 +1083,13 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertEqual(fusion.ultrasonic_trigger_mm, 2600.0)
         self.assertEqual(fusion.ultrasonic_clear_mm, 2900.0)
         self.assertAlmostEqual(resolve_lane_change_target_width_px(args), 120.0)
-        self.assertEqual(lane_config.target_lane_width_px, 0.0)
+        self.assertEqual(lane_config.target_lane_width_px, 120.0)
         self.assertEqual(fusion.lane_width_px, 120.0)
         self.assertEqual(fusion.speed_cap, 255)
         self.assertEqual(fusion.approach_speed_cap, 255)
+        self.assertTrue(fusion.range_visual_fallback_enabled)
+        self.assertAlmostEqual(fusion.range_visual_fallback_confidence, 0.90)
+        self.assertAlmostEqual(fusion.max_current_path_distance_ratio, 0.58)
         self.assertAlmostEqual(fusion.frame_visual_trigger_y_ratio, 0.10)
         self.assertAlmostEqual(fusion.target_block_y_ratio, 0.65)
         self.assertAlmostEqual(fusion.frame_target_block_y_ratio, 0.65)

@@ -316,6 +316,8 @@ class LaneChangeController:
     ) -> ControlCommand:
         if command.brake:
             return command
+        if self._uses_avoidance_profile(result.state):
+            return self._apply_stabilizing_steering(command, result)
         if not result.lane_reliable and self.speed_cap_active(result):
             cap = max(0, int(self.config.unreliable_steering_cap))
             steering = self._clip(command.steering, -cap, cap)
@@ -330,8 +332,6 @@ class LaneChangeController:
                 brake=False,
                 reason=reason,
             )
-        if self._uses_avoidance_profile(result.state):
-            return self._apply_stabilizing_steering(command, result)
         if result.direction == 0:
             return command
         if self.config.steering_min <= 0 and self.config.steering_boost <= 0:

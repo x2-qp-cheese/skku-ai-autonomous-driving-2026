@@ -27,8 +27,11 @@ class ObstacleFusionConfig:
     frame_path_half_width_scale: float = 0.42
     frame_min_path_half_width_px: float = 12.0
     min_path_overlap_ratio: float = 0.15
+    max_current_path_distance_ratio: float = 0.58
     contact_band_ratio: float = 0.25
     visual_action_confidence: float = 0.75
+    range_visual_fallback_enabled: bool = True
+    range_visual_fallback_confidence: float = 0.90
     visual_confirm_frames: int = 2
     visual_clear_frames: int = 2
 
@@ -106,12 +109,17 @@ class PathOccupancy:
     bottom_y_ratio: float
     current_overlap: float
     target_overlap: float
+    current_distance_px: float = 0.0
+    target_distance_px: float = 0.0
+    current_distance_ratio: float = 0.0
+    target_distance_ratio: float = 0.0
 
 
 @dataclass(frozen=True)
 class PathAssessment:
     current_detected: bool = False
     target_blocked: bool = False
+    range_fallback_candidate: bool = False
     closest_y_ratio: float = 0.0
     obstacle_count: int = 0
 
@@ -207,16 +215,11 @@ class ObstacleFusionPlanner:
             frame_paths,
             path_lane,
         )
-        raw_visual = (
+        raw_path_visual = (
             bev_assessment.current_detected
             or frame_assessment.current_detected
         )
         visual_confidence = max(0.0, min(1.0, float(obstacle_confidence)))
-        visual = (
-            raw_visual
-            and visual_confidence
-            >= max(0.0, float(self.config.visual_action_confidence))
-        )
         target_blocked = (
             bev_assessment.target_blocked
             or frame_assessment.target_blocked
@@ -239,12 +242,20 @@ class ObstacleFusionPlanner:
         )
         front_mm = ultrasonic.front_min_mm
         front_count = ultrasonic.front_fresh_count
+        obstacle_count = max(
+            bev_assessment.obstacle_count,
+            frame_assessment.obstacle_count,
+        )
 
         if not running:
             self.reset()
             self.observation = ObstacleFusionObservation(
-                visual_detected=raw_visual,
-                visual_actionable=visual,
+                visual_detected=raw_path_visual,
+                visual_actionable=(
+                    raw_path_visual
+                    and visual_confidence
+                    >= max(0.0, float(self.config.visual_action_confidence))
+                ),
                 visual_confidence=visual_confidence,
                 target_blocked=target_blocked,
                 solid_blocked=solid_blocked,
@@ -252,18 +263,28 @@ class ObstacleFusionPlanner:
                 path_lane=path_lane,
                 closest_y_ratio=bev_assessment.closest_y_ratio,
                 frame_y_ratio=frame_assessment.closest_y_ratio,
-                obstacle_count=max(
-                    bev_assessment.obstacle_count,
-                    frame_assessment.obstacle_count,
-                ),
+                obstacle_count=obstacle_count,
                 front_mm=front_mm,
                 front_sensor_count=front_count,
             )
             return None
 
         stable_lane = lane_change.state in ("lane2", "completed", "lane1")
-        self._update_visual_state(visual)
         self._update_range_state(ultrasonic, now)
+        raw_visual = raw_path_visual or self._range_visual_fallback(
+            raw_path_visual,
+            target_blocked,
+            bev_assessment.range_fallback_candidate
+            or frame_assessment.range_fallback_candidate,
+            obstacle_count,
+            visual_confidence,
+        )
+        visual = (
+            raw_visual
+            and visual_confidence
+            >= max(0.0, float(self.config.visual_action_confidence))
+        )
+        self._update_visual_state(visual)
         self._update_rearm_state(raw_visual, stable_lane)
         self._update_path_plan(
             path_lane,
@@ -309,10 +330,7 @@ class ObstacleFusionPlanner:
             path_lane=path_lane,
             closest_y_ratio=bev_assessment.closest_y_ratio,
             frame_y_ratio=frame_assessment.closest_y_ratio,
-            obstacle_count=max(
-                bev_assessment.obstacle_count,
-                frame_assessment.obstacle_count,
-            ),
+            obstacle_count=obstacle_count,
             visual_frames=self._visual_frames,
             front_mm=front_mm,
             front_sensor_count=front_count,
@@ -338,6 +356,28 @@ class ObstacleFusionPlanner:
                 self._clear_path_plan()
                 return event
         return None
+
+    def _range_visual_fallback(
+        self,
+        raw_path_visual: bool,
+        target_blocked: bool,
+        range_fallback_candidate: bool,
+        obstacle_count: int,
+        visual_confidence: float,
+    ) -> bool:
+        if not self.config.range_visual_fallback_enabled:
+            return False
+        if raw_path_visual or target_blocked or obstacle_count <= 0:
+            return False
+        if not range_fallback_candidate:
+            return False
+        if not self._range_hazard:
+            return False
+        required_confidence = max(
+            max(0.0, float(self.config.visual_action_confidence)),
+            max(0.0, float(self.config.range_visual_fallback_confidence)),
+        )
+        return visual_confidence >= required_confidence
 
     def apply_safety(
         self,
@@ -666,6 +706,9 @@ class ObstacleFusionPlanner:
                 float(binary.shape[1]) / 2.0,
             )
             lane_spacing = np.abs(current_x - target_x)
+            safe_lane_spacing = np.maximum(1.0, lane_spacing)
+            current_distance = np.abs(contact_xs - current_x)
+            target_distance = np.abs(contact_xs - target_x)
             half_width = np.maximum(
                 max(1.0, self.config.frame_min_path_half_width_px),
                 lane_spacing * max(0.0, self.config.frame_path_half_width_scale),
@@ -678,6 +721,14 @@ class ObstacleFusionPlanner:
                     ),
                     target_overlap=float(
                         np.mean(np.abs(contact_xs - target_x) <= half_width)
+                    ),
+                    current_distance_px=float(np.mean(current_distance)),
+                    target_distance_px=float(np.mean(target_distance)),
+                    current_distance_ratio=float(
+                        np.mean(current_distance / safe_lane_spacing)
+                    ),
+                    target_distance_ratio=float(
+                        np.mean(target_distance / safe_lane_spacing)
                     ),
                 )
             )
@@ -759,20 +810,27 @@ class ObstacleFusionPlanner:
         if len(contact_ys) == 0:
             return None
         base_x = self._center_x_at(contact_ys, base_centerline, fallback_x)
+        current_x = base_x + current_offset
+        target_x = base_x + target_offset
+        current_distance = np.abs(contact_xs - current_x)
+        target_distance = np.abs(contact_xs - target_x)
+        lane_spacing = max(1.0, abs(float(current_offset) - float(target_offset)))
         return PathOccupancy(
             bottom_y_ratio=max_y / float(max(1, binary.shape[0] - 1)),
             current_overlap=float(
                 np.mean(
-                    np.abs(contact_xs - (base_x + current_offset))
-                    <= half_width
+                    current_distance <= half_width
                 )
             ),
             target_overlap=float(
                 np.mean(
-                    np.abs(contact_xs - (base_x + target_offset))
-                    <= half_width
+                    target_distance <= half_width
                 )
             ),
+            current_distance_px=float(np.mean(current_distance)),
+            target_distance_px=float(np.mean(target_distance)),
+            current_distance_ratio=float(np.mean(current_distance / lane_spacing)),
+            target_distance_ratio=float(np.mean(target_distance / lane_spacing)),
         )
 
     def _assess_measurements(
@@ -782,21 +840,63 @@ class ObstacleFusionPlanner:
         target_y_threshold: float,
     ) -> PathAssessment:
         overlap_min = max(0.0, min(1.0, self.config.min_path_overlap_ratio))
+        max_current_distance = max(
+            0.0,
+            float(self.config.max_current_path_distance_ratio),
+        )
+        dominance_margin_px = 5.0
+
+        def inside_current_path(item: PathOccupancy) -> bool:
+            return item.current_distance_ratio <= max_current_distance
+
+        def current_preferred(item: PathOccupancy) -> bool:
+            return (
+                item.current_overlap >= item.target_overlap
+                and item.current_distance_px
+                <= item.target_distance_px + dominance_margin_px
+            )
+
+        def target_preferred(item: PathOccupancy) -> bool:
+            if item.target_overlap >= overlap_min and (
+                item.target_overlap > item.current_overlap
+            ):
+                return True
+            return (
+                item.target_distance_px + dominance_margin_px
+                < item.current_distance_px
+            )
+
         current = [
             item
             for item in measurements
             if item.bottom_y_ratio >= current_y_threshold
             and item.current_overlap >= overlap_min
-            and item.current_overlap >= item.target_overlap
+            and inside_current_path(item)
+            and current_preferred(item)
+        ]
+        target_lookahead = [
+            item
+            for item in measurements
+            if item.bottom_y_ratio >= current_y_threshold
+            and target_preferred(item)
         ]
         target_blocked = any(
             item.bottom_y_ratio >= target_y_threshold
             and item.target_overlap >= overlap_min
+            and target_preferred(item)
+            for item in measurements
+        ) or bool(target_lookahead)
+        range_fallback = any(
+            item.bottom_y_ratio >= current_y_threshold
+            and inside_current_path(item)
+            and current_preferred(item)
+            and not target_preferred(item)
             for item in measurements
         )
         return PathAssessment(
             current_detected=bool(current),
             target_blocked=target_blocked,
+            range_fallback_candidate=range_fallback,
             closest_y_ratio=max(
                 (item.bottom_y_ratio for item in current),
                 default=0.0,

@@ -772,7 +772,7 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument(
         "--lane-lost-steering-release-rate-limit",
         type=int,
-        default=0,
+        default=35,
         help="during lane-lost hold, release cached steering toward 0 by this many units/frame; default=max(min-steering-rate-limit, steering-release-rate-limit), 0 keeps the old cached steering",
     )
     parser.add_argument(
@@ -851,7 +851,7 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument(
         "--corridor-max-center-jump",
         type=float,
-        default=BevCorridorConfig.max_center_jump_px,
+        default=150.0,
         help="[--bev-corridor] reject and coast a frame whose lookahead center_x jumps more than this many BEV px (lower = smoother, more likely to briefly coast on real fast curves)",
     )
     parser.add_argument(
@@ -863,7 +863,7 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument(
         "--corridor-max-coast-frames",
         type=int,
-        default=10,
+        default=3,
         help="[--bev-corridor] hold the last good geometry for at most this many rejected frames before declaring the lane lost",
     )
     parser.add_argument(
@@ -899,7 +899,7 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument(
         "--corridor-centerline-bias",
         type=float,
-        default=0.40,
+        default=0.50,
         help="[--bev-corridor] driving line position between boundaries: 0=center line, 0.5=midpoint, 1=outer side line. Raise if the car rides too far inside",
     )
     parser.add_argument(
@@ -917,7 +917,7 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument(
         "--corridor-crosswalk-max-center-jump",
         type=float,
-        default=BevCorridorConfig.crosswalk_max_center_jump_px,
+        default=150.0,
         help="[--bev-corridor] reject and coast a crosswalk frame whose center_x jumps more than this many BEV px",
     )
     parser.add_argument(
@@ -966,8 +966,8 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument(
         "--vehicle-center-offset",
         type=float,
-        default=0.085,
-        help="vehicle center x offset as frame width ratio; positive shifts the vehicle center right (camera is mounted left of the car centerline), so centered targets steer left. Default matches the last good run (~0.585 frame x)",
+        default=BevCorridorConfig.vehicle_center_x_offset_ratio,
+        help="vehicle center x offset as frame width ratio; positive shifts the vehicle center right (camera is mounted left of the car centerline), so centered targets steer left",
     )
     parser.add_argument(
         "--pure-pursuit",

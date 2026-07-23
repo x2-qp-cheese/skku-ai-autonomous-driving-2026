@@ -608,6 +608,48 @@ class LaneChangeControllerTest(unittest.TestCase):
         self.assertEqual(adjusted.steering, 70)
         self.assertIn("lane_change_stabilize", adjusted.reason)
 
+    def test_unreliable_avoidance_stabilization_still_forces_return_steering(self):
+        self.controller = LaneChangeController(
+            LaneChangeConfig(
+                mode="external",
+                stabilizing_steering_min=90,
+                steering_cap=150,
+                target_capture_error=0.20,
+                target_capture_frames=1,
+                stable_required_frames=5,
+                unreliable_steering_cap=90,
+            )
+        )
+        self.controller.request_avoidance("obstacle_fusion")
+        self.controller.update(lane(), 150.0, 800.0, 0.0, True)
+        captured = self.controller.update(
+            lane_for_target_error(lateral_error_norm=0.05, heading=0.30),
+            150.0,
+            800.0,
+            0.1,
+            True,
+            lane_reliable=True,
+        )
+        stabilizing = self.controller.update(
+            lane_for_target_error(lateral_error_norm=0.17, heading=0.43),
+            150.0,
+            800.0,
+            0.2,
+            True,
+            lane_reliable=False,
+        )
+
+        adjusted = self.controller.apply_steering_assist(
+            ControlCommand(speed=255, steering=40, reason="lane"),
+            stabilizing,
+        )
+
+        self.assertEqual(captured.state, "stabilizing_lane1")
+        self.assertEqual(stabilizing.state, "stabilizing_lane1")
+        self.assertFalse(stabilizing.lane_reliable)
+        self.assertEqual(adjusted.steering, 90)
+        self.assertIn("lane_change_stabilize", adjusted.reason)
+
     def test_target_capture_requires_consecutive_frames(self):
         self.controller = LaneChangeController(
             LaneChangeConfig(

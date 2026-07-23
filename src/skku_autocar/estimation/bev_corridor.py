@@ -60,13 +60,12 @@ class BevCorridorConfig:
     poly_degree: int = 2
     min_line_area_ratio: float = 0.0003
 
-    # The camera is mounted slightly left of the car's true centerline, so the
-    # true vehicle center sits a bit RIGHT of the frame center. Measured off the
-    # last good run (blue vehicle-axis marker at frame x-ratio ~0.585), so the
-    # lateral-error reference is width*(0.5 + 0.085). Positive = shift the vehicle
-    # center right (a centered road then reads as slightly left -> steers left).
+    # The camera is mounted slightly left of the car's true centerline, but the
+    # full-speed S-curve runs showed x=0.585 over-biases the reference and makes
+    # the car cut toward the center line. Keep a smaller rightward offset so the
+    # visible vehicle axis and the control reference stay closer together.
     # Tune with --vehicle-center-offset.
-    vehicle_center_x_offset_ratio: float = 0.085
+    vehicle_center_x_offset_ratio: float = 0.04
     # Where the driving centerline sits between the two lane boundaries:
     # 0.0 = on the center line (innermost), 0.5 = midpoint (geometric center),
     # 1.0 = on the outer side line. Raise above 0.5 if the car rides too far inside
@@ -131,7 +130,7 @@ class BevCorridorConfig:
     # max_coast_frames before declaring the lane lost. Coast confidence decays
     # each held frame.
     max_center_jump_px: float = 80.0
-    max_heading_jump: float = 0.22
+    max_heading_jump: float = 0.32
     max_coast_frames: int = 10
     coast_confidence_decay: float = 0.8
 
@@ -271,6 +270,11 @@ class BevCorridorLaneEstimator:
         self._crosswalk_active = self.last_crosswalk_visible
         if self._crosswalk_active:
             self.last_lane_width_px = self.config.crosswalk_lane_width_px
+            if (
+                self.config.crosswalk_option.lower() == "b"
+                and self._last_lane is not None
+            ):
+                return self._hold_crosswalk_lane()
 
         center_fit = self._fit_line(bev.center, bev.shape)
         side_fits = [f for f in (self._fit_line([m], bev.shape) for m in bev.side) if f]
@@ -390,7 +394,11 @@ class BevCorridorLaneEstimator:
                     # the real side line only refines the width (via _update_width)
                     # so its jitter does not reach the centerline. Overlay still
                     # shows the real detected side.
-                    right_boundary = self._offset(center_fit, width_px) if self.config.center_anchor else right
+                    right_boundary = (
+                        self._bounded_right_boundary(center_fit, right, width_px)
+                        if self.config.center_anchor
+                        else right
+                    )
                     name = "center+right-side"
                 midline = self._midline(center_fit, right_boundary)
                 if midline is not None:
@@ -557,6 +565,34 @@ class BevCorridorLaneEstimator:
         points = [(float(x), float(y)) for x, y in zip(xc, ys)]
         return {"fit": fit, "min_y": float(y0), "max_y": float(y1), "n": len(ys), "points": points}
 
+    def _bounded_right_boundary(self, center_fit: dict, right_fit: dict, width_px: float) -> dict:
+        import numpy as np
+
+        y0 = max(center_fit["min_y"], right_fit["min_y"])
+        y1 = min(center_fit["max_y"], right_fit["max_y"])
+        if y1 - y0 < 1.0:
+            return self._offset(center_fit, width_px)
+
+        ys = np.linspace(y0, y1, self.config.num_samples)
+        center_x = np.polyval(center_fit["fit"], ys)
+        virtual_right_x = center_x + max(0.0, float(width_px))
+        detected_right_x = np.polyval(right_fit["fit"], ys)
+        min_right_x = center_x + max(1.0, float(self.config.side_min_gap_px))
+        bounded_x = np.maximum(
+            min_right_x,
+            np.minimum(virtual_right_x, detected_right_x),
+        )
+        degree = min(self.config.poly_degree, len(ys) - 1)
+        fit = np.polyfit(ys, bounded_x, degree)
+        points = [(float(x), float(y)) for x, y in zip(bounded_x, ys)]
+        return {
+            "fit": fit,
+            "min_y": float(y0),
+            "max_y": float(y1),
+            "n": len(ys),
+            "points": points,
+        }
+
     def _line_points(self, fit_info: Optional[dict], num: int = 20) -> List[Tuple[float, float]]:
         import numpy as np
 
@@ -679,6 +715,28 @@ class BevCorridorLaneEstimator:
         self.last_class_name = "none"
         self.last_tier = 0
         return self._lost(bev_shape, ("lost:%s" % reason) if had_last else reason)
+
+    def _hold_crosswalk_lane(self) -> LaneGeometry:
+        prev = self._last_lane
+        assert prev is not None
+        self.last_class_name = "crosswalk-hold-right-lane"
+        self.last_centerline_bev, self.last_center_line_bev, self.last_right_line_bev = self._last_overlays
+        return LaneGeometry(
+            found=True,
+            center_x=prev.center_x,
+            vehicle_center_x=prev.vehicle_center_x,
+            target_y=prev.target_y,
+            lateral_error_px=prev.lateral_error_px,
+            lateral_error_norm=prev.lateral_error_norm,
+            heading_error=prev.heading_error,
+            confidence=prev.confidence,
+            reason=prev.reason,
+            height=prev.height,
+            near_center_x=prev.near_center_x,
+            near_target_y=prev.near_target_y,
+            near_lateral_error_px=prev.near_lateral_error_px,
+            near_lateral_error_norm=prev.near_lateral_error_norm,
+        )
 
     def _virtual_hold_lane(self, bev_shape: Tuple[int, int], reason: str) -> LaneGeometry:
         """Last-resort fallback: no lane evidence remains, so build a straight

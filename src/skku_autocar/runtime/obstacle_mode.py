@@ -368,8 +368,11 @@ def build_obstacle_fusion_config(args: argparse.Namespace) -> ObstacleFusionConf
         path_half_width_px=args.obstacle_path_half_width_px,
         frame_path_half_width_scale=args.obstacle_frame_path_width_scale,
         min_path_overlap_ratio=args.obstacle_min_overlap,
+        max_current_path_distance_ratio=args.obstacle_current_path_max_distance_ratio,
         contact_band_ratio=args.obstacle_contact_band,
         visual_action_confidence=args.obstacle_action_confidence,
+        range_visual_fallback_enabled=args.obstacle_range_visual_fallback == "on",
+        range_visual_fallback_confidence=args.obstacle_range_visual_confidence,
         visual_confirm_frames=args.obstacle_visual_confirm_frames,
         visual_clear_frames=args.obstacle_visual_clear_frames,
         ultrasonic_trigger_mm=args.obstacle_trigger_mm,
@@ -477,7 +480,7 @@ def add_obstacle_arguments(parser: argparse.ArgumentParser) -> None:
         ("--lane-change-stable-heading-error", float, LaneChangeConfig.stable_heading_error),
         ("--lane-change-stable-near-error", float, LaneChangeConfig.stable_near_lateral_error),
         ("--lane-change-stable-frames", int, LaneChangeConfig.stable_required_frames),
-        ("--lane-change-target-width-px", float, LaneChangeConfig.target_lane_width_px),
+        ("--lane-change-target-width-px", float, 120.0),
         ("--lane-change-target-approach-error", float, 0.20),
         ("--lane-change-target-capture-frames", int, LaneChangeConfig.target_capture_frames),
     )
@@ -510,8 +513,10 @@ def add_obstacle_arguments(parser: argparse.ArgumentParser) -> None:
         ("--obstacle-path-half-width-px", float, ObstacleFusionConfig.path_half_width_px),
         ("--obstacle-frame-path-width-scale", float, ObstacleFusionConfig.frame_path_half_width_scale),
         ("--obstacle-min-overlap", float, ObstacleFusionConfig.min_path_overlap_ratio),
+        ("--obstacle-current-path-max-distance-ratio", float, ObstacleFusionConfig.max_current_path_distance_ratio),
         ("--obstacle-contact-band", float, ObstacleFusionConfig.contact_band_ratio),
         ("--obstacle-action-confidence", float, ObstacleFusionConfig.visual_action_confidence),
+        ("--obstacle-range-visual-confidence", float, ObstacleFusionConfig.range_visual_fallback_confidence),
         ("--obstacle-visual-confirm-frames", int, 2),
         ("--obstacle-visual-clear-frames", int, ObstacleFusionConfig.visual_clear_frames),
         ("--obstacle-trigger-mm", float, 2600.0),
@@ -533,6 +538,12 @@ def add_obstacle_arguments(parser: argparse.ArgumentParser) -> None:
     )
     for name, value_type, default in obstacle_specs:
         group.add_argument(name, type=value_type, default=default)
+    group.add_argument(
+        "--obstacle-range-visual-fallback",
+        choices=("on", "off"),
+        default="on",
+        help="allow high-confidence YOLO plus confirmed front range to trigger when path overlap is ambiguous",
+    )
     group.add_argument(
         "--obstacle-emergency-stop",
         choices=("on", "off"),
