@@ -25,7 +25,6 @@ from ..perception.yolo_lane import YoloLaneConfig, YoloLaneSegmenter
 from ..planning.t_parking_planner import ParkingPlan, ParkingState, TParkingPlanner
 from ..sensors.lidar import LidarScan, load_lidar_csv
 from .parking_app import (
-    LOCKED_SLOT_STATES,
     compose_parking_dashboard,
     draw_camera_alignment_line,
     draw_lidar_debug,
@@ -34,6 +33,7 @@ from .parking_app import (
     extract_recording_zip,
     make_locked_slot_geometry,
     parking_mask_color,
+    slot_lock_requested,
 )
 
 
@@ -448,7 +448,7 @@ class SharedParkingPlannerReplay:
         self.state = replay_state_for_planner(plan.state)
         if plan.state == ParkingState.TRACK_GAP:
             self.positioning_phase = ReplayPositioningPhase.TRACK_FIRST_CAR
-        elif plan.state == ParkingState.PREALIGN_LEFT:
+        elif plan.state in (ParkingState.PREALIGN_LEFT, ParkingState.ENTRY_SETUP):
             self.positioning_phase = ReplayPositioningPhase.PREALIGN_LEFT
         elif plan.state == ParkingState.POSITION_REAR_AXLE:
             self.positioning_phase = ReplayPositioningPhase.ALIGN_REAR_AXLE
@@ -469,6 +469,7 @@ def replay_state_for_planner(state: ParkingState) -> ReplayParkingState:
     if state in (
         ParkingState.POSITION_REAR_AXLE,
         ParkingState.PREALIGN_LEFT,
+        ParkingState.ENTRY_SETUP,
         ParkingState.EXIT_RIGHT,
         ParkingState.EXIT_STRAIGHT,
     ):
@@ -695,7 +696,7 @@ def simulate_scans(
         lidar_geometry = locked_slot_geometry.update(
             lidar,
             lidar_estimator.vehicle_points(scan),
-            lock_requested=controller.planner_state in LOCKED_SLOT_STATES,
+            lock_requested=slot_lock_requested(controller.planner_state, lidar),
         )
         geometry = fuse_parking_geometry(
             lidar_geometry,
@@ -921,8 +922,9 @@ def run_visual_replay(
                 lidar_geometry = locked_slot_geometry.update(
                     current_lidar,
                     lidar_estimator.vehicle_points(current_scan),
-                    lock_requested=(
-                        controller.planner_state in LOCKED_SLOT_STATES
+                    lock_requested=slot_lock_requested(
+                        controller.planner_state,
+                        current_lidar,
                     ),
                 )
                 geometry = fuse_parking_geometry(

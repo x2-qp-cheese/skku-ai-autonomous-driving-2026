@@ -4,7 +4,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional, Sequence
 
 from ..types import ControlCommand
 from .protocol import encode_command
@@ -62,16 +62,34 @@ def _valid_ultrasonic_mm(value: float) -> Optional[float]:
     return value if value > 0.0 else None
 
 
-def find_arduino_port(explicit_port: Optional[str] = None) -> Optional[str]:
-    if explicit_port:
-        return explicit_port
+def find_arduino_port(
+    explicit_port: Optional[str] = None,
+    ports: Optional[Sequence[Any]] = None,
+    exists: Optional[Callable[[str], bool]] = None,
+) -> Optional[str]:
+    exists = exists or _device_exists
+    requested = (
+        None
+        if explicit_port is None or explicit_port.strip().lower() in ("", "auto")
+        else explicit_port
+    )
+    if requested is not None:
+        upper = requested.upper()
+        if requested.startswith("/dev/") and not exists(requested):
+            requested = None
+        elif upper.startswith("COM") and upper[3:].isdigit():
+            return requested
+        else:
+            return requested
 
-    try:
-        from serial.tools import list_ports
-    except ImportError as exc:
-        raise RuntimeError("pyserial is required for Arduino serial control") from exc
-
-    ports = list(list_ports.comports())
+    if ports is None:
+        try:
+            from serial.tools import list_ports
+        except ImportError as exc:
+            raise RuntimeError("pyserial is required for Arduino serial control") from exc
+        ports = list(list_ports.comports())
+    else:
+        ports = list(ports)
     # macOS exposes the same USB serial device as both /dev/tty.* and /dev/cu.*.
     # The cu device is the correct endpoint for an app initiating the connection;
     # preferring it also avoids a lexicographic tie accidentally selecting tty.
@@ -105,14 +123,32 @@ def _score_port(port: Any) -> int:
         return 0
 
     score = 0
-    for token in ("arduino", "usbmodem", "usbserial", "wchusbserial", "ch340", "cp210", "ttyacm"):
+    priority_tokens = (
+        ("arduino", 40),
+        ("usbmodem", 35),
+        ("ttyacm", 30),
+        ("wchusbserial", 14),
+        ("ch340", 14),
+        ("cp210", 12),
+        ("usbserial", 3),
+    )
+    for token, value in priority_tokens:
         if token in text:
-            score += 10
+            score += value
     if "vid:pid" in text:
         score += 2
     if "com" in str(getattr(port, "device", "")).lower():
         score += 1
     return score
+
+
+def _device_exists(path: str) -> bool:
+    try:
+        from pathlib import Path
+
+        return Path(path).exists()
+    except OSError:
+        return False
 
 
 class SerialVehicleClient:

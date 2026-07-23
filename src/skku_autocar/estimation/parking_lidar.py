@@ -100,8 +100,8 @@ class LidarParkingConfig:
     # car may move into the left half of the vehicle frame while turning.
     gap_center_x_min_mm: float = 0.0
     gap_center_y_back_min_mm: float = 200.0
-    gap_confirm_scans: int = 3
-    gap_candidate_hold_s: float = 1.2
+    gap_confirm_scans: int = 2
+    gap_candidate_hold_s: float = 0.45
     gap_single_cluster_track_enabled: bool = True
     gap_single_cluster_max_edge_jump_mm: float = 700.0
     gap_coast_scans: int = 15
@@ -119,7 +119,7 @@ class LidarParkingConfig:
     # useful early trigger, before the second bordering car is visible.  With
     # the rear-mounted LiDAR, -650 mm places that surface roughly 350 mm ahead
     # of the provisional rear axle (-300 mm).
-    first_car_confirm_scans: int = 6
+    first_car_confirm_scans: int = 3
     first_car_min_x_right_mm: float = 450.0
     # A lone weak cluster must not be enough to start the parking maneuver.
     # People and cable reflections often produce one or two LiDAR points on the

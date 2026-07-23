@@ -27,6 +27,7 @@ class ParkingYoloConfig:
 class ParkingRuntimeConfig:
     auto_start: bool = False
     camera_enabled: bool = True
+    front_camera_enabled: bool = True
     command_rate_hz: float = 20.0
     lidar_video_offset_s: float = 0.0
     require_lidar: bool = True
@@ -55,6 +56,7 @@ class ParkingRuntimeConfig:
 @dataclass(frozen=True)
 class ParkingAppConfig:
     rear_camera: CameraConfig
+    front_camera: CameraConfig
     serial: SerialConfig
     yolo: ParkingYoloConfig
     bev: BevConfig
@@ -91,6 +93,7 @@ def load_parking_config(path: str) -> ParkingAppConfig:
 
     return ParkingAppConfig(
         rear_camera=CameraConfig(**section(data, "rear_camera")),
+        front_camera=CameraConfig(**section(data, "front_camera")),
         serial=SerialConfig(**section(data, "serial")),
         yolo=ParkingYoloConfig(**section(data, "yolo")),
         bev=BevConfig(**section(data, "bev")),

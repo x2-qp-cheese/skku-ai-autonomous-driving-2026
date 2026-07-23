@@ -1,6 +1,11 @@
 import unittest
+from types import SimpleNamespace
 
-from skku_autocar.control.serial_vehicle import is_ready_line, parse_ultrasonic_line
+from skku_autocar.control.serial_vehicle import (
+    find_arduino_port,
+    is_ready_line,
+    parse_ultrasonic_line,
+)
 from skku_autocar.runtime.parking_app import newest_ultrasonic_sample
 
 
@@ -32,6 +37,44 @@ class SerialVehicleUltrasonicTest(unittest.TestCase):
 
         self.assertEqual(sample.side_right_mm, 500.0)
         self.assertEqual(sample.side_left_mm, 600.0)
+
+    def test_arduino_auto_detect_prefers_usbmodem_over_lidar_usbserial(self):
+        ports = (
+            SimpleNamespace(
+                device="/dev/cu.usbserial-1130",
+                description="USB Serial",
+                hwid="VID:PID=1A86:7523",
+                manufacturer="wch.cn",
+            ),
+            SimpleNamespace(
+                device="/dev/cu.usbmodem11101",
+                description="Arduino USB Modem",
+                hwid="VID:PID=2341:0043",
+                manufacturer="Arduino",
+            ),
+        )
+
+        selected = find_arduino_port("auto", ports=ports)
+
+        self.assertEqual(selected, "/dev/cu.usbmodem11101")
+
+    def test_missing_dev_placeholder_falls_back_to_detected_arduino(self):
+        ports = (
+            SimpleNamespace(
+                device="/dev/cu.usbmodem11101",
+                description="Arduino USB Modem",
+                hwid="VID:PID=2341:0043",
+                manufacturer="Arduino",
+            ),
+        )
+
+        selected = find_arduino_port(
+            "/dev/tty.usbmodem-ARDUINO",
+            ports=ports,
+            exists=lambda _: False,
+        )
+
+        self.assertEqual(selected, "/dev/cu.usbmodem11101")
 
 
 if __name__ == "__main__":

@@ -44,6 +44,7 @@ ROOT = Path(__file__).resolve().parents[3]
 LOCKED_SLOT_STATES = frozenset(
     (
         ParkingState.VERIFY_SLOT_BOX,
+        ParkingState.ENTRY_SETUP,
         ParkingState.PLAN_REVERSE_PATH,
         ParkingState.FOLLOW_ENTRY_CURVE,
         ParkingState.FOLLOW_SLOT_CENTER,
@@ -52,6 +53,17 @@ LOCKED_SLOT_STATES = frozenset(
         ParkingState.PARKED,
     )
 )
+
+
+def slot_lock_requested(
+    state: ParkingState,
+    observation: LidarParkingObservation,
+) -> bool:
+    return (
+        state in LOCKED_SLOT_STATES
+        or observation.gap_confirmed
+        or (observation.gap_found and observation.gap_pair_observed)
+    )
 
 
 class DashboardVideoRecorder:
@@ -230,8 +242,18 @@ def run_prepared(args: argparse.Namespace) -> int:
     )
     camera_enabled = config.runtime.camera_enabled
     source = str(args.source) if args.source is not None else str(config.rear_camera.index)
+    front_source = (
+        str(args.front_source)
+        if args.front_source is not None
+        else str(config.front_camera.index)
+    )
     is_video = camera_enabled and not source.isdigit() and not is_auto_camera_source(source)
     is_replay = is_video or (not camera_enabled and args.lidar_csv is not None)
+    front_camera_enabled = (
+        config.runtime.front_camera_enabled
+        and camera_enabled
+        and not is_video
+    )
     if is_replay and args.serial:
         raise RuntimeError(
             "--serial is forbidden for recorded replay; use live LiDAR/camera input"
@@ -284,6 +306,7 @@ def run_prepared(args: argparse.Namespace) -> int:
         raise RuntimeError("LiDAR is required: pass --lidar-csv, --lidar-port, or explicitly --allow-no-lidar")
 
     cap = None
+    front_cap = None
     try:
         if camera_enabled:
             cap = open_capture(
@@ -293,7 +316,16 @@ def run_prepared(args: argparse.Namespace) -> int:
                 segmenter=segmenter,
                 transformer=transformer,
             )
+            if front_camera_enabled:
+                front_cap = open_front_capture(
+                    cv2,
+                    front_source,
+                    config,
+                    source,
+                )
     except Exception:
+        if cap is not None:
+            cap.release()
         if lidar_scanner is not None:
             lidar_scanner.close()
         raise
@@ -304,6 +336,8 @@ def run_prepared(args: argparse.Namespace) -> int:
     except Exception:
         if cap is not None:
             cap.release()
+        if front_cap is not None:
+            front_cap.release()
         if lidar_scanner is not None:
             lidar_scanner.close()
         raise
@@ -322,7 +356,14 @@ def run_prepared(args: argparse.Namespace) -> int:
         LOG.info("parking mission auto-started")
 
     if segmenter is not None:
-        LOG.info("source=%s model=%s device=%s", source, model_path, segmenter.device)
+        LOG.info(
+            "rear_source=%s front_source=%s front_enabled=%s model=%s device=%s",
+            source,
+            front_source,
+            front_camera_enabled,
+            model_path,
+            segmenter.device,
+        )
     else:
         LOG.info("camera=disabled; LiDAR-only parking runtime")
     LOG.info("controls: SPACE=start/resume | R=stop/reset | Q/ESC=quit")
@@ -373,6 +414,18 @@ def run_prepared(args: argparse.Namespace) -> int:
                     2,
                     cv2.LINE_AA,
                 )
+            front_frame = None
+            if front_cap is not None:
+                front_ok, front_candidate = front_cap.read()
+                if front_ok and front_candidate is not None:
+                    front_frame = front_candidate
+                else:
+                    front_frame = camera_placeholder_frame(
+                        cv2,
+                        np,
+                        config.front_camera,
+                        "FRONT CAMERA READ FAILED",
+                    )
             if vehicle is not None:
                 sample = newest_ultrasonic_sample(vehicle.read_lines())
                 if sample is not None:
@@ -409,7 +462,10 @@ def run_prepared(args: argparse.Namespace) -> int:
             lidar_geometry = locked_slot_geometry.update(
                 lidar_observation,
                 lidar_points,
-                lock_requested=planner.state in LOCKED_SLOT_STATES,
+                lock_requested=slot_lock_requested(
+                    planner.state,
+                    lidar_observation,
+                ),
             )
             geometry = fuse_parking_geometry(
                 lidar_geometry,
@@ -504,6 +560,8 @@ def run_prepared(args: argparse.Namespace) -> int:
                 vehicle is not None,
                 dashboard_record_path,
                 camera_enabled=camera_enabled,
+                front_display=front_frame,
+                front_camera_enabled=front_camera_enabled,
                 front_left_ultrasonic_mm=front_left_ultrasonic_mm,
                 front_right_ultrasonic_mm=front_right_ultrasonic_mm,
             )
@@ -589,6 +647,8 @@ def run_prepared(args: argparse.Namespace) -> int:
             lidar_scanner.close()
         if cap is not None:
             cap.release()
+        if front_cap is not None:
+            front_cap.release()
         cv2.destroyAllWindows()
     return 0
 
@@ -633,6 +693,29 @@ def current_lidar_observation(
     return estimator.estimate(None), None
 
 
+def camera_placeholder_frame(
+    cv2: Any,
+    np: Any,
+    camera_config: Any,
+    message: str,
+) -> Any:
+    frame = np.zeros(
+        (camera_config.height, camera_config.width, 3),
+        dtype=np.uint8,
+    )
+    cv2.putText(
+        frame,
+        message,
+        (30, max(45, camera_config.height // 2)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.85,
+        (0, 220, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return frame
+
+
 def compose_parking_dashboard(
     cv2: Any,
     np: Any,
@@ -642,6 +725,8 @@ def compose_parking_dashboard(
     header_text: str,
     header_color: Tuple[int, int, int],
     status_lines: Tuple[str, ...],
+    front_display: Optional[Any] = None,
+    front_label: str = "FRONT",
 ) -> Any:
     """Build the one dashboard layout shared by live and offline replay."""
 
@@ -666,6 +751,28 @@ def compose_parking_dashboard(
 
     dashboard = np.zeros((720, 1280, 3), dtype=np.uint8)
     dashboard[0:495, 0:880] = cv2.resize(rear_panel, (880, 495))
+    if front_display is not None:
+        front_panel = cv2.resize(front_display, (312, 176))
+        cv2.rectangle(front_panel, (0, 0), (312, 28), (0, 0, 0), -1)
+        cv2.putText(
+            front_panel,
+            front_label,
+            (10, 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            (0, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        x0, y0 = 552, 304
+        dashboard[y0 : y0 + 176, x0 : x0 + 312] = front_panel
+        cv2.rectangle(
+            dashboard,
+            (x0, y0),
+            (x0 + 311, y0 + 175),
+            (0, 255, 255),
+            2,
+        )
     dashboard[0:360, 900:1260] = cv2.resize(bev_display, (360, 360))
     dashboard[360:720, 900:1260] = cv2.resize(lidar_display, (360, 360))
     cv2.putText(
@@ -729,6 +836,8 @@ def draw_live_dashboard(
     motor_output_enabled: bool,
     recording_path: Optional[Path],
     camera_enabled: bool = True,
+    front_display: Optional[Any] = None,
+    front_camera_enabled: bool = False,
     front_left_ultrasonic_mm: Optional[float] = None,
     front_right_ultrasonic_mm: Optional[float] = None,
 ) -> Any:
@@ -748,7 +857,11 @@ def draw_live_dashboard(
     )
     status_lines = (
         "%s | MOTOR=%s | REC=%s" % (
-            "LIVE CAMERA" if camera_enabled else "LIDAR ONLY",
+            (
+                "LIVE REAR+FRONT"
+                if camera_enabled and front_camera_enabled
+                else ("LIVE CAMERA" if camera_enabled else "LIDAR ONLY")
+            ),
             "ENABLED" if motor_output_enabled else "DISABLED",
             recording_name,
         ),
@@ -769,20 +882,20 @@ def draw_live_dashboard(
             format_dashboard_value(center_cm, signed=True),
             format_dashboard_value(width_cm),
         ),
-        "FIRST CAR edgeY=%s cm targetErr=%s cm turn=%s" % (
+        "SLOT pair=%s coast=%s entryErr=%s cm safety=%s cm" % (
+            "Y" if lidar.gap_pair_observed else "N",
+            "Y" if lidar.coasted else "N",
             format_dashboard_value(
                 None
-                if lidar.first_car_slot_edge_y_back_mm is None
-                else lidar.first_car_slot_edge_y_back_mm / 10.0,
+                if lidar.entry_error_mm is None
+                else lidar.entry_error_mm / 10.0,
                 signed=True,
             ),
             format_dashboard_value(
                 None
-                if lidar.first_car_turn_error_mm is None
-                else lidar.first_car_turn_error_mm / 10.0,
-                signed=True,
+                if lidar.nearest_safety_mm is None
+                else lidar.nearest_safety_mm / 10.0
             ),
-            "READY" if lidar.first_car_turn_reached else "waiting",
         ),
         "LOCKED SLOT inside=%.0f%% full=%s conf=%.2f lat=%+.2f head=%+.1f depth=%s (%s)" % (
             geometry.vehicle_inside_ratio * 100.0,
@@ -829,6 +942,8 @@ def draw_live_dashboard(
         ),
         state_color,
         status_lines,
+        front_display=front_display,
+        front_label="FRONT CAMERA",
     )
 
 
@@ -855,6 +970,7 @@ def parking_state_color(state: ParkingState) -> Tuple[int, int, int]:
         ParkingState.POSITION_REAR_AXLE,
         ParkingState.PREALIGN_LEFT,
         ParkingState.VERIFY_SLOT_BOX,
+        ParkingState.ENTRY_SETUP,
         ParkingState.PLAN_REVERSE_PATH,
     ):
         return (0, 165, 255)
@@ -930,19 +1046,15 @@ def draw_debug(
             "-" if lidar.entry_error_mm is None else "%+.0fmm" % lidar.entry_error_mm,
             safety,
         ),
-        "first-car confirmed=%s edge=%s turnErr=%s trigger=%s" % (
-            "Y" if lidar.first_car_confirmed else "N",
+        "slot pair=%s coast=%s entryErr=%s centerX=%s" % (
+            "Y" if lidar.gap_pair_observed else "N",
+            "Y" if lidar.coasted else "N",
+            "-" if lidar.entry_error_mm is None else "%+.0fmm" % lidar.entry_error_mm,
             (
                 "-"
-                if lidar.first_car_slot_edge_y_back_mm is None
-                else "%+.0fmm" % lidar.first_car_slot_edge_y_back_mm
+                if lidar.gap_center_x_right_mm is None
+                else "%+.0fmm" % lidar.gap_center_x_right_mm
             ),
-            (
-                "-"
-                if lidar.first_car_turn_error_mm is None
-                else "%+.0fmm" % lidar.first_car_turn_error_mm
-            ),
-            "Y" if lidar.first_car_turn_reached else "N",
         ),
         "plan=%s" % plan.reason,
         "ultrasonic FL=%s FR=%s SL=%s SR=%s" % (
@@ -1054,42 +1166,6 @@ def draw_lidar_debug(
     for cluster in observation.car_clusters:
         draw_cluster(
             cv2, canvas, cluster, origin, scale, rotation_deg, (255, 180, 0)
-        )
-    if (
-        observation.first_car_slot_edge_x_right_mm is not None
-        and observation.first_car_slot_edge_y_back_mm is not None
-    ):
-        first_edge = (
-            observation.first_car_slot_edge_x_right_mm,
-            observation.first_car_slot_edge_y_back_mm,
-        )
-        turn_target = (
-            observation.first_car_slot_edge_x_right_mm,
-            config.lidar.first_car_turn_target_y_back_mm,
-        )
-        draw_world_segment(
-            cv2,
-            canvas,
-            first_edge,
-            turn_target,
-            origin,
-            scale,
-            rotation_deg,
-            (0, 255, 255),
-            2,
-        )
-        cv2.circle(
-            canvas,
-            world_to_lidar_pixel(
-                first_edge[0],
-                first_edge[1],
-                origin,
-                scale,
-                rotation_deg,
-            ),
-            6,
-            (0, 255, 255),
-            -1,
         )
     dynamic_slot = slot_polygon
     if dynamic_slot is None:
@@ -1214,18 +1290,18 @@ def draw_lidar_debug(
     draw_vehicle_direction_labels(cv2, canvas, origin, scale, rotation_deg)
     cv2.putText(
         canvas,
-        "%s%s cars=%d first=%s turnErr=%s gap=%s err=%s" % (
+        "%s%s cars=%d gap=%s pair=%s err=%s centerX=%s" % (
             observation.reason,
             " HOLD" if observation.coasted else "",
             observation.car_count,
-            "Y" if observation.first_car_confirmed else "N",
+            "Y" if observation.gap_confirmed else "N",
+            "Y" if observation.gap_pair_observed else "N",
+            "-" if observation.entry_error_mm is None else "%+.0f" % observation.entry_error_mm,
             (
                 "-"
-                if observation.first_car_turn_error_mm is None
-                else "%+.0f" % observation.first_car_turn_error_mm
+                if observation.gap_center_x_right_mm is None
+                else "%+.0f" % observation.gap_center_x_right_mm
             ),
-            "Y" if observation.gap_confirmed else "N",
-            "-" if observation.entry_error_mm is None else "%+.0f" % observation.entry_error_mm,
         ),
         (12, 25),
         cv2.FONT_HERSHEY_SIMPLEX,
@@ -1648,6 +1724,7 @@ def open_vehicle(args: argparse.Namespace, config: ParkingAppConfig) -> SerialVe
             abs(config.planner.gap_tracking_speed),
             abs(config.planner.position_speed),
             abs(config.planner.prealign_speed),
+            abs(config.planner.entry_setup_speed),
             abs(config.planner.reverse_entry_speed),
             abs(config.planner.reverse_center_speed),
             abs(config.planner.correction_forward_speed),
@@ -1657,6 +1734,7 @@ def open_vehicle(args: argparse.Namespace, config: ParkingAppConfig) -> SerialVe
         max_steering=max(
             abs(config.planner.max_steering),
             abs(config.planner.prealign_steering),
+            abs(config.planner.entry_setup_steering),
             abs(config.planner.correction_steering),
             abs(config.planner.exit_turn_steering),
         ),
@@ -1689,12 +1767,58 @@ def open_capture(
 
     value: Any = int(source) if source.isdigit() else str(resolve_path(source))
     if isinstance(value, int):
-        cap = open_camera_index(cv2, value, config)
+        cap = open_camera_index(cv2, value, config.rear_camera)
     else:
         cap = cv2.VideoCapture(value)
-        configure_capture(cv2, cap, config)
+        configure_capture(cv2, cap, config.rear_camera)
     if not cap.isOpened():
         raise RuntimeError("rear camera/video could not be opened: %s" % source)
+    return cap
+
+
+def open_front_capture(
+    cv2: Any,
+    source: str,
+    config: ParkingAppConfig,
+    rear_source: str,
+) -> Any:
+    if is_auto_camera_source(source):
+        rear_index = int(rear_source) if rear_source.isdigit() else None
+        candidates = camera_source_candidates(
+            config.front_camera.index,
+            max_index=2 if sys.platform == "darwin" else 5,
+        )
+        tried: list[int] = []
+        for index in candidates:
+            if rear_index is not None and index == rear_index:
+                continue
+            tried.append(index)
+            try:
+                cap = open_camera_index(cv2, index, config.front_camera)
+            except RuntimeError:
+                continue
+            LOG.info("front camera auto-selected: index=%s", index)
+            return cap
+        raise RuntimeError(
+            "front camera auto-detect failed; tried indices %s. "
+            "Pass --front-source 0, --front-source 1, or --no-front-camera."
+            % ",".join(str(index) for index in tried)
+        )
+
+    if source.isdigit():
+        index = int(source)
+        if rear_source.isdigit() and int(rear_source) == index:
+            raise RuntimeError(
+                "front camera index %s matches rear camera index; "
+                "set --front-source to the other camera"
+                % index
+            )
+        return open_camera_index(cv2, index, config.front_camera)
+
+    cap = cv2.VideoCapture(str(resolve_path(source)))
+    configure_capture(cv2, cap, config.front_camera)
+    if not cap.isOpened():
+        raise RuntimeError("front camera/video could not be opened: %s" % source)
     return cap
 
 
@@ -1736,7 +1860,7 @@ def open_auto_capture(
     for index in candidates:
         tried.append(index)
         try:
-            cap = open_camera_index(cv2, index, config)
+            cap = open_camera_index(cv2, index, config.rear_camera)
         except RuntimeError:
             continue
         score, reason = score_rear_camera_candidate(
@@ -1770,24 +1894,24 @@ def open_auto_capture(
     return best_cap
 
 
-def open_camera_index(cv2: Any, index: int, config: ParkingAppConfig) -> Any:
+def open_camera_index(cv2: Any, index: int, camera_config: Any) -> Any:
     if sys.platform == "darwin" and hasattr(cv2, "CAP_AVFOUNDATION"):
         cap = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
     elif sys.platform.startswith("win") and hasattr(cv2, "CAP_DSHOW"):
         cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
     else:
         cap = cv2.VideoCapture(index)
-    configure_capture(cv2, cap, config)
+    configure_capture(cv2, cap, camera_config)
     if not cap.isOpened():
         cap.release()
         raise RuntimeError("camera index could not be opened: %s" % index)
     return cap
 
 
-def configure_capture(cv2: Any, cap: Any, config: ParkingAppConfig) -> None:
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.rear_camera.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.rear_camera.height)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*config.rear_camera.fourcc))
+def configure_capture(cv2: Any, cap: Any, camera_config: Any) -> None:
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, camera_config.width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, camera_config.height)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*camera_config.fourcc))
 
 
 def score_rear_camera_candidate(
@@ -1885,6 +2009,8 @@ def apply_cli_overrides(config: ParkingAppConfig, args: argparse.Namespace) -> P
     runtime = config.runtime
     if args.camera_enabled is not None:
         runtime = replace(runtime, camera_enabled=args.camera_enabled)
+    if args.front_camera_enabled is not None:
+        runtime = replace(runtime, front_camera_enabled=args.front_camera_enabled)
     if args.lidar_display_rotation is not None:
         runtime = replace(
             runtime,
@@ -1911,6 +2037,27 @@ def apply_cli_overrides(config: ParkingAppConfig, args: argparse.Namespace) -> P
         planner = replace(planner, prealign_steering=args.prealign_steering)
     if args.prealign_timeout_s is not None:
         planner = replace(planner, prealign_timeout_s=args.prealign_timeout_s)
+    if args.straight_steering_trim is not None:
+        planner = replace(
+            planner,
+            straight_steering_trim=args.straight_steering_trim,
+        )
+    if args.entry_setup_speed is not None:
+        planner = replace(planner, entry_setup_speed=args.entry_setup_speed)
+    if args.entry_setup_steering is not None:
+        planner = replace(
+            planner,
+            entry_setup_steering=args.entry_setup_steering,
+        )
+    if args.entry_setup_min_s is not None:
+        planner = replace(planner, entry_setup_min_s=args.entry_setup_min_s)
+    if args.entry_setup_max_s is not None:
+        planner = replace(planner, entry_setup_max_s=args.entry_setup_max_s)
+    if args.entry_setup_target_heading_deg is not None:
+        planner = replace(
+            planner,
+            entry_setup_target_heading_deg=args.entry_setup_target_heading_deg,
+        )
     if args.park_hold_s is not None:
         planner = replace(planner, park_hold_s=args.park_hold_s)
     if args.exit_speed is not None:
@@ -1985,6 +2132,11 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         default=None,
         help="rear camera index, auto, or recorded video; default uses config rear_camera.index",
     )
+    parser.add_argument(
+        "--front-source",
+        default=None,
+        help="front camera index, auto, or video; default uses config front_camera.index",
+    )
     camera_group = parser.add_mutually_exclusive_group()
     camera_group.add_argument(
         "--camera",
@@ -1999,6 +2151,20 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         help="run LiDAR-only without opening a camera or loading YOLO",
     )
     parser.set_defaults(camera_enabled=None)
+    front_camera_group = parser.add_mutually_exclusive_group()
+    front_camera_group.add_argument(
+        "--front-camera",
+        dest="front_camera_enabled",
+        action="store_true",
+        help="show a front-camera inset on the live dashboard",
+    )
+    front_camera_group.add_argument(
+        "--no-front-camera",
+        dest="front_camera_enabled",
+        action="store_false",
+        help="disable the front-camera inset",
+    )
+    parser.set_defaults(front_camera_enabled=None)
     parser.add_argument("--recording-zip", default=None, help="ZIP containing one MP4 and one *_lidar.csv")
     parser.add_argument("--model", default=None, help="parking YOLO segmentation model")
     parser.add_argument("--device", default=None, help="auto, cpu, mps, 0, cuda, ...")
@@ -2077,31 +2243,67 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         "--prealign-speed",
         type=int,
         default=None,
-        help="forward speed while swinging the rear toward the parking slot",
+        help="legacy prealign override; ignored by the straight-search planner",
     )
     parser.add_argument(
         "--first-car-turn-target-cm",
         type=float,
         default=None,
-        help="vehicle-frame yBack trigger for the first car; negative is ahead",
+        help="legacy first-car trigger calibration; ignored by the straight-search planner",
     )
     parser.add_argument(
         "--first-car-preemptive-turn",
         choices=("on", "off"),
         default=None,
-        help="turn left at the first car before the second car is confirmed",
+        help="legacy preemptive-turn switch; ignored by the straight-search planner",
     )
     parser.add_argument(
         "--prealign-steering",
         type=int,
         default=None,
-        help="signed configured maximum steering command for pre-alignment (left is negative)",
+        help="legacy prealign steering override; ignored by the straight-search planner",
     )
     parser.add_argument(
         "--prealign-timeout-s",
         type=float,
         default=None,
-        help="maximum seconds allowed for the LiDAR-closed-loop pre-alignment arc",
+        help="legacy prealign timeout override; ignored by the straight-search planner",
+    )
+    parser.add_argument(
+        "--straight-steering-trim",
+        type=int,
+        default=None,
+        help="signed steering trim while driving straight during slot search",
+    )
+    parser.add_argument(
+        "--entry-setup-speed",
+        type=int,
+        default=None,
+        help="forward speed used to create entry angle before reversing",
+    )
+    parser.add_argument(
+        "--entry-setup-steering",
+        type=int,
+        default=None,
+        help="signed steering command used to create entry angle before reversing",
+    )
+    parser.add_argument(
+        "--entry-setup-min-s",
+        type=float,
+        default=None,
+        help="minimum seconds to hold the entry-angle setup before reversing",
+    )
+    parser.add_argument(
+        "--entry-setup-max-s",
+        type=float,
+        default=None,
+        help="maximum seconds allowed for entry-angle setup before aborting",
+    )
+    parser.add_argument(
+        "--entry-setup-target-heading-deg",
+        type=float,
+        default=None,
+        help="reverse starts only when abs(slot heading error) is at or below this value",
     )
     parser.add_argument(
         "--park-hold-s",
@@ -2186,6 +2388,35 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         parser.error("--prealign-steering must be between -150 and 150")
     if args.prealign_timeout_s is not None and args.prealign_timeout_s <= 0.0:
         parser.error("--prealign-timeout-s must be positive")
+    if (
+        args.straight_steering_trim is not None
+        and abs(args.straight_steering_trim) > 150
+    ):
+        parser.error("--straight-steering-trim must be between -150 and 150")
+    if args.entry_setup_speed is not None and args.entry_setup_speed <= 0:
+        parser.error("--entry-setup-speed must be positive")
+    if (
+        args.entry_setup_steering is not None
+        and abs(args.entry_setup_steering) > 150
+    ):
+        parser.error("--entry-setup-steering must be between -150 and 150")
+    if args.entry_setup_steering == 0:
+        parser.error("--entry-setup-steering cannot be zero")
+    if args.entry_setup_min_s is not None and args.entry_setup_min_s < 0.0:
+        parser.error("--entry-setup-min-s cannot be negative")
+    if args.entry_setup_max_s is not None and args.entry_setup_max_s <= 0.0:
+        parser.error("--entry-setup-max-s must be positive")
+    if (
+        args.entry_setup_min_s is not None
+        and args.entry_setup_max_s is not None
+        and args.entry_setup_max_s < args.entry_setup_min_s
+    ):
+        parser.error("--entry-setup-max-s must be at least --entry-setup-min-s")
+    if (
+        args.entry_setup_target_heading_deg is not None
+        and args.entry_setup_target_heading_deg <= 0.0
+    ):
+        parser.error("--entry-setup-target-heading-deg must be positive")
     if args.park_hold_s is not None and args.park_hold_s < 0.0:
         parser.error("--park-hold-s cannot be negative")
     if args.exit_speed is not None and args.exit_speed <= 0:
