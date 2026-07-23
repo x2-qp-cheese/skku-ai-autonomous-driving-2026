@@ -1,12 +1,12 @@
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 
 @dataclass(frozen=True)
 class CameraConfig:
-    index: int = 0
+    index: Union[int, str] = 0
     width: int = 1280
     height: int = 720
     fourcc: str = "MJPG"

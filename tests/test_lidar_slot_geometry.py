@@ -126,6 +126,19 @@ class LidarSlotGeometryProjectorTest(unittest.TestCase):
         self.assertFalse(geometry.found)
         self.assertEqual(geometry.reason, "lidar_slot_box_unavailable")
 
+    def test_vehicle_footprint_reports_full_inside_only_with_all_corners_in_box(self):
+        inside = self.projector.project_polygon(
+            ((-475.0, -1200.0), (475.0, -1200.0), (475.0, 300.0), (-475.0, 300.0))
+        )
+        outside = self.projector.project_polygon(
+            ((-475.0, 300.0), (475.0, 300.0), (475.0, 1800.0), (-475.0, 1800.0))
+        )
+
+        self.assertTrue(inside.vehicle_fully_inside)
+        self.assertAlmostEqual(inside.vehicle_inside_ratio, 1.0)
+        self.assertFalse(outside.vehicle_fully_inside)
+        self.assertAlmostEqual(outside.vehicle_inside_ratio, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

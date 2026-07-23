@@ -64,6 +64,8 @@ class ParkingGeometry:
     back_center_y_px: Optional[float] = None
     stop_target_x_px: Optional[float] = None
     stop_target_y_px: Optional[float] = None
+    vehicle_inside_ratio: float = 0.0
+    vehicle_fully_inside: bool = False
     confidence: float = 0.0
     observed_line_count: int = 0
     coasted: bool = False

@@ -33,7 +33,7 @@ class ReverseParkingPathTest(unittest.TestCase):
             )
         )
 
-    def test_path_starts_at_vehicle_and_ends_at_clearance_target(self):
+    def test_path_starts_at_vehicle_and_ends_at_local_lookahead(self):
         path = self.make_generator().generate(geometry())
 
         self.assertTrue(path.found)
@@ -41,7 +41,9 @@ class ReverseParkingPathTest(unittest.TestCase):
         self.assertAlmostEqual(path.points[0][0], 300.0)
         self.assertAlmostEqual(path.points[0][1], 570.0)
         self.assertAlmostEqual(path.points[-1][0], 300.0)
-        self.assertAlmostEqual(path.points[-1][1], 100.0)
+        self.assertAlmostEqual(path.points[-1][1], 490.0)
+        self.assertAlmostEqual(path.lookahead_point[1], 490.0)
+        self.assertEqual(path.reason, "local_target_ready")
         self.assertAlmostEqual(path.curvature_per_px, 0.0, places=5)
 
     def test_target_to_right_generates_signed_curvature(self):

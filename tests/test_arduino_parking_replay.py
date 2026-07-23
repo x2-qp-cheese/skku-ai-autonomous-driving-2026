@@ -119,8 +119,15 @@ class ArduinoParkingControllerReplayTests(unittest.TestCase):
         )
         self.assertEqual(command.state, ReplayParkingState.SEARCHING)
 
-    def test_zero_distance_latches_emergency(self):
+    def test_zero_distance_does_not_latch_emergency_by_default(self):
         controller = ArduinoParkingControllerReplay()
+        command = controller.update(lidar_observation(), 0.0, None)
+        self.assertEqual(command.state, ReplayParkingState.SEARCHING)
+
+    def test_zero_distance_latches_emergency_when_enabled(self):
+        controller = ArduinoParkingControllerReplay(
+            ArduinoReplayConstants(emergency_stop_enabled=True)
+        )
         command = controller.update(lidar_observation(), 0.0, None)
         self.assertEqual(command.state, ReplayParkingState.EMERGENCY_STOP)
         self.assertEqual(command.speed, 0)

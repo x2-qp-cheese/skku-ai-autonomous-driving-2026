@@ -15,6 +15,7 @@ class SerialVehicleConfig:
     port: Optional[str] = None
     baudrate: int = 115200
     timeout_s: float = 0.1
+    startup_delay_s: float = 0.0
     ready_timeout_s: float = 3.0
 
 
@@ -48,6 +49,13 @@ def parse_ultrasonic_line(line: str) -> Optional[UltrasonicReadings]:
         side_right_mm=values.get("SR"),
         side_left_mm=values.get("SL"),
     )
+
+
+def is_ready_line(line: str) -> bool:
+    """Return true when the Arduino is already producing usable serial output."""
+
+    text = line.strip()
+    return "READY" in text or "PONG" in text or text.startswith("US ")
 
 
 def _valid_ultrasonic_mm(value: float) -> Optional[float]:
@@ -128,6 +136,8 @@ class SerialVehicleClient:
 
         self._serial = serial.Serial(port, self.config.baudrate, timeout=self.config.timeout_s)
         self.port = port
+        if self.config.startup_delay_s > 0.0:
+            time.sleep(self.config.startup_delay_s)
         try:
             self._wait_ready()
         except Exception:
@@ -183,7 +193,7 @@ class SerialVehicleClient:
                 continue
             line = raw.decode("ascii", errors="replace").strip()
             ready_lines.append(line)
-            if "READY" in line or "PONG" in line:
+            if is_ready_line(line):
                 return
         detail = "; ".join(ready_lines[-3:]) if ready_lines else "no serial output"
         raise RuntimeError("Arduino READY response was not received from %s: %s" % (self.port, detail))

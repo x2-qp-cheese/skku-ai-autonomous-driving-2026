@@ -1,6 +1,6 @@
 import unittest
 
-from skku_autocar.control.serial_vehicle import parse_ultrasonic_line
+from skku_autocar.control.serial_vehicle import is_ready_line, parse_ultrasonic_line
 from skku_autocar.runtime.parking_app import newest_ultrasonic_sample
 
 
@@ -16,6 +16,12 @@ class SerialVehicleUltrasonicTest(unittest.TestCase):
 
     def test_non_ultrasonic_line_is_ignored(self):
         self.assertIsNone(parse_ultrasonic_line("OK DRIVE"))
+
+    def test_ultrasonic_stream_counts_as_ready_serial_output(self):
+        self.assertTrue(is_ready_line("T_PARKING_READY: S=start"))
+        self.assertTrue(is_ready_line("PONG"))
+        self.assertTrue(is_ready_line("US FC=0 FR=0 FL=0 SR=0 SL=0"))
+        self.assertFalse(is_ready_line("OK DRIVE"))
 
     def test_newest_sample_wins(self):
         sample = newest_ultrasonic_sample([

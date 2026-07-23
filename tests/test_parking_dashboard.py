@@ -5,8 +5,11 @@ from pathlib import Path
 
 from skku_autocar.runtime.parking_app import (
     DashboardVideoRecorder,
+    camera_source_candidates,
     compose_parking_dashboard,
     dashboard_recording_enabled,
+    draw_camera_alignment_line,
+    is_auto_camera_source,
     parse_args,
     timestamped_dashboard_path,
 )
@@ -25,6 +28,7 @@ class ParkingDashboardTest(unittest.TestCase):
 
     def test_live_camera_records_by_default(self):
         args = parse_args([])
+        self.assertIsNone(args.source)
         self.assertEqual(args.record_dashboard, "auto")
         self.assertEqual(args.parking_record_dir, "data/parking")
         self.assertEqual(args.dashboard_record_fps, 10.0)
@@ -32,6 +36,10 @@ class ParkingDashboardTest(unittest.TestCase):
         self.assertFalse(dashboard_recording_enabled("auto", is_video=True))
         self.assertTrue(dashboard_recording_enabled("on", is_video=True))
         self.assertFalse(dashboard_recording_enabled("off", is_video=False))
+
+    def test_source_auto_must_be_explicit(self):
+        args = parse_args(["--source", "auto"])
+        self.assertEqual(args.source, "auto")
 
     def test_timestamp_path_avoids_collision(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -57,6 +65,23 @@ class ParkingDashboardTest(unittest.TestCase):
             ("REC=test.mp4",),
         )
         self.assertEqual(dashboard.shape, (720, 1280, 3))
+
+    def test_camera_alignment_line_marks_center_column(self):
+        image = self.np.zeros((20, 30, 3), dtype=self.np.uint8)
+
+        draw_camera_alignment_line(self.cv2, image)
+
+        center = image[:, 15]
+        left = image[:, 10]
+        self.assertGreater(int(center.sum()), 0)
+        self.assertEqual(int(left.sum()), 0)
+
+    def test_auto_camera_source_candidates_prioritize_configured_rear_index(self):
+        self.assertTrue(is_auto_camera_source("auto"))
+        self.assertTrue(is_auto_camera_source(" AUTO "))
+        self.assertFalse(is_auto_camera_source("1"))
+        self.assertEqual(camera_source_candidates(1, max_index=3), [1, 0, 2, 3])
+        self.assertEqual(camera_source_candidates("auto", max_index=2), [0, 1, 2])
 
     def test_recorder_writes_readable_dashboard_mp4(self):
         with tempfile.TemporaryDirectory() as directory:

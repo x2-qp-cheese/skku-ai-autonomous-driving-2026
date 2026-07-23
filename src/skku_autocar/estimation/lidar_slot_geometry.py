@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from math import atan2, degrees, hypot
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 from .parking_geometry import ParkingGeometry, ParkingGeometryConfig, ParkingLine
 from .parking_lidar import (
@@ -29,6 +29,9 @@ class LidarSlotGeometryProjector:
         geometry_config: ParkingGeometryConfig,
         canvas_width: int,
         canvas_height: int,
+        vehicle_width_mm: float = 600.0,
+        vehicle_length_mm: float = 1000.0,
+        rear_axle_to_rear_bumper_mm: float = 200.0,
     ) -> None:
         if canvas_width <= 0 or canvas_height <= 0:
             raise ValueError("LiDAR slot geometry canvas must be positive")
@@ -38,6 +41,13 @@ class LidarSlotGeometryProjector:
         self.geometry_config = geometry_config
         self.canvas_width = int(canvas_width)
         self.canvas_height = int(canvas_height)
+        self.vehicle_width_mm = max(1.0, float(vehicle_width_mm))
+        self.vehicle_length_mm = max(1.0, float(vehicle_length_mm))
+        self.rear_axle_to_rear_bumper_mm = clip(
+            float(rear_axle_to_rear_bumper_mm),
+            0.0,
+            self.vehicle_length_mm,
+        )
         self.pixels_per_mm = (
             geometry_config.expected_slot_width_px
             / lidar_config.parking_space_width_mm
@@ -47,9 +57,34 @@ class LidarSlotGeometryProjector:
         polygon = infer_dynamic_slot_polygon(
             observation,
             self.lidar_config.parking_space_depth_mm,
+            self.lidar_config.parking_space_width_mm,
         )
         if polygon is None:
             return ParkingGeometry(reason="lidar_slot_box_unavailable")
+
+        if observation.coasted:
+            reason = "lidar_slot_box_hold"
+        elif observation.gap_confirmed:
+            reason = "lidar_slot_box"
+        else:
+            reason = "lidar_slot_box_confirming"
+        return self.project_polygon(
+            polygon,
+            confirmed=observation.gap_confirmed,
+            coasted=observation.coasted,
+            reason=reason,
+        )
+
+    def project_polygon(
+        self,
+        polygon: Sequence[Point],
+        *,
+        confirmed: bool = True,
+        coasted: bool = False,
+        reason: str = "lidar_slot_box_locked",
+    ) -> ParkingGeometry:
+        if len(polygon) != 4:
+            return ParkingGeometry(reason="lidar_slot_box_invalid_polygon")
 
         points = tuple(self._world_to_bev(point) for point in polygon)
         entrance_first, entrance_second, far_second, far_first = points
@@ -97,18 +132,12 @@ class LidarSlotGeometryProjector:
         lateral_norm = lateral_error / max(1.0, slot_width / 2.0)
         heading_error = degrees(atan2(direction[0], -direction[1]))
 
-        confidence = 0.65 if observation.coasted else 0.95
-        confirmed = observation.gap_confirmed
+        confidence = 0.65 if coasted else 0.95
         found = (
             confirmed
             and confidence >= self.geometry_config.min_geometry_confidence
         )
-        if observation.coasted:
-            reason = "lidar_slot_box_hold"
-        elif confirmed:
-            reason = "lidar_slot_box"
-        else:
-            reason = "lidar_slot_box_confirming"
+        inside_ratio, fully_inside = self._vehicle_inside(points)
 
         return ParkingGeometry(
             found=found,
@@ -133,11 +162,39 @@ class LidarSlotGeometryProjector:
             back_center_y_px=back_center[1],
             stop_target_x_px=stop_target[0],
             stop_target_y_px=stop_target[1],
+            vehicle_inside_ratio=inside_ratio,
+            vehicle_fully_inside=fully_inside,
             confidence=confidence,
             observed_line_count=0,
-            coasted=observation.coasted,
+            coasted=coasted,
             reason=reason,
         )
+
+    def _vehicle_inside(self, slot_polygon: Sequence[Point]) -> Tuple[float, bool]:
+        axle_x, axle_y = self._rear_axle_pixel()
+        half_width_px = self.vehicle_width_mm * self.pixels_per_mm / 2.0
+        rear_y = axle_y - self.rear_axle_to_rear_bumper_mm * self.pixels_per_mm
+        front_overhang_from_axle = (
+            self.vehicle_length_mm - self.rear_axle_to_rear_bumper_mm
+        )
+        front_y = axle_y + front_overhang_from_axle * self.pixels_per_mm
+        corners = (
+            (axle_x - half_width_px, rear_y),
+            (axle_x + half_width_px, rear_y),
+            (axle_x + half_width_px, front_y),
+            (axle_x - half_width_px, front_y),
+        )
+        fully_inside = all(point_in_convex_polygon(point, slot_polygon) for point in corners)
+
+        inside = 0
+        total = 0
+        for row in range(9):
+            y = rear_y + (front_y - rear_y) * row / 8.0
+            for column in range(5):
+                x = axle_x - half_width_px + 2.0 * half_width_px * column / 4.0
+                total += 1
+                inside += int(point_in_convex_polygon((x, y), slot_polygon))
+        return inside / float(max(1, total)), fully_inside
 
     def _rear_axle_pixel(self) -> Point:
         return (
@@ -206,3 +263,17 @@ def dot(first: Point, second: Point) -> float:
 
 def clip(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
+
+
+def point_in_convex_polygon(point: Point, polygon: Sequence[Point]) -> bool:
+    if len(polygon) < 3:
+        return False
+    signs = []
+    for first, second in zip(polygon, tuple(polygon[1:]) + (polygon[0],)):
+        cross = (
+            (second[0] - first[0]) * (point[1] - first[1])
+            - (second[1] - first[1]) * (point[0] - first[0])
+        )
+        if abs(cross) > 1e-6:
+            signs.append(cross > 0.0)
+    return not signs or all(sign == signs[0] for sign in signs)

@@ -40,10 +40,26 @@ class CarCluster:
     def center_y_back_mm(self) -> float:
         return (self.y_back_min_mm + self.y_back_max_mm) / 2.0
 
+    @property
+    def center_x_right_mm(self) -> float:
+        return (self.x_min_mm + self.x_max_mm) / 2.0
+
+    @property
+    def span_x_mm(self) -> float:
+        return self.x_max_mm - self.x_min_mm
+
+    @property
+    def span_y_back_mm(self) -> float:
+        return self.y_back_max_mm - self.y_back_min_mm
+
+    @property
+    def max_span_mm(self) -> float:
+        return max(self.span_x_mm, self.span_y_back_mm)
+
 
 @dataclass(frozen=True)
 class LidarParkingConfig:
-    quality_min: int = 8
+    quality_min: int = 1
     min_distance_mm: float = 120.0
     max_distance_mm: float = 12000.0
     # On the supplied installation, raw 90 deg was displayed at screen-right
@@ -56,12 +72,22 @@ class LidarParkingConfig:
 
     # This ROI looks sideways at the row of parked cars. It is not a parking
     # line or a claim that the bay interior is empty.
-    car_detection_roi: RectangleRoi = RectangleRoi(-1800.0, 1800.0, -2500.0, 2500.0)
+    car_detection_roi: RectangleRoi = RectangleRoi(250.0, 2600.0, -2500.0, 2500.0)
+    # Once the slot is confirmed, the ego vehicle may rotate enough that one
+    # bordering car moves out of the initial right-side ROI. Use this wider ROI
+    # only for tracking an already confirmed slot.
+    slot_tracking_roi: Optional[RectangleRoi] = RectangleRoi(-1800.0, 2600.0, -2500.0, 2500.0)
     # Separate collision envelope used while reversing.
     safety_roi: RectangleRoi = RectangleRoi(-300.0, 300.0, 100.0, 450.0)
     min_observed_points: int = 5
-    car_cluster_radius_mm: float = 250.0
+    car_cluster_radius_mm: float = 350.0
     car_cluster_min_points: int = 3
+    # First-car detection stays intentionally sensitive, but a parking bay
+    # must be bordered by two stronger parked-car clusters. Otherwise a partial
+    # return from the first obstacle plus a stray reflection can look like a
+    # false slot.
+    gap_cluster_min_points: int = 5
+    gap_pair_min_points: int = 10
 
     # Official painted bay dimensions. The observed surface gap is larger
     # because LiDAR sees the neighboring vehicles, not the painted boundaries.
@@ -73,7 +99,11 @@ class LidarParkingConfig:
     # The mission slot starts on the vehicle-right, although either bordering
     # car may move into the left half of the vehicle frame while turning.
     gap_center_x_min_mm: float = 0.0
+    gap_center_y_back_min_mm: float = 200.0
     gap_confirm_scans: int = 3
+    gap_candidate_hold_s: float = 1.2
+    gap_single_cluster_track_enabled: bool = True
+    gap_single_cluster_max_edge_jump_mm: float = 700.0
     gap_coast_scans: int = 15
     # Keep displaying the last confirmed slot for the current mission when
     # both bordering cars are temporarily unavailable. Coasted observations
@@ -89,8 +119,15 @@ class LidarParkingConfig:
     # useful early trigger, before the second bordering car is visible.  With
     # the rear-mounted LiDAR, -650 mm places that surface roughly 350 mm ahead
     # of the provisional rear axle (-300 mm).
-    first_car_confirm_scans: int = 2
-    first_car_min_x_right_mm: float = 500.0
+    first_car_confirm_scans: int = 6
+    first_car_min_x_right_mm: float = 450.0
+    # A lone weak cluster must not be enough to start the parking maneuver.
+    # People and cable reflections often produce one or two LiDAR points on the
+    # right; require a denser, physically wider cluster before it is treated as
+    # the first parked car.
+    first_car_cluster_min_points: int = 5
+    first_car_min_span_mm: float = 80.0
+    first_car_max_center_jump_mm: float = 450.0
     first_car_turn_target_y_back_mm: float = -650.0
 
     # Positive y_back is behind the sensor. The LiDAR is provisionally 30 cm
@@ -108,6 +145,7 @@ class LidarParkingObservation:
     valid: bool = False
     unsafe: bool = False
     observed_points: int = 0
+    car_roi_points: int = 0
     car_count: int = 0
     first_car_seen: bool = False
     first_car_confirmed: bool = False
@@ -118,6 +156,7 @@ class LidarParkingObservation:
     second_car_seen: bool = False
     gap_found: bool = False
     gap_confirmed: bool = False
+    gap_pair_observed: bool = False
     gap_width_mm: Optional[float] = None
     gap_near_edge_x_right_mm: Optional[float] = None
     gap_near_edge_y_back_mm: Optional[float] = None
@@ -149,8 +188,11 @@ class LidarParkingSpaceEstimator:
         self.config = config
         self._last_timestamp: Optional[float] = None
         self._first_car_confirm_scans = 0
+        self._first_car_center_x_mm: Optional[float] = None
+        self._first_car_center_y_mm: Optional[float] = None
         self._candidate_center_x_mm: Optional[float] = None
         self._candidate_center_mm: Optional[float] = None
+        self._last_candidate_timestamp: Optional[float] = None
         self._smoothed_center_x_mm: Optional[float] = None
         self._smoothed_center_mm: Optional[float] = None
         self._confirm_scans = 0
@@ -169,8 +211,11 @@ class LidarParkingSpaceEstimator:
     def reset(self) -> None:
         self._last_timestamp = None
         self._first_car_confirm_scans = 0
+        self._first_car_center_x_mm = None
+        self._first_car_center_y_mm = None
         self._candidate_center_x_mm = None
         self._candidate_center_mm = None
+        self._last_candidate_timestamp = None
         self._smoothed_center_x_mm = None
         self._smoothed_center_mm = None
         self._confirm_scans = 0
@@ -203,9 +248,14 @@ class LidarParkingSpaceEstimator:
             return LidarParkingObservation(timestamp=scan.timestamp, reason="stale_scan")
 
         transformed = [value for value in (self._transform(point) for point in scan.points) if value]
+        cluster_roi = (
+            self.config.slot_tracking_roi
+            if self._confirmed and self.config.slot_tracking_roi is not None
+            else self.config.car_detection_roi
+        )
         car_points = [
             point for point in transformed
-            if self.config.car_detection_roi.contains(point[0], point[1])
+            if cluster_roi.contains(point[0], point[1])
         ]
         cluster_points_list = cluster_points(
             car_points,
@@ -223,7 +273,10 @@ class LidarParkingSpaceEstimator:
         ]
         nearest_safety = min(safety_distances) if safety_distances else None
         unsafe = nearest_safety is not None
-        valid = len(transformed) >= max(1, self.config.min_observed_points)
+        valid = (
+            len(transformed) >= max(1, self.config.min_observed_points)
+            or len(car_points) >= max(1, self.config.car_cluster_min_points)
+        )
         reference_depth = (
             (self._tracked_depth_x, self._tracked_depth_y)
             if self._tracked_depth_x is not None and self._tracked_depth_y is not None
@@ -249,14 +302,22 @@ class LidarParkingSpaceEstimator:
             # cluster pair or a 90/180-degree pose jump. Retain the previous
             # pose briefly and wait for a consistent observation.
             candidate = None
+        gap_pair_observed = candidate is not None
+        if candidate is None and valid and self._confirmed:
+            candidate = self._track_gap_from_single_cluster(clusters)
         new_scan = self._last_timestamp != scan.timestamp
 
         first_car = select_first_approach_car(clusters, self.config) if valid else None
         if new_scan:
             if first_car is None:
-                self._first_car_confirm_scans = 0
+                self._clear_first_car()
             else:
-                self._first_car_confirm_scans += 1
+                if not self._first_car_track_consistent(first_car):
+                    self._first_car_confirm_scans = 1
+                else:
+                    self._first_car_confirm_scans += 1
+                self._first_car_center_x_mm = first_car.center_x_right_mm
+                self._first_car_center_y_mm = first_car.center_y_back_mm
         first_car_confirmed = (
             first_car is not None
             and self._first_car_confirm_scans
@@ -285,7 +346,7 @@ class LidarParkingSpaceEstimator:
         )
 
         if new_scan:
-            self._update_tracking(candidate)
+            self._update_tracking(candidate, scan.timestamp)
             self._last_timestamp = scan.timestamp
 
         gap = self._last_gap if candidate is not None and self._last_gap is not None else candidate
@@ -336,6 +397,8 @@ class LidarParkingSpaceEstimator:
                 self._confirm_scans,
                 max(1, self.config.gap_confirm_scans),
             )
+        elif len(clusters) == 1 and first_car is None:
+            reason = "one_cluster_filtered"
         elif len(clusters) == 1:
             reason = "one_parked_car"
         elif len(clusters) >= 2:
@@ -348,8 +411,9 @@ class LidarParkingSpaceEstimator:
             valid=valid,
             unsafe=unsafe,
             observed_points=len(transformed),
+            car_roi_points=len(car_points),
             car_count=len(clusters),
-            first_car_seen=len(clusters) >= 1,
+            first_car_seen=first_car is not None,
             first_car_confirmed=first_car_confirmed,
             first_car_slot_edge_x_right_mm=first_car_edge_x,
             first_car_slot_edge_y_back_mm=first_car_edge_y,
@@ -358,6 +422,7 @@ class LidarParkingSpaceEstimator:
             second_car_seen=len(clusters) >= 2,
             gap_found=gap_found,
             gap_confirmed=self._confirmed and gap_found,
+            gap_pair_observed=gap_pair_observed,
             gap_width_mm=gap_width,
             gap_near_edge_x_right_mm=near_edge_x,
             gap_near_edge_y_back_mm=near_edge,
@@ -379,6 +444,7 @@ class LidarParkingSpaceEstimator:
     def _update_tracking(
         self,
         gap: Optional[Tuple[float, float, float, float, float, float, float]],
+        timestamp: float,
     ) -> None:
         if gap is None:
             if self._confirmed and self._last_gap is not None:
@@ -388,10 +454,17 @@ class LidarParkingSpaceEstimator:
                     and self._coast_scans > max(0, self.config.gap_coast_scans)
                 ):
                     self._clear_candidate()
+            elif (
+                self._last_candidate_timestamp is not None
+                and timestamp - self._last_candidate_timestamp
+                <= max(0.0, self.config.gap_candidate_hold_s)
+            ):
+                self._coast_scans += 1
             else:
                 self._clear_candidate()
             return
 
+        self._last_candidate_timestamp = timestamp
         first_x, first_y = gap[3], gap[1]
         second_x, second_y = gap[4], gap[2]
         axis_x = second_x - first_x
@@ -502,6 +575,82 @@ class LidarParkingSpaceEstimator:
         if self._confirm_scans >= max(1, self.config.gap_confirm_scans):
             self._confirmed = True
 
+    def _track_gap_from_single_cluster(
+        self,
+        clusters: Sequence[CarCluster],
+    ) -> Optional[Tuple[float, float, float, float, float, float, float]]:
+        if (
+            not self.config.gap_single_cluster_track_enabled
+            or self._last_gap is None
+            or self._tracked_axis_x is None
+            or self._tracked_axis_y is None
+            or self._tracked_depth_x is None
+            or self._tracked_depth_y is None
+        ):
+            return None
+        eligible = [
+            cluster for cluster in clusters
+            if is_gap_cluster_eligible(cluster, self.config)
+        ]
+        if not eligible:
+            return None
+
+        last_width, first_y, second_y, first_x, second_x, depth_x, depth_y = self._last_gap
+        first_edge = (first_x, first_y)
+        second_edge = (second_x, second_y)
+        best: Optional[Tuple[float, float, float, float]] = None
+        for cluster in eligible:
+            first_candidate = cluster_slot_edge(
+                cluster,
+                self._tracked_axis_x,
+                self._tracked_axis_y,
+                self._tracked_depth_x,
+                self._tracked_depth_y,
+                side=1,
+            )
+            first_distance = hypot(
+                first_candidate[0] - first_edge[0],
+                first_candidate[1] - first_edge[1],
+            )
+            second_candidate = cluster_slot_edge(
+                cluster,
+                self._tracked_axis_x,
+                self._tracked_axis_y,
+                self._tracked_depth_x,
+                self._tracked_depth_y,
+                side=-1,
+            )
+            second_distance = hypot(
+                second_candidate[0] - second_edge[0],
+                second_candidate[1] - second_edge[1],
+            )
+            for distance, candidate_edge, reference_edge in (
+                (first_distance, first_candidate, first_edge),
+                (second_distance, second_candidate, second_edge),
+            ):
+                if best is None or distance < best[0]:
+                    best = (
+                        distance,
+                        candidate_edge[0] - reference_edge[0],
+                        candidate_edge[1] - reference_edge[1],
+                        last_width,
+                    )
+        if (
+            best is None
+            or best[0] > max(0.0, self.config.gap_single_cluster_max_edge_jump_mm)
+        ):
+            return None
+        _, delta_x, delta_y, width = best
+        return (
+            width,
+            first_y + delta_y,
+            second_y + delta_y,
+            first_x + delta_x,
+            second_x + delta_x,
+            depth_x,
+            depth_y,
+        )
+
     def _track_consistent(
         self,
         gap: Tuple[float, float, float, float, float, float, float],
@@ -532,9 +681,24 @@ class LidarParkingSpaceEstimator:
         minimum_alignment = cos(radians(self.config.gap_max_orientation_jump_deg))
         return axis_alignment >= minimum_alignment
 
+    def _first_car_track_consistent(self, cluster: CarCluster) -> bool:
+        if self._first_car_center_x_mm is None or self._first_car_center_y_mm is None:
+            return True
+        jump = hypot(
+            cluster.center_x_right_mm - self._first_car_center_x_mm,
+            cluster.center_y_back_mm - self._first_car_center_y_mm,
+        )
+        return jump <= max(0.0, self.config.first_car_max_center_jump_mm)
+
+    def _clear_first_car(self) -> None:
+        self._first_car_confirm_scans = 0
+        self._first_car_center_x_mm = None
+        self._first_car_center_y_mm = None
+
     def _clear_candidate(self) -> None:
         self._candidate_center_x_mm = None
         self._candidate_center_mm = None
+        self._last_candidate_timestamp = None
         self._smoothed_center_x_mm = None
         self._smoothed_center_mm = None
         self._confirm_scans = 0
@@ -581,12 +745,57 @@ def select_first_approach_car(
     candidates = [
         cluster
         for cluster in clusters
-        if (cluster.x_min_mm + cluster.x_max_mm) / 2.0
-        >= config.first_car_min_x_right_mm
+        if first_car_cluster_eligible(cluster, config)
     ]
     if not candidates:
         return None
     return max(candidates, key=lambda cluster: cluster.center_y_back_mm)
+
+
+def first_car_cluster_eligible(
+    cluster: CarCluster,
+    config: LidarParkingConfig,
+) -> bool:
+    if cluster.center_x_right_mm < config.first_car_min_x_right_mm:
+        return False
+    if cluster.point_count < max(1, config.first_car_cluster_min_points):
+        return False
+    if cluster.max_span_mm < max(0.0, config.first_car_min_span_mm):
+        return False
+    return True
+
+
+def is_gap_cluster_eligible(
+    cluster: CarCluster,
+    config: LidarParkingConfig,
+) -> bool:
+    min_points = max(1, config.car_cluster_min_points, config.gap_cluster_min_points)
+    return cluster.point_count >= min_points
+
+
+def cluster_slot_edge(
+    cluster: CarCluster,
+    axis_x: float,
+    axis_y: float,
+    depth_x: float,
+    depth_y: float,
+    side: int,
+) -> Tuple[float, float]:
+    center_x = cluster.center_x_right_mm
+    center_y = cluster.center_y_back_mm
+    axis_radius = (
+        abs(axis_x) * (cluster.x_max_mm - cluster.x_min_mm) / 2.0
+        + abs(axis_y) * (cluster.y_back_max_mm - cluster.y_back_min_mm) / 2.0
+    )
+    depth_radius = (
+        abs(depth_x) * (cluster.x_max_mm - cluster.x_min_mm) / 2.0
+        + abs(depth_y) * (cluster.y_back_max_mm - cluster.y_back_min_mm) / 2.0
+    )
+    direction = 1.0 if side >= 0 else -1.0
+    return (
+        center_x + direction * axis_x * axis_radius - depth_x * depth_radius,
+        center_y + direction * axis_y * axis_radius - depth_y * depth_radius,
+    )
 
 
 def choose_gap(
@@ -606,13 +815,24 @@ def choose_gap(
     rotates and one car enters the left half-plane.
     """
 
+    gap_clusters = tuple(
+        cluster for cluster in clusters
+        if is_gap_cluster_eligible(cluster, config)
+    )
+    min_pair_points = max(
+        2,
+        config.gap_pair_min_points,
+        2 * max(1, config.gap_cluster_min_points),
+    )
     candidates = []
-    for first_index, first in enumerate(clusters):
-        first_center_x = (first.x_min_mm + first.x_max_mm) / 2.0
-        first_center_y = (first.y_back_min_mm + first.y_back_max_mm) / 2.0
-        for second in clusters[first_index + 1:]:
-            second_center_x = (second.x_min_mm + second.x_max_mm) / 2.0
-            second_center_y = (second.y_back_min_mm + second.y_back_max_mm) / 2.0
+    for first_index, first in enumerate(gap_clusters):
+        first_center_x = first.center_x_right_mm
+        first_center_y = first.center_y_back_mm
+        for second in gap_clusters[first_index + 1:]:
+            if first.point_count + second.point_count < min_pair_points:
+                continue
+            second_center_x = second.center_x_right_mm
+            second_center_y = second.center_y_back_mm
             axis_x = second_center_x - first_center_x
             axis_y = second_center_y - first_center_y
             center_distance = hypot(axis_x, axis_y)
@@ -638,6 +858,11 @@ def choose_gap(
             center_x = (first_edge_x + second_edge_x) / 2.0
             center_y = (first_edge_y + second_edge_y) / 2.0
             if center_x < config.gap_center_x_min_mm:
+                continue
+            if (
+                reference_center is None
+                and center_y < config.gap_center_y_back_min_mm
+            ):
                 continue
 
             # On the first observation, choose the normal that points from the
@@ -705,6 +930,7 @@ def choose_gap(
 def infer_dynamic_slot_polygon(
     observation: LidarParkingObservation,
     depth_mm: float,
+    width_mm: Optional[float] = None,
 ) -> Optional[Tuple[Tuple[float, float], ...]]:
     """Infer a moving parking-space rectangle from the two bordering cars.
 
@@ -724,25 +950,40 @@ def infer_dynamic_slot_polygon(
     ):
         return None
 
-    first_edge = (
+    detected_first_edge = (
         observation.gap_near_edge_x_right_mm,
         observation.gap_near_edge_y_back_mm,
     )
-    second_edge = (
+    detected_second_edge = (
         observation.gap_far_edge_x_right_mm,
         observation.gap_far_edge_y_back_mm,
     )
-    axis_x = second_edge[0] - first_edge[0]
-    axis_y = second_edge[1] - first_edge[1]
+    axis_x = detected_second_edge[0] - detected_first_edge[0]
+    axis_y = detected_second_edge[1] - detected_first_edge[1]
     axis_length = hypot(axis_x, axis_y)
     if axis_length <= 1e-6:
         return None
 
+    axis_x /= axis_length
+    axis_y /= axis_length
+    center_x = (detected_first_edge[0] + detected_second_edge[0]) / 2.0
+    center_y = (detected_first_edge[1] + detected_second_edge[1]) / 2.0
+    locked_width = axis_length if width_mm is None else max(0.0, width_mm)
+    half_width = locked_width / 2.0
+    first_edge = (
+        center_x - axis_x * half_width,
+        center_y - axis_y * half_width,
+    )
+    second_edge = (
+        center_x + axis_x * half_width,
+        center_y + axis_y * half_width,
+    )
+
     # Use the depth direction locked by the tracker. Only the sign of the
     # perpendicular is selected here, so the rectangle remains orthogonal while
     # never flipping 180 degrees as the LiDAR crosses the entrance line.
-    normal_x = -axis_y / axis_length
-    normal_y = axis_x / axis_length
+    normal_x = -axis_y
+    normal_y = axis_x
     if (
         observation.slot_depth_x_right is not None
         and observation.slot_depth_y_back is not None
@@ -753,8 +994,6 @@ def infer_dynamic_slot_polygon(
             < 0.0
         )
     else:
-        center_x = (first_edge[0] + second_edge[0]) / 2.0
-        center_y = (first_edge[1] + second_edge[1]) / 2.0
         flip_normal = center_x * normal_x + center_y * normal_y < 0.0
     if flip_normal:
         normal_x = -normal_x

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import bisect
 import csv
+import sys
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
 
 
 ScanPoint = Tuple[float, float]
@@ -87,6 +88,89 @@ def load_lidar_csv(path: str) -> List[LidarScan]:
     if current_timestamp is not None:
         groups.append(LidarScan(current_timestamp, tuple(current_points)))
     return groups
+
+
+def find_lidar_port(
+    explicit_port: Optional[str] = None,
+    ports: Optional[Sequence[Any]] = None,
+    exists: Optional[Callable[[str], bool]] = None,
+) -> Optional[str]:
+    """Find the RPLidar serial port, preferring macOS callout devices."""
+
+    exists = exists or (lambda value: Path(value).exists())
+    requested = (
+        None
+        if explicit_port is None or explicit_port.strip().lower() in ("", "auto")
+        else explicit_port
+    )
+    if requested is not None:
+        # Windows serial endpoints such as COM7 are valid device names but are
+        # not filesystem paths, so Path("COM7").exists() is normally false.
+        upper = requested.upper()
+        if exists(requested) or (
+            upper.startswith("COM") and upper[3:].isdigit()
+        ):
+            return requested
+
+    if ports is None:
+        try:
+            from serial.tools import list_ports
+        except ImportError:
+            return None
+        ports = tuple(list_ports.comports())
+
+    candidates = tuple(ports)
+    if sys.platform == "darwin":
+        callout_ports = [
+            port for port in candidates
+            if str(getattr(port, "device", "")).startswith("/dev/cu.")
+        ]
+        if callout_ports:
+            candidates = tuple(callout_ports)
+
+    scored = []
+    for port in candidates:
+        score = _score_lidar_port(port)
+        if score > 0:
+            scored.append((score, str(getattr(port, "device", ""))))
+    if not scored:
+        return None
+    scored.sort(reverse=True)
+    return scored[0][1]
+
+
+def _score_lidar_port(port: Any) -> int:
+    device = str(getattr(port, "device", ""))
+    text = " ".join(
+        str(value).lower()
+        for value in (
+            device,
+            getattr(port, "description", ""),
+            getattr(port, "hwid", ""),
+            getattr(port, "manufacturer", ""),
+        )
+    )
+    if "debug-console" in text or "bluetooth" in text:
+        return 0
+    if "arduino" in text or "usbmodem" in text:
+        return 0
+
+    score = 0
+    if "usbserial" in text:
+        score += 30
+    if "ch340" in text or "1a86:7523" in text:
+        score += 20
+    if "cp210" in text or "silicon labs" in text:
+        score += 15
+    if "usb serial" in text:
+        score += 10
+    if "ttyusb" in text:
+        score += 5
+    if "vid:pid" in text:
+        score += 2
+    if sys.platform == "darwin" and device.startswith("/dev/cu."):
+        score += 3
+    return score
 
 
 class LidarCsvReplay:

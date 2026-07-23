@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -97,7 +98,8 @@ class YoloLaneSegmenter:
             from ultralytics import YOLO
         except ImportError as exc:
             raise RuntimeError(
-                "ultralytics is required for YOLO driving. Run: pip install ultralytics"
+                "ultralytics is required for YOLO driving. Run: %s -m pip install ultralytics"
+                % sys.executable
             ) from exc
 
         self.device = select_yolo_device(config.device)
