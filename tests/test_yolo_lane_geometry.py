@@ -9,6 +9,7 @@ from skku_autocar.runtime.obstacle_mode import (
 )
 from skku_autocar.runtime.yolo_drive_app import (
     CommandSafetyFilter,
+    DrivePriorityController,
     build_bev_corridor_config,
     build_follower_config,
     parse_args,
@@ -340,7 +341,8 @@ class YoloLaneGeometryTest(unittest.TestCase):
         self.assertEqual(bev_config.max_coast_frames, 3)
         self.assertAlmostEqual(bev_config.max_center_jump_px, 150.0)
         self.assertAlmostEqual(bev_config.crosswalk_max_center_jump_px, 150.0)
-        self.assertEqual(follower_config.lane_lost_hold_frames, 10)
+        self.assertTrue(bev_config.virtual_hold)
+        self.assertEqual(follower_config.lane_lost_hold_frames, 3)
         self.assertEqual(follower_config.lane_lost_steering_release_rate_limit, 35)
 
     def test_default_lane_following_uses_last_known_good_drive_tuning(self):
@@ -594,6 +596,49 @@ class YoloLaneGeometryTest(unittest.TestCase):
         self.assertEqual(guarded.steering, 35)
         self.assertIn("virtual_bootstrap", guarded.reason)
 
+    def test_drive_priority_restores_fixed_speed_after_late_obstacle_cap(self):
+        args = parse_args(["--speed", "255", "--fixed-speed", "on"])
+        policy = DrivePriorityController(
+            CommandSafetyFilter(args),
+            traffic_light_enabled=False,
+        )
+        lane = lane_geometry(lateral_error_norm=0.0, heading_error=0.0)
+
+        command = policy.apply(
+            ControlCommand(180, 12, brake=False, reason="lane"),
+            DummyMask("lane-center+right-lane-side"),
+            lane,
+            True,
+            DummyObstacleMode(late_speed_cap=80),
+            DummyTrafficLight(),
+        )
+
+        self.assertEqual(command.speed, 255)
+        self.assertEqual(command.steering, 12)
+        self.assertIn("fixed_speed", command.reason)
+        self.assertIn("late_obstacle_cap", command.reason)
+
+    def test_drive_priority_never_overrides_brake_with_fixed_speed(self):
+        args = parse_args(["--speed", "255", "--fixed-speed", "on"])
+        policy = DrivePriorityController(
+            CommandSafetyFilter(args),
+            traffic_light_enabled=True,
+        )
+        lane = lane_geometry(lateral_error_norm=0.0, heading_error=0.0)
+
+        command = policy.apply(
+            ControlCommand(255, 0, brake=False, reason="lane"),
+            DummyMask("lane-center+right-lane-side"),
+            lane,
+            True,
+            DummyObstacleMode(),
+            DummyTrafficLight(stop=True),
+        )
+
+        self.assertTrue(command.brake)
+        self.assertEqual(command.speed, 0)
+        self.assertEqual(command.reason, "traffic_light:red_contact")
+
 
 def lane_geometry(lateral_error_norm: float, heading_error: float) -> LaneGeometry:
     return LaneGeometry(
@@ -612,6 +657,39 @@ def lane_geometry(lateral_error_norm: float, heading_error: float) -> LaneGeomet
 class DummyMask:
     def __init__(self, class_name: str):
         self.class_name = class_name
+
+
+class DummyObstacleMode:
+    blocks_light_stop = False
+
+    def __init__(self, late_speed_cap: int = 0):
+        self.late_speed_cap = late_speed_cap
+
+    def apply_steering(self, command: ControlCommand) -> ControlCommand:
+        return command
+
+    def apply_speed_cap(self, command: ControlCommand) -> ControlCommand:
+        return command
+
+    def apply_safety(self, command: ControlCommand, running: bool) -> ControlCommand:
+        if not running or command.brake or self.late_speed_cap <= 0:
+            return command
+        return ControlCommand(
+            speed=min(command.speed, self.late_speed_cap),
+            steering=command.steering,
+            brake=False,
+            reason="%s:late_obstacle_cap" % command.reason,
+        )
+
+
+class DummyTrafficLight:
+    def __init__(self, stop: bool = False):
+        self.stop = stop
+
+    def apply(self, command: ControlCommand, running: bool) -> ControlCommand:
+        if self.stop and running:
+            return ControlCommand.stop("traffic_light:red_contact")
+        return command
 
 
 if __name__ == "__main__":

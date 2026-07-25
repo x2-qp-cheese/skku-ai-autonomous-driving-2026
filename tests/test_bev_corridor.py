@@ -194,6 +194,64 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
         self.assertAlmostEqual(lane.center_x, 86.5, delta=0.2)
         self.assertLess(lane.center_x, 111.5)
 
+    def test_virtual_hold_preserves_last_curve_direction(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lane_width_px=60.0,
+                center_smooth_alpha=1.0,
+                heading_smooth_alpha=1.0,
+                max_coast_frames=0,
+                virtual_hold=True,
+                virtual_hold_recenter_alpha=0.0,
+                vehicle_center_x_offset_ratio=0.0,
+            )
+        )
+
+        before = estimator.estimate(
+            BevClassMasks(
+                center=[slanted_line_mask(60.0, 0.20)],
+                center_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+        virtual = estimator.estimate(BevClassMasks(shape=(100, 200)))
+
+        self.assertTrue(virtual.found)
+        self.assertEqual(estimator.last_class_name, "virtual-hold")
+        self.assertTrue(virtual.reason.startswith("virtual_hold:no_corridor"))
+        self.assertAlmostEqual(virtual.center_x, before.center_x, delta=0.2)
+        self.assertAlmostEqual(virtual.heading_error, before.heading_error, delta=0.01)
+        self.assertNotAlmostEqual(
+            estimator.last_centerline_bev[0][0],
+            estimator.last_centerline_bev[-1][0],
+            delta=1.0,
+        )
+
+    def test_virtual_hold_recenter_shifts_curve_without_flattening_it(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lane_width_px=60.0,
+                center_smooth_alpha=1.0,
+                heading_smooth_alpha=1.0,
+                max_coast_frames=0,
+                virtual_hold=True,
+                virtual_hold_recenter_alpha=0.25,
+                vehicle_center_x_offset_ratio=0.0,
+            )
+        )
+
+        before = estimator.estimate(
+            BevClassMasks(
+                center=[slanted_line_mask(60.0, 0.20)],
+                center_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+        virtual = estimator.estimate(BevClassMasks(shape=(100, 200)))
+
+        self.assertLess(abs(virtual.lateral_error_norm), abs(before.lateral_error_norm))
+        self.assertAlmostEqual(virtual.heading_error, before.heading_error, delta=0.01)
+
     def test_disabled_obstacle_mode_skips_obstacle_bev_warp(self):
         transformer = CountingTransformer()
         masks = SimpleNamespace(

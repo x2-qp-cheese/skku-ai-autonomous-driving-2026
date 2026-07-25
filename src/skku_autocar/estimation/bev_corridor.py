@@ -150,10 +150,12 @@ class BevCorridorConfig:
     vehicle_width_px: float = 120.0
     virtual_hold_max_frames: int = 45
     virtual_hold_confidence: float = 0.3
-    # Per-frame easing of the held center toward the vehicle axis (0 = freeze at the
-    # last lane center, 1 = snap straight to center). A small value straightens the
-    # car out gradually while blind.
-    virtual_hold_recenter_alpha: float = 0.05
+    # Per-frame lateral easing of the held curve toward the vehicle axis
+    # (0 = freeze on the last lane curve, 1 = snap the whole curve laterally to
+    # the vehicle axis). Keep this at 0 for the competition track: when YOLO is
+    # briefly blind on an S-curve/crosswalk, the last measured lane direction is
+    # more reliable than inventing a new straight line.
+    virtual_hold_recenter_alpha: float = 0.0
 
 
 @dataclass
@@ -739,42 +741,47 @@ class BevCorridorLaneEstimator:
         )
 
     def _virtual_hold_lane(self, bev_shape: Tuple[int, int], reason: str) -> LaneGeometry:
-        """Last-resort fallback: no lane evidence remains, so build a straight
-        virtual lane one vehicle-width wide and keep the car centered in it.
+        """Last-resort fallback: keep following the last known lane curve.
 
-        The centerline is anchored on the last known lane center (falling back to
-        the vehicle axis when nothing was ever seen) and eased toward the vehicle
-        axis each frame, so the car straightens out gradually instead of freezing a
-        mid-curve steering bias. The lane is reported as found (low confidence) so
-        the follower keeps driving and re-centers; the "virtual" class name lets the
-        drive-time safety guard cap its speed/steering."""
-        import numpy as np
-
+        The competition track is made of straights plus predictable curves, so a
+        short blind section should continue along the last reliable centerline and
+        boundary direction. Falling back to a vertical line would discard the curve
+        tangent and can pull the target away from the lane on S-curves/crosswalks.
+        If no previous curve exists, only then synthesize a straight lane."""
         height, width = bev_shape
         vehicle_center_x = self._vehicle_center_x(width)
         target_y = height * self.config.lookahead_y_ratio
         near_target_y = height * self.config.lane_change_near_y_ratio
 
-        if self._virtual_center_x is None:
-            self._virtual_center_x = (
-                self._smoothed_center_x if self._smoothed_center_x is not None else vehicle_center_x
+        held_centerline, held_left, held_right = self._last_overlays
+        if len(held_centerline) >= 2:
+            centerline, left, right = self._virtual_curve_from_last(
+                held_centerline,
+                held_left,
+                held_right,
+                vehicle_center_x,
+                target_y,
+                width,
             )
-        # Ease the held center back toward the vehicle axis so we straighten out.
-        alpha = self._clip(self.config.virtual_hold_recenter_alpha, 0.0, 1.0)
-        self._virtual_center_x = (1.0 - alpha) * self._virtual_center_x + alpha * vehicle_center_x
-        center_x = self._clip(self._virtual_center_x, 0.0, float(width - 1))
+        else:
+            centerline, left, right = self._straight_virtual_lane(
+                bev_shape,
+                vehicle_center_x,
+            )
+
+        fit_info = self._fit_points(centerline)
+        center_x = self._clip(self._x_at(fit_info, target_y), 0.0, float(width - 1))
+        near_center_x = self._clip(
+            self._x_at(fit_info, near_target_y),
+            0.0,
+            float(width - 1),
+        )
+        heading_error = self._heading_error(fit_info["fit"], height)
         self._virtual_hold_frames += 1
 
-        # Straight vertical virtual lane centered on the hold: one vehicle-width
-        # wide normally, or one crosswalk-lane-width wide through a crosswalk.
-        lane_w = self.config.crosswalk_lane_width_px if self._crosswalk_active else self.config.vehicle_width_px
-        half = 0.5 * lane_w
-        top = height * self.config.sample_top_y_ratio
-        bottom = height * self.config.sample_bottom_y_ratio
-        ys = np.linspace(top, bottom, self.config.num_samples)
-        self.last_centerline_bev = [(center_x, float(y)) for y in ys]
-        self.last_center_line_bev = [(center_x - half, float(y)) for y in ys]
-        self.last_right_line_bev = [(center_x + half, float(y)) for y in ys]
+        self.last_centerline_bev = centerline
+        self.last_center_line_bev = left
+        self.last_right_line_bev = right
         self.last_class_name = "virtual-hold"
         self.last_tier = 5
         self.last_lane_width_px = self.config.vehicle_width_px
@@ -782,13 +789,19 @@ class BevCorridorLaneEstimator:
         # Keep temporal state consistent so a recovered real frame transitions
         # smoothly (gated/smoothed relative to the held center, not a stale one).
         self._smoothed_center_x = center_x
-        self._smoothed_near_center_x = center_x
+        self._smoothed_near_center_x = near_center_x
         self._last_raw_center_x = center_x
-        self._last_raw_heading = 0.0
-        self._smoothed_heading = 0.0
+        self._last_raw_heading = heading_error
+        self._smoothed_heading = heading_error
 
         lateral_error_px = center_x - vehicle_center_x
         lateral_error_norm = self._clip(lateral_error_px / (width / 2.0), -1.0, 1.0)
+        near_lateral_error_px = near_center_x - vehicle_center_x
+        near_lateral_error_norm = self._clip(
+            near_lateral_error_px / (width / 2.0),
+            -1.0,
+            1.0,
+        )
         return LaneGeometry(
             found=True,
             center_x=center_x,
@@ -796,15 +809,103 @@ class BevCorridorLaneEstimator:
             target_y=target_y,
             lateral_error_px=lateral_error_px,
             lateral_error_norm=lateral_error_norm,
-            heading_error=0.0,
+            heading_error=heading_error,
             confidence=self._clip(self.config.virtual_hold_confidence, 0.0, 1.0),
             reason="virtual_hold:%s(%d)" % (reason, self._virtual_hold_frames),
             height=float(height),
-            near_center_x=center_x,
+            near_center_x=near_center_x,
             near_target_y=near_target_y,
-            near_lateral_error_px=lateral_error_px,
-            near_lateral_error_norm=lateral_error_norm,
+            near_lateral_error_px=near_lateral_error_px,
+            near_lateral_error_norm=near_lateral_error_norm,
         )
+
+    def _virtual_curve_from_last(
+        self,
+        centerline: List[Tuple[float, float]],
+        left: List[Tuple[float, float]],
+        right: List[Tuple[float, float]],
+        vehicle_center_x: float,
+        target_y: float,
+        width: int,
+    ) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]], List[Tuple[float, float]]]:
+        fit_info = self._fit_points(centerline)
+        base_center_x = self._clip(self._x_at(fit_info, target_y), 0.0, float(width - 1))
+        if self._virtual_center_x is None:
+            self._virtual_center_x = base_center_x
+        alpha = self._clip(self.config.virtual_hold_recenter_alpha, 0.0, 1.0)
+        self._virtual_center_x = (
+            (1.0 - alpha) * self._virtual_center_x
+            + alpha * vehicle_center_x
+        )
+        shift = self._virtual_center_x - base_center_x
+        virtual_centerline = self._shift_points(centerline, shift)
+        if len(left) >= 2 and len(right) >= 2:
+            virtual_left = self._shift_points(left, shift)
+            virtual_right = self._shift_points(right, shift)
+        else:
+            virtual_left, virtual_right = self._virtual_boundaries_from_centerline(virtual_centerline)
+        return virtual_centerline, virtual_left, virtual_right
+
+    def _straight_virtual_lane(
+        self,
+        bev_shape: Tuple[int, int],
+        vehicle_center_x: float,
+    ) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]], List[Tuple[float, float]]]:
+        import numpy as np
+
+        height, _ = bev_shape
+        if self._virtual_center_x is None:
+            self._virtual_center_x = (
+                self._smoothed_center_x
+                if self._smoothed_center_x is not None
+                else vehicle_center_x
+            )
+        alpha = self._clip(self.config.virtual_hold_recenter_alpha, 0.0, 1.0)
+        self._virtual_center_x = (
+            (1.0 - alpha) * self._virtual_center_x
+            + alpha * vehicle_center_x
+        )
+        top = height * self.config.sample_top_y_ratio
+        bottom = height * self.config.sample_bottom_y_ratio
+        ys = np.linspace(top, bottom, self.config.num_samples)
+        centerline = [(float(self._virtual_center_x), float(y)) for y in ys]
+        left, right = self._virtual_boundaries_from_centerline(centerline)
+        return centerline, left, right
+
+    def _virtual_boundaries_from_centerline(
+        self,
+        centerline: List[Tuple[float, float]],
+    ) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+        lane_w = (
+            self.config.crosswalk_lane_width_px
+            if self._crosswalk_active
+            else self.config.vehicle_width_px
+        )
+        half = 0.5 * lane_w
+        left = [(float(x - half), float(y)) for x, y in centerline]
+        right = [(float(x + half), float(y)) for x, y in centerline]
+        return left, right
+
+    def _fit_points(self, points: List[Tuple[float, float]]) -> dict:
+        import numpy as np
+
+        xs = np.array([float(x) for x, _ in points], dtype=float)
+        ys = np.array([float(y) for _, y in points], dtype=float)
+        degree = min(self.config.poly_degree, len(points) - 1)
+        fit = np.polyfit(ys, xs, degree)
+        return {
+            "fit": fit,
+            "min_y": float(ys.min()),
+            "max_y": float(ys.max()),
+            "n": len(points),
+        }
+
+    @staticmethod
+    def _shift_points(
+        points: List[Tuple[float, float]],
+        dx: float,
+    ) -> List[Tuple[float, float]]:
+        return [(float(x + dx), float(y)) for x, y in points]
 
     def _reset_temporal(self) -> None:
         self._coast_frames = 0

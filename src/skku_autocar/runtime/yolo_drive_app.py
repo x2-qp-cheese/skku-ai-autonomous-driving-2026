@@ -57,6 +57,10 @@ def run(args: argparse.Namespace) -> int:
     follower_config = build_follower_config(args)
     follower = YoloLaneFollower(follower_config)
     command_filter = CommandSafetyFilter(args)
+    drive_policy = DrivePriorityController(
+        command_filter,
+        traffic_light_enabled=args.traffic_light == "on",
+    )
     obstacle_mode = ObstacleDriveMode(args, transformer, corridor_estimator)
     traffic_light = TrafficLightController(
         TrafficLightConfig(
@@ -202,10 +206,6 @@ def run(args: argparse.Namespace) -> int:
                 now,
                 running,
             )
-            planned_command = follower.plan(lane) if running else ControlCommand.stop("paused")
-            planned_command = obstacle_mode.apply_steering(planned_command)
-            command = command_filter.apply(mask_result, lane, planned_command, running)
-            command = obstacle_mode.apply_speed_cap(command)
             stop_crosswalk_masks = (
                 class_masks.crosswalk
                 if class_masks.crosswalk_conf >= args.light_crosswalk_min_conf
@@ -214,9 +214,15 @@ def run(args: argparse.Namespace) -> int:
             if obstacle_mode.blocks_light_stop:
                 stop_crosswalk_masks = ()
             light_observation = traffic_light.update(frame, light_masks, stop_crosswalk_masks)
-            if args.traffic_light == "on" and not obstacle_mode.blocks_light_stop:
-                command = traffic_light.apply(command, running)
-            command = obstacle_mode.apply_safety(command, running)
+            planned_command = follower.plan(lane) if running else ControlCommand.stop("paused")
+            command = drive_policy.apply(
+                planned_command,
+                mask_result,
+                lane,
+                running,
+                obstacle_mode,
+                traffic_light,
+            )
 
             if vehicle is not None and now - last_command_at >= 1.0 / args.command_rate:
                 serial_lines = vehicle.send(command)
@@ -525,6 +531,11 @@ class CommandSafetyFilter:
         self._virtual_frames = 0
         self._reliable_frames = 0
 
+    def finalize(self, command: ControlCommand, running: bool) -> ControlCommand:
+        if not running:
+            return command
+        return self._force_fixed_speed(command)
+
     def _guard_virtual_command(self, command: ControlCommand) -> ControlCommand:
         if self._reliable_frames < self.virtual_lane_min_reliable_frames:
             return self._guard_virtual_bootstrap_command(command)
@@ -592,11 +603,18 @@ class CommandSafetyFilter:
     def _force_fixed_speed(self, command: ControlCommand) -> ControlCommand:
         if not self.fixed_speed or command.brake:
             return command
+        if command.speed == self.fixed_speed_value and self._reason_has(command.reason, "fixed_speed"):
+            return command
+        reason = (
+            command.reason
+            if self._reason_has(command.reason, "fixed_speed")
+            else self._append_reason(command.reason, "fixed_speed")
+        )
         return ControlCommand(
             speed=self.fixed_speed_value,
             steering=command.steering,
             brake=command.brake,
-            reason=self._append_reason(command.reason, "fixed_speed"),
+            reason=reason,
         )
 
     def _cap_or_fix_speed(self, speed: int, cap: int) -> int:
@@ -635,6 +653,48 @@ class CommandSafetyFilter:
     @staticmethod
     def _append_reason(reason: str, suffix: str) -> str:
         return "%s:%s" % (reason, suffix) if reason else suffix
+
+    @staticmethod
+    def _reason_has(reason: str, token: str) -> bool:
+        return token in reason.split(":") if reason else False
+
+
+class DrivePriorityController:
+    """Single command-composition point for one runtime frame.
+
+    Priority order:
+    1. Lane follower provides the normal steering command.
+    2. Obstacle lane-change logic may shift/assist steering.
+    3. Geometry guards handle virtual or lost lane evidence.
+    4. Mission stops, such as a red light at a crosswalk, may brake.
+    5. Obstacle emergency safety may brake.
+    6. Fixed-speed policy is finalized for every non-brake command.
+    """
+
+    def __init__(
+        self,
+        command_filter: CommandSafetyFilter,
+        traffic_light_enabled: bool = True,
+    ) -> None:
+        self._command_filter = command_filter
+        self._traffic_light_enabled = traffic_light_enabled
+
+    def apply(
+        self,
+        base_command: ControlCommand,
+        mask_result: Optional[YoloLaneMask],
+        lane: LaneGeometry,
+        running: bool,
+        obstacle_mode: Any,
+        traffic_light: TrafficLightController,
+    ) -> ControlCommand:
+        command = obstacle_mode.apply_steering(base_command)
+        command = obstacle_mode.apply_speed_cap(command)
+        command = self._command_filter.apply(mask_result, lane, command, running)
+        if self._traffic_light_enabled and not obstacle_mode.blocks_light_stop:
+            command = traffic_light.apply(command, running)
+        command = obstacle_mode.apply_safety(command, running)
+        return self._command_filter.finalize(command, running)
 
 
 def parse_args(argv: Optional[list]) -> argparse.Namespace:
@@ -766,7 +826,7 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument(
         "--lane-lost-hold-frames",
         type=int,
-        default=10,
+        default=3,
         help="keep the last steering/speed for up to this many frames when the lane is not detected (e.g. crosswalks) before stopping",
     )
     parser.add_argument(
@@ -881,7 +941,7 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument(
         "--corridor-virtual-hold",
         choices=("on", "off"),
-        default="off",
+        default="on",
         help="[--bev-corridor] when the lane is fully lost, hold a vehicle-width virtual lane and keep centered (guarded by the virtual-lane safety caps) instead of braking immediately",
     )
     parser.add_argument(
