@@ -388,6 +388,7 @@ def build_follower_config(args: argparse.Namespace) -> YoloLaneFollowerConfig:
         speed_curve_slowdown=args.speed_curve_slowdown,
         lateral_priority_threshold=args.lateral_priority_threshold,
         curve_strength_alpha=args.curve_strength_alpha,
+        curve_strength_release_alpha=args.curve_strength_release_alpha,
         straight_steering_scale=args.straight_steering_scale,
         curve_steering_scale=args.curve_steering_scale,
         center_recovery_error_threshold=args.center_recovery_error_threshold,
@@ -430,7 +431,7 @@ def log_effective_config(
             follower_config.steering_release_rate_limit,
         )
     LOG.info(
-        "control speed=%d min_curve=%d max=%d max_steer=%d kp_lat=%.1f kd_lat=%.1f kp_head=%.1f kd_head=%.1f scale=%.2f..%.2f lateral_priority=%.2f curve_alpha=%.2f center_lock=%s threshold=%.2f min=%d lane_lost_release=%d/frame",
+        "control speed=%d min_curve=%d max=%d max_steer=%d kp_lat=%.1f kd_lat=%.1f kp_head=%.1f kd_head=%.1f scale=%.2f..%.2f lateral_priority=%.2f curve_alpha=%.2f/%.2f center_lock=%s threshold=%.2f min=%d lane_lost_release=%d/frame",
         follower_config.base_speed,
         follower_config.min_curve_speed,
         follower_config.max_speed,
@@ -443,6 +444,7 @@ def log_effective_config(
         follower_config.curve_steering_scale,
         follower_config.lateral_priority_threshold,
         follower_config.curve_strength_alpha,
+        follower_config.curve_strength_release_alpha,
         "on" if follower_config.center_lock_enabled else "off",
         follower_config.center_lock_error_threshold,
         follower_config.center_lock_min_steering,
@@ -780,7 +782,7 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument("--max-steering", type=int, default=150)
     parser.add_argument("--steering-rate-limit", type=int, default=150)
     parser.add_argument("--min-steering-rate-limit", type=int, default=35)
-    parser.add_argument("--steering-release-rate-limit", type=int, default=10)
+    parser.add_argument("--steering-release-rate-limit", type=int, default=6)
     parser.add_argument("--kp-lateral", type=float, default=205.0)
     parser.add_argument("--kd-lateral", type=float, default=75.0)
     parser.add_argument("--kp-heading", type=float, default=1.5)
@@ -795,32 +797,38 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument(
         "--curve-strength-alpha",
         type=float,
-        default=0.45,
-        help="curve strength smoothing alpha; lower keeps curve state longer",
+        default=0.60,
+        help="curve strength rise smoothing alpha; higher enters curve steering faster",
+    )
+    parser.add_argument(
+        "--curve-strength-release-alpha",
+        type=float,
+        default=0.18,
+        help="curve strength fall smoothing alpha; lower holds curve steering longer at curve exit",
     )
     parser.add_argument("--straight-steering-scale", type=float, default=0.50)
     parser.add_argument("--curve-steering-scale", type=float, default=1.68)
-    parser.add_argument("--center-recovery-error-threshold", type=float, default=0.12)
-    parser.add_argument("--center-recovery-steering-boost", type=float, default=1.20)
-    parser.add_argument("--center-recovery-min-steering", type=int, default=70)
+    parser.add_argument("--center-recovery-error-threshold", type=float, default=0.08)
+    parser.add_argument("--center-recovery-steering-boost", type=float, default=1.35)
+    parser.add_argument("--center-recovery-min-steering", type=int, default=85)
     parser.add_argument("--center-recovery-rate-limit", type=int, default=150)
     parser.add_argument("--center-recovery-max-speed", type=int, default=255)
     parser.add_argument(
         "--center-lock",
         choices=("on", "off"),
-        default="off",
+        default="on",
         help="force at least --center-lock-min-steering toward lane center when lateral error exceeds --center-lock-error-threshold",
     )
     parser.add_argument(
         "--center-lock-error-threshold",
         type=float,
-        default=0.05,
+        default=0.055,
         help="normalized lateral error that activates center-lock steering",
     )
     parser.add_argument(
         "--center-lock-min-steering",
         type=int,
-        default=90,
+        default=75,
         help="minimum absolute steering while center-lock is active",
     )
     parser.add_argument(
@@ -917,7 +925,7 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument(
         "--corridor-max-heading-jump",
         type=float,
-        default=BevCorridorConfig.max_heading_jump,
+        default=0.45,
         help="[--bev-corridor] reject and coast a frame whose heading jumps more than this normalized amount",
     )
     parser.add_argument(
@@ -959,7 +967,7 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument(
         "--corridor-centerline-bias",
         type=float,
-        default=0.50,
+        default=0.46,
         help="[--bev-corridor] driving line position between boundaries: 0=center line, 0.5=midpoint, 1=outer side line. Raise if the car rides too far inside",
     )
     parser.add_argument(
@@ -995,7 +1003,7 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument(
         "--bev-lookahead",
         type=float,
-        default=0.55,
+        default=0.45,
         help="BEV row ratio where lateral error is measured; defaults to --lookahead when provided, otherwise BEV default",
     )
     parser.add_argument(

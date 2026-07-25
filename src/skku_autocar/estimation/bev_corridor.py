@@ -110,11 +110,20 @@ class BevCorridorConfig:
     # (coast on the last good geometry) ONLY while a crosswalk is in view. Normal
     # driving keeps its responsive values.
     crosswalk_center_smooth_alpha: float = 0.15
-    crosswalk_max_center_jump_px: float = 30.0
+    crosswalk_max_center_jump_px: float = 150.0
     # Crosswalk option A follows the center line with a virtual right boundary.
     # Option B follows a detected right boundary at a fixed inward BEV offset.
     crosswalk_option: str = "a"
     crosswalk_right_offset_px: float = 90.0
+    # Stable pre-crosswalk cache. The cache is updated only on reliable
+    # non-crosswalk frames, then frozen while the zebra stripes are visible. This
+    # prevents the "hold" path from capturing a late, already-skewed crosswalk
+    # frame and steering away from the previous yellow dashed lane direction.
+    crosswalk_cache_min_confidence: float = 0.45
+    crosswalk_cache_max_lateral_error: float = 0.35
+    crosswalk_cache_max_heading: float = 0.28
+    crosswalk_cache_max_center_delta_px: float = 45.0
+    crosswalk_cache_max_heading_delta: float = 0.18
     # A real lane line is thin at every BEV row; rows spanning wider than this
     # (ratio of BEV width) are dropped from a single line's fit, so a stray wide
     # blob (e.g. a mislabeled crosswalk stripe leaking into center/side) can't
@@ -237,6 +246,10 @@ class BevCorridorLaneEstimator:
         # True while a crosswalk is in view: build the corridor from the fixed
         # crosswalk_lane_width_px instead of the (zebra-contaminated) measured width.
         self._crosswalk_active: bool = False
+        self._crosswalk_cache_lane: Optional[LaneGeometry] = None
+        self._crosswalk_cache_overlays: Tuple[list, list, list] = ([], [], [])
+        self._crosswalk_cache_raw_center_x: Optional[float] = None
+        self._crosswalk_cache_raw_heading: Optional[float] = None
 
     # ------------------------------------------------------------------
     def estimate(self, bev: BevClassMasks) -> LaneGeometry:
@@ -272,17 +285,15 @@ class BevCorridorLaneEstimator:
         self._crosswalk_active = self.last_crosswalk_visible
         if self._crosswalk_active:
             self.last_lane_width_px = self.config.crosswalk_lane_width_px
-            if (
-                self.config.crosswalk_option.lower() == "b"
-                and self._last_lane is not None
-            ):
-                return self._hold_crosswalk_lane()
 
         center_fit = self._fit_line(bev.center, bev.shape)
         side_fits = [f for f in (self._fit_line([m], bev.shape) for m in bev.side) if f]
 
         resolved = self._resolve(center_fit, side_fits, bev, vehicle_center_x, target_y)
         if resolved is None:
+            held = self._hold_crosswalk_lane_if_available("no_corridor")
+            if held is not None:
+                return held
             # A momentary YOLO miss: coast rather than dropping the lane outright.
             return self._coast_or_lost(bev.shape, "no_corridor")
 
@@ -291,12 +302,27 @@ class BevCorridorLaneEstimator:
         raw_near_center_x = float(np.polyval(centerline_fit["fit"], near_target_y))
         raw_heading = self._heading_error(centerline_fit["fit"], height)
 
+        crosswalk_reject = self._crosswalk_reject_reason(
+            raw_center_x,
+            raw_heading,
+        )
+        if crosswalk_reject is not None:
+            held = self._hold_crosswalk_lane_if_available(crosswalk_reject)
+            if held is not None:
+                return held
+
         # Temporal gate: outlier fits show up as a big lookahead center_x or
         # heading jump. Reject the frame and coast on the last good geometry
         # instead of letting the EMA follow it.
         if self._is_center_jump(raw_center_x):
+            held = self._hold_crosswalk_lane_if_available("center_jump")
+            if held is not None:
+                return held
             return self._coast_or_lost(bev.shape, "center_jump")
         if self._is_heading_jump(raw_heading):
+            held = self._hold_crosswalk_lane_if_available("heading_jump")
+            if held is not None:
+                return held
             return self._coast_or_lost(bev.shape, "heading_jump")
 
         self._coast_frames = 0
@@ -351,6 +377,8 @@ class BevCorridorLaneEstimator:
             near_lateral_error_norm=near_lateral_error_norm,
         )
         self._last_lane = lane
+        if not self._crosswalk_active:
+            self._maybe_update_crosswalk_cache(lane, raw_center_x, raw_heading, width)
         return lane
 
     # ------------------------------------------------------------------
@@ -377,6 +405,8 @@ class BevCorridorLaneEstimator:
                 centerline["points"] = self._line_points(centerline)
                 left = self._offset(right, -2.0 * offset_px)
                 return centerline, left, right, 3, "crosswalk-right-side-b", bev.side_conf
+            if self._crosswalk_cache_lane is not None:
+                return None
 
         # Tier 1: center line + a real right-side line.
         if center_fit is not None and side_fits:
@@ -718,11 +748,27 @@ class BevCorridorLaneEstimator:
         self.last_tier = 0
         return self._lost(bev_shape, ("lost:%s" % reason) if had_last else reason)
 
-    def _hold_crosswalk_lane(self) -> LaneGeometry:
-        prev = self._last_lane
+    def _hold_crosswalk_lane_if_available(self, reason: str) -> Optional[LaneGeometry]:
+        if not self._crosswalk_active or self._crosswalk_cache_lane is None:
+            return None
+        return self._hold_crosswalk_lane(reason)
+
+    def _hold_crosswalk_lane(self, reason: str = "cache") -> LaneGeometry:
+        prev = self._crosswalk_cache_lane
         assert prev is not None
         self.last_class_name = "crosswalk-hold-right-lane"
-        self.last_centerline_bev, self.last_center_line_bev, self.last_right_line_bev = self._last_overlays
+        self.last_tier = 3
+        self.last_lane_width_px = self.config.crosswalk_lane_width_px
+        self.last_centerline_bev, self.last_center_line_bev, self.last_right_line_bev = self._crosswalk_cache_overlays
+        self._last_overlays = self._crosswalk_cache_overlays
+        self._last_lane = prev
+        self._smoothed_center_x = prev.center_x
+        self._smoothed_near_center_x = prev.near_center_x
+        self._smoothed_heading = prev.heading_error
+        if self._crosswalk_cache_raw_center_x is not None:
+            self._last_raw_center_x = self._crosswalk_cache_raw_center_x
+        if self._crosswalk_cache_raw_heading is not None:
+            self._last_raw_heading = self._crosswalk_cache_raw_heading
         return LaneGeometry(
             found=True,
             center_x=prev.center_x,
@@ -732,13 +778,57 @@ class BevCorridorLaneEstimator:
             lateral_error_norm=prev.lateral_error_norm,
             heading_error=prev.heading_error,
             confidence=prev.confidence,
-            reason=prev.reason,
+            reason="crosswalk_hold:%s" % reason,
             height=prev.height,
             near_center_x=prev.near_center_x,
             near_target_y=prev.near_target_y,
             near_lateral_error_px=prev.near_lateral_error_px,
             near_lateral_error_norm=prev.near_lateral_error_norm,
         )
+
+    def _maybe_update_crosswalk_cache(
+        self,
+        lane: LaneGeometry,
+        raw_center_x: float,
+        raw_heading: float,
+        width: int,
+    ) -> None:
+        if not lane.found:
+            return
+        if lane.confidence < self.config.crosswalk_cache_min_confidence:
+            return
+        raw_lateral_error = raw_center_x - lane.vehicle_center_x
+        raw_lateral_norm = self._clip(raw_lateral_error / (width / 2.0), -1.0, 1.0)
+        max_lateral = max(0.0, float(self.config.crosswalk_cache_max_lateral_error))
+        if abs(raw_lateral_norm) > max_lateral:
+            return
+        max_heading = max(0.0, float(self.config.crosswalk_cache_max_heading))
+        if abs(raw_heading) > max_heading or abs(lane.heading_error) > max_heading:
+            return
+        if len(self.last_centerline_bev) < 2:
+            return
+
+        self._crosswalk_cache_lane = lane
+        self._crosswalk_cache_overlays = self._last_overlays
+        self._crosswalk_cache_raw_center_x = raw_center_x
+        self._crosswalk_cache_raw_heading = raw_heading
+
+    def _crosswalk_reject_reason(
+        self,
+        raw_center_x: float,
+        raw_heading: float,
+    ) -> Optional[str]:
+        if not self._crosswalk_active or self._crosswalk_cache_lane is None:
+            return None
+        if self._crosswalk_cache_raw_center_x is not None:
+            max_delta = max(0.0, float(self.config.crosswalk_cache_max_center_delta_px))
+            if abs(raw_center_x - self._crosswalk_cache_raw_center_x) > max_delta:
+                return "cache_center_guard"
+        if self._crosswalk_cache_raw_heading is not None:
+            max_heading_delta = max(0.0, float(self.config.crosswalk_cache_max_heading_delta))
+            if abs(raw_heading - self._crosswalk_cache_raw_heading) > max_heading_delta:
+                return "cache_heading_guard"
+        return None
 
     def _virtual_hold_lane(self, bev_shape: Tuple[int, int], reason: str) -> LaneGeometry:
         """Last-resort fallback: keep following the last known lane curve.
@@ -960,6 +1050,12 @@ class BevCorridorLaneEstimator:
         self.last_right_line_bev = []
         self.last_class_name = "none"
         self.last_tier = 0
+        self.last_crosswalk_visible = False
+        self._crosswalk_active = False
+        self._crosswalk_cache_lane = None
+        self._crosswalk_cache_overlays = ([], [], [])
+        self._crosswalk_cache_raw_center_x = None
+        self._crosswalk_cache_raw_heading = None
         self._reset_temporal()
 
     def _lost(self, bev_shape: Tuple[int, int], reason: str) -> LaneGeometry:

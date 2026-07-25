@@ -25,6 +25,7 @@ class YoloLaneFollowerConfig:
     speed_curve_slowdown: int = 70
     lateral_priority_threshold: float = 0.10
     curve_strength_alpha: float = 0.35
+    curve_strength_release_alpha: float = 0.18
     straight_steering_scale: float = 0.45
     curve_steering_scale: float = 1.45
     center_recovery_error_threshold: float = 0.14
@@ -70,26 +71,27 @@ class YoloLaneFollower:
 
         raw_curve_strength = self._curve_strength_from(lane)
         curve_strength = self._smooth_curve_strength(raw_curve_strength)
-        recovery_strength = self._center_recovery_strength(lane.lateral_error_norm)
-        center_lock_active = self._center_lock_active(lane.lateral_error_norm)
+        centering_error = self._centering_error(lane)
+        recovery_strength = self._center_recovery_strength(centering_error)
+        center_lock_active = self._center_lock_active(centering_error)
 
-        lateral_derivative = self._derivative(lane.lateral_error_norm, self._last_lateral_error)
+        lateral_derivative = self._derivative(centering_error, self._last_lateral_error)
         heading_error = self._effective_heading_error(
-            lane.lateral_error_norm,
+            centering_error,
             lane.heading_error,
             center_lock_active,
         )
         heading_derivative = self._derivative(heading_error, self._last_heading_error)
         steering_scale = self._steering_scale(curve_strength)
         raw_steering = (
-            self.config.kp_lateral * lane.lateral_error_norm
+            self.config.kp_lateral * centering_error
             + self.config.kd_lateral * lateral_derivative
             + self.config.kp_heading * heading_error
             + self.config.kd_heading * heading_derivative
         ) * steering_scale
-        raw_steering = self._apply_center_recovery(raw_steering, lane.lateral_error_norm, recovery_strength)
-        raw_steering = self._apply_center_lock(raw_steering, lane.lateral_error_norm, center_lock_active)
-        if self._opposes_lateral(lane.lateral_error_norm, self._last_steering, center_lock_active):
+        raw_steering = self._apply_center_recovery(raw_steering, centering_error, recovery_strength)
+        raw_steering = self._apply_center_lock(raw_steering, centering_error, center_lock_active)
+        if self._opposes_lateral(centering_error, self._last_steering, center_lock_active):
             self._last_steering = 0
         rate_limit_strength = max(recovery_strength, 1.0 if center_lock_active else 0.0)
         steering = self._rate_limit(int(round(raw_steering)), curve_strength, rate_limit_strength)
@@ -101,7 +103,7 @@ class YoloLaneFollower:
         speed = self._clip(speed, 0, self.config.max_speed)
 
         self._last_steering = steering
-        self._last_lateral_error = lane.lateral_error_norm
+        self._last_lateral_error = centering_error
         self._last_heading_error = heading_error
         reason = "yolo_lane_follow:center_lock" if center_lock_active else "yolo_lane_follow"
         command = ControlCommand(speed=speed, steering=steering, brake=False, reason=reason)
@@ -211,7 +213,10 @@ class YoloLaneFollower:
         return self._clip_float(max(lateral_curve, heading_curve), 0.0, 1.0)
 
     def _smooth_curve_strength(self, value: float) -> float:
-        alpha = self.config.curve_strength_alpha
+        if value >= self._curve_strength:
+            alpha = self.config.curve_strength_alpha
+        else:
+            alpha = self.config.curve_strength_release_alpha
         self._curve_strength = alpha * value + (1.0 - alpha) * self._curve_strength
         return self._curve_strength
 
@@ -234,7 +239,7 @@ class YoloLaneFollower:
         boost = 1.0 + (self.config.center_recovery_steering_boost - 1.0) * recovery_strength
         boosted = steering * boost
         minimum = self.config.center_recovery_min_steering * recovery_strength
-        if abs(boosted) < minimum:
+        if boosted * lateral_error <= 0.0 or abs(boosted) < minimum:
             direction = 1.0 if lateral_error >= 0.0 else -1.0
             boosted = direction * minimum
         return boosted
@@ -244,11 +249,18 @@ class YoloLaneFollower:
             return False
         return abs(lateral_error) >= self.config.center_lock_error_threshold
 
+    @staticmethod
+    def _centering_error(lane: LaneGeometry) -> float:
+        near = lane.near_lateral_error_norm
+        if near is not None and abs(near) > abs(lane.lateral_error_norm):
+            return near
+        return lane.lateral_error_norm
+
     def _apply_center_lock(self, steering: float, lateral_error: float, active: bool) -> float:
         if not active:
             return steering
         minimum = abs(self.config.center_lock_min_steering)
-        if abs(steering) >= minimum:
+        if steering * lateral_error > 0.0 and abs(steering) >= minimum:
             return steering
         direction = 1.0 if lateral_error >= 0.0 else -1.0
         return direction * minimum

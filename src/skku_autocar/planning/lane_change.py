@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import Optional
 
 from ..estimation.lane_geometry import LaneGeometry
 from ..types import ControlCommand
@@ -68,6 +69,7 @@ class LaneChangeController:
         self._stable_frames = 0
         self._target_capture_frames = 0
         self._locked_lane_width_px = None
+        self._last_reliable_shifted_lane: Optional[LaneGeometry] = None
 
     def reset(self) -> None:
         self.state = "lane2"
@@ -81,6 +83,7 @@ class LaneChangeController:
         self._stable_frames = 0
         self._target_capture_frames = 0
         self._locked_lane_width_px = None
+        self._last_reliable_shifted_lane = None
 
     def request(self, source: str = "external") -> bool:
         """Arm a lane change from any detector/trigger.
@@ -225,7 +228,12 @@ class LaneChangeController:
             offset_ratio = 0.0
 
         offset_px = offset_ratio * self._effective_lane_width(lane_width_px)
-        shifted = self._shift_lane(lane, offset_px, bev_width_px) if lane.found else lane
+        shifted, applied_offset_px = self._lane_target(
+            lane,
+            offset_px,
+            bev_width_px,
+            lane_reliable,
+        )
         if not lane_reliable and self._uses_target_arrival(self.state):
             self._target_capture_frames = 0
         if (
@@ -252,7 +260,6 @@ class LaneChangeController:
             if self._update_stability(shifted, lane_reliable):
                 self.state = "completed"
                 self._phase_started_at = None
-        applied_offset_px = shifted.center_x - lane.center_x if lane.found else 0.0
         active = self.state in (
             "changing_to_lane1",
             "stabilizing_lane1",
@@ -318,6 +325,12 @@ class LaneChangeController:
             return command
         if self._uses_avoidance_profile(result.state):
             return self._apply_stabilizing_steering(command, result)
+        if (
+            not result.lane_reliable
+            and self._uses_target_arrival(result.state)
+            and result.direction != 0
+        ):
+            return self._apply_unreliable_directional_steering(command, result)
         if not result.lane_reliable and self.speed_cap_active(result):
             cap = max(0, int(self.config.unreliable_steering_cap))
             steering = self._clip(command.steering, -cap, cap)
@@ -411,6 +424,33 @@ class LaneChangeController:
             "%s:lane_change_stabilize" % command.reason
             if command.reason
             else "lane_change_stabilize"
+        )
+        return ControlCommand(
+            speed=command.speed,
+            steering=steering,
+            brake=False,
+            reason=reason,
+        )
+
+    def _apply_unreliable_directional_steering(
+        self,
+        command: ControlCommand,
+        result: LaneChangeResult,
+    ) -> ControlCommand:
+        direction = -1 if result.direction < 0 else 1
+        cap = max(0, int(self.config.unreliable_steering_cap))
+        if self.config.steering_cap > 0:
+            cap = min(cap, max(0, int(self.config.steering_cap)))
+        minimum = min(max(0, int(self.config.steering_min)), cap) if cap > 0 else 0
+        steering = int(command.steering)
+        if steering * direction <= 0 or abs(steering) < minimum:
+            steering = direction * minimum
+        if cap > 0:
+            steering = self._clip(steering, -cap, cap)
+        reason = (
+            "%s:lane_change_unreliable_steer" % command.reason
+            if command.reason
+            else "lane_change_unreliable_steer"
         )
         return ControlCommand(
             speed=command.speed,
@@ -538,6 +578,54 @@ class LaneChangeController:
         if self._locked_lane_width_px is not None:
             return self._locked_lane_width_px
         return max(0.0, float(lane_width_px))
+
+    def _lane_target(
+        self,
+        lane: LaneGeometry,
+        offset_px: float,
+        bev_width_px: float,
+        lane_reliable: bool,
+    ) -> tuple:
+        if not lane.found:
+            return lane, 0.0
+        if lane_reliable:
+            shifted = self._shift_lane_if_needed(lane, offset_px, bev_width_px)
+            self._last_reliable_shifted_lane = shifted
+            applied = shifted.center_x - lane.center_x
+            return shifted, applied
+        if self._hold_unreliable_target_active() and self._last_reliable_shifted_lane is not None:
+            held = self._held_unreliable_lane(lane)
+            return held, 0.0
+        return lane, 0.0
+
+    def _hold_unreliable_target_active(self) -> bool:
+        return self.state in (
+            "changing_to_lane1",
+            "stabilizing_lane1",
+            "lane1",
+            "changing_to_lane2",
+            "stabilizing_lane2",
+        )
+
+    def _held_unreliable_lane(self, lane: LaneGeometry) -> LaneGeometry:
+        prev = self._last_reliable_shifted_lane
+        assert prev is not None
+        reason = prev.reason.split(":lane_change_hold_unreliable", 1)[0]
+        return replace(
+            prev,
+            confidence=min(prev.confidence, lane.confidence),
+            reason="%s:lane_change_hold_unreliable:%s" % (reason, lane.reason),
+        )
+
+    def _shift_lane_if_needed(
+        self,
+        lane: LaneGeometry,
+        offset_px: float,
+        bev_width_px: float,
+    ) -> LaneGeometry:
+        if abs(offset_px) <= 1e-6:
+            return lane
+        return self._shift_lane(lane, offset_px, bev_width_px)
 
     @staticmethod
     def _smoothstep(value: float) -> float:

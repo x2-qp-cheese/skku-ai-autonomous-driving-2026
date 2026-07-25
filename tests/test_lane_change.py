@@ -483,6 +483,70 @@ class LaneChangeControllerTest(unittest.TestCase):
         self.assertEqual(unreliable.state, "armed")
         self.assertEqual(reliable.state, "changing_to_lane1")
 
+    def test_lane2_keeps_reason_clean_when_no_offset_is_active(self):
+        result = self.controller.update(lane(), 150.0, 800.0, 0.0, True)
+
+        self.assertEqual(result.state, "lane2")
+        self.assertEqual(result.offset_px, 0.0)
+        self.assertEqual(result.lane.reason, "corridor")
+
+    def test_avoidance_holds_last_reliable_target_on_unreliable_geometry(self):
+        self.controller = LaneChangeController(
+            LaneChangeConfig(
+                mode="external",
+                target_lane_width_px=150.0,
+                stable_required_frames=5,
+            )
+        )
+        self.controller.request_avoidance("obstacle_fusion")
+        reliable = self.controller.update(lane(), 150.0, 800.0, 0.0, True)
+        unreliable_lane = replace(
+            lane_for_shifted_lane1(heading=0.55),
+            confidence=0.30,
+            reason="virtual_hold:heading_jump(3)",
+        )
+
+        held = self.controller.update(
+            unreliable_lane,
+            150.0,
+            800.0,
+            0.1,
+            True,
+            lane_reliable=False,
+        )
+
+        self.assertEqual(reliable.state, "changing_to_lane1")
+        self.assertEqual(held.state, "changing_to_lane1")
+        self.assertFalse(held.lane_reliable)
+        self.assertAlmostEqual(held.lane.center_x, reliable.lane.center_x)
+        self.assertAlmostEqual(held.lane.near_lateral_error_norm or 0.0, reliable.lane.near_lateral_error_norm or 0.0)
+        self.assertIn("lane_change_hold_unreliable", held.lane.reason)
+
+    def test_unreliable_avoidance_keeps_directional_steering(self):
+        self.controller = LaneChangeController(
+            LaneChangeConfig(
+                mode="external",
+                target_lane_width_px=150.0,
+                steering_min=150,
+                steering_cap=150,
+                unreliable_steering_cap=90,
+            )
+        )
+        self.controller.request_avoidance("obstacle_fusion")
+        result = self.controller.update(lane(), 150.0, 800.0, 0.0, True)
+        result = replace(result, lane_reliable=False)
+
+        adjusted = self.controller.apply_control_adjustments(
+            ControlCommand(speed=255, steering=20, reason="lane"),
+            result,
+        )
+
+        self.assertEqual(result.state, "changing_to_lane1")
+        self.assertEqual(result.direction, -1)
+        self.assertEqual(adjusted.speed, 70)
+        self.assertEqual(adjusted.steering, -90)
+        self.assertIn("lane_change_unreliable_steer", adjusted.reason)
+
     def test_unreliable_geometry_cannot_confirm_target_capture(self):
         self.controller = LaneChangeController(
             LaneChangeConfig(

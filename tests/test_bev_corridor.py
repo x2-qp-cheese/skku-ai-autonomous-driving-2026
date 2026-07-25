@@ -63,7 +63,7 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
         self.assertEqual(during.reason, "corridor_tier2")
         self.assertEqual(estimator.last_class_name, "crosswalk-virtual-center")
 
-    def test_crosswalk_specific_jump_gate_coasts_on_outlier(self):
+    def test_crosswalk_specific_jump_gate_holds_stable_cache_on_outlier(self):
         estimator = BevCorridorLaneEstimator(
             BevCorridorConfig(
                 lane_width_px=60.0,
@@ -80,8 +80,8 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
         outlier = estimator.estimate(bev_at(80, crosswalk=True))
 
         self.assertAlmostEqual(outlier.center_x, before.center_x)
-        self.assertTrue(outlier.reason.startswith("coast:center_jump"))
-        self.assertEqual(estimator.last_class_name, "coast")
+        self.assertTrue(outlier.reason.startswith("crosswalk_hold:"))
+        self.assertEqual(estimator.last_class_name, "crosswalk-hold-right-lane")
 
     def test_heading_jump_gate_coasts_on_slanted_outlier(self):
         estimator = BevCorridorLaneEstimator(
@@ -131,6 +131,41 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
         self.assertEqual(lane.reason, "corridor_tier3")
         self.assertEqual(estimator.last_class_name, "crosswalk-right-side-b")
 
+    def test_crosswalk_option_b_uses_right_boundary_before_cache(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lane_width_px=60.0,
+                crosswalk_option="b",
+                crosswalk_right_offset_px=30.0,
+                center_smooth_alpha=1.0,
+                crosswalk_center_smooth_alpha=1.0,
+                vehicle_center_x_offset_ratio=0.0,
+            )
+        )
+
+        cached = estimator.estimate(
+            BevClassMasks(
+                center=[line_mask(60)],
+                side=[line_mask(120)],
+                center_conf=1.0,
+                side_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+        during = estimator.estimate(
+            BevClassMasks(
+                side=[line_mask(160)],
+                crosswalk=[crosswalk_mask()],
+                side_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+
+        self.assertTrue(during.found)
+        self.assertGreater(during.center_x, cached.center_x)
+        self.assertAlmostEqual(during.center_x, 131.5, delta=0.2)
+        self.assertEqual(estimator.last_class_name, "crosswalk-right-side-b")
+
     def test_crosswalk_option_b_holds_previous_right_lane_geometry(self):
         estimator = BevCorridorLaneEstimator(
             BevCorridorConfig(
@@ -164,6 +199,85 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
         self.assertTrue(during.found)
         self.assertAlmostEqual(during.center_x, before.center_x, delta=0.2)
         self.assertAlmostEqual(during.lateral_error_norm, before.lateral_error_norm)
+        self.assertEqual(estimator.last_class_name, "crosswalk-hold-right-lane")
+
+    def test_crosswalk_cache_ignores_bad_pre_crosswalk_geometry(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lane_width_px=60.0,
+                crosswalk_option="b",
+                crosswalk_right_offset_px=30.0,
+                center_smooth_alpha=1.0,
+                crosswalk_center_smooth_alpha=1.0,
+                vehicle_center_x_offset_ratio=0.0,
+            )
+        )
+
+        stable = estimator.estimate(
+            BevClassMasks(
+                center=[line_mask(60)],
+                side=[line_mask(120)],
+                center_conf=1.0,
+                side_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+        estimator.estimate(
+            BevClassMasks(
+                center=[line_mask(20)],
+                side=[line_mask(80)],
+                center_conf=1.0,
+                side_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+        during = estimator.estimate(
+            BevClassMasks(
+                side=[line_mask(90)],
+                crosswalk=[crosswalk_mask()],
+                side_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+
+        self.assertTrue(during.found)
+        self.assertAlmostEqual(during.center_x, stable.center_x, delta=0.2)
+        self.assertEqual(during.reason, "crosswalk_hold:no_corridor")
+        self.assertEqual(estimator.last_class_name, "crosswalk-hold-right-lane")
+
+    def test_crosswalk_right_boundary_heading_jump_holds_cache(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lane_width_px=60.0,
+                crosswalk_option="b",
+                crosswalk_right_offset_px=30.0,
+                center_smooth_alpha=1.0,
+                crosswalk_center_smooth_alpha=1.0,
+                vehicle_center_x_offset_ratio=0.0,
+            )
+        )
+
+        stable = estimator.estimate(
+            BevClassMasks(
+                center=[line_mask(60)],
+                side=[line_mask(120)],
+                center_conf=1.0,
+                side_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+        during = estimator.estimate(
+            BevClassMasks(
+                side=[slanted_line_mask(160.0, 0.30)],
+                crosswalk=[crosswalk_mask()],
+                side_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+
+        self.assertTrue(during.found)
+        self.assertAlmostEqual(during.center_x, stable.center_x, delta=0.2)
+        self.assertEqual(during.reason, "crosswalk_hold:cache_heading_guard")
         self.assertEqual(estimator.last_class_name, "crosswalk-hold-right-lane")
 
     def test_center_anchor_does_not_push_target_past_detected_right_boundary(self):

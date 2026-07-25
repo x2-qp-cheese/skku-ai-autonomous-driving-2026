@@ -84,6 +84,49 @@ class YoloLaneGeometryTest(unittest.TestCase):
 
         self.assertLess(first_command.steering, second_command.steering)
 
+    def test_curve_strength_releases_slower_than_it_rises(self):
+        slow_release = YoloLaneFollower(
+            YoloLaneFollowerConfig(
+                kp_lateral=100.0,
+                kd_lateral=0.0,
+                kp_heading=0.0,
+                kd_heading=0.0,
+                steering_rate_limit=500,
+                min_steering_rate_limit=500,
+                steering_release_rate_limit=500,
+                max_steering=500,
+                curve_strength_alpha=1.0,
+                curve_strength_release_alpha=0.10,
+                straight_steering_scale=0.4,
+                curve_steering_scale=1.0,
+            )
+        )
+        fast_release = YoloLaneFollower(
+            YoloLaneFollowerConfig(
+                kp_lateral=100.0,
+                kd_lateral=0.0,
+                kp_heading=0.0,
+                kd_heading=0.0,
+                steering_rate_limit=500,
+                min_steering_rate_limit=500,
+                steering_release_rate_limit=500,
+                max_steering=500,
+                curve_strength_alpha=1.0,
+                curve_strength_release_alpha=1.0,
+                straight_steering_scale=0.4,
+                curve_steering_scale=1.0,
+            )
+        )
+        curve = lane_geometry(lateral_error_norm=0.65, heading_error=0.0)
+        exit_curve = lane_geometry(lateral_error_norm=0.30, heading_error=0.0)
+
+        slow_release.plan(curve)
+        fast_release.plan(curve)
+        slow_command = slow_release.plan(exit_curve)
+        fast_command = fast_release.plan(exit_curve)
+
+        self.assertGreater(slow_command.steering, fast_command.steering)
+
     def test_curve_slows_speed_before_steering_ramp_finishes(self):
         follower = YoloLaneFollower(
             YoloLaneFollowerConfig(
@@ -215,6 +258,63 @@ class YoloLaneGeometryTest(unittest.TestCase):
         command = follower.plan(lane)
 
         self.assertEqual(command.steering, -80)
+
+    def test_near_error_keeps_center_lock_active(self):
+        follower = YoloLaneFollower(
+            YoloLaneFollowerConfig(
+                kp_lateral=0.0,
+                kd_lateral=0.0,
+                kp_heading=0.0,
+                kd_heading=0.0,
+                steering_rate_limit=500,
+                min_steering_rate_limit=500,
+                center_recovery_error_threshold=1.0,
+                center_lock_enabled=True,
+                center_lock_error_threshold=0.055,
+                center_lock_min_steering=75,
+                straight_steering_scale=1.0,
+                curve_steering_scale=1.0,
+                max_steering=500,
+            )
+        )
+        lane = lane_geometry(
+            lateral_error_norm=-0.03,
+            heading_error=0.0,
+            near_lateral_error_norm=-0.12,
+        )
+
+        command = follower.plan(lane)
+
+        self.assertEqual(command.steering, -75)
+        self.assertIn("center_lock", command.reason)
+
+    def test_near_error_can_override_opposite_far_error_for_centering(self):
+        follower = YoloLaneFollower(
+            YoloLaneFollowerConfig(
+                kp_lateral=100.0,
+                kd_lateral=0.0,
+                kp_heading=0.0,
+                kd_heading=0.0,
+                steering_rate_limit=500,
+                min_steering_rate_limit=500,
+                center_recovery_error_threshold=1.0,
+                center_lock_enabled=True,
+                center_lock_error_threshold=0.055,
+                center_lock_min_steering=75,
+                straight_steering_scale=1.0,
+                curve_steering_scale=1.0,
+                max_steering=500,
+            )
+        )
+        lane = lane_geometry(
+            lateral_error_norm=0.04,
+            heading_error=0.0,
+            near_lateral_error_norm=-0.12,
+        )
+
+        command = follower.plan(lane)
+
+        self.assertEqual(command.steering, -75)
 
     def test_release_rate_limit_slows_unwinding_same_direction(self):
         follower = YoloLaneFollower(
@@ -351,21 +451,26 @@ class YoloLaneGeometryTest(unittest.TestCase):
         bev_config = build_bev_corridor_config(args)
         follower_config = build_follower_config(args)
 
-        self.assertAlmostEqual(bev_config.centerline_bias, 0.50)
+        self.assertAlmostEqual(bev_config.lookahead_y_ratio, 0.45)
+        self.assertAlmostEqual(bev_config.centerline_bias, 0.46)
         self.assertAlmostEqual(bev_config.vehicle_center_x_offset_ratio, 0.04)
-        self.assertAlmostEqual(bev_config.max_heading_jump, 0.32)
+        self.assertAlmostEqual(bev_config.max_heading_jump, 0.45)
         self.assertEqual(follower_config.base_speed, 255)
         self.assertEqual(follower_config.max_speed, 255)
         self.assertEqual(follower_config.min_curve_speed, 255)
         self.assertEqual(follower_config.max_steering, 150)
         self.assertAlmostEqual(follower_config.kp_lateral, 205.0)
         self.assertAlmostEqual(follower_config.kd_lateral, 75.0)
-        self.assertAlmostEqual(follower_config.curve_strength_alpha, 0.45)
+        self.assertAlmostEqual(follower_config.curve_strength_alpha, 0.60)
+        self.assertAlmostEqual(follower_config.curve_strength_release_alpha, 0.18)
         self.assertAlmostEqual(follower_config.straight_steering_scale, 0.50)
         self.assertAlmostEqual(follower_config.curve_steering_scale, 1.68)
-        self.assertAlmostEqual(follower_config.center_recovery_error_threshold, 0.12)
-        self.assertAlmostEqual(follower_config.center_recovery_steering_boost, 1.20)
-        self.assertEqual(follower_config.center_recovery_min_steering, 70)
+        self.assertAlmostEqual(follower_config.center_recovery_error_threshold, 0.08)
+        self.assertAlmostEqual(follower_config.center_recovery_steering_boost, 1.35)
+        self.assertEqual(follower_config.center_recovery_min_steering, 85)
+        self.assertTrue(follower_config.center_lock_enabled)
+        self.assertAlmostEqual(follower_config.center_lock_error_threshold, 0.055)
+        self.assertEqual(follower_config.center_lock_min_steering, 75)
 
     def test_lane_change_cli_defaults_are_external_ready_and_aggressive(self):
         args = parse_args([])
@@ -640,7 +745,11 @@ class YoloLaneGeometryTest(unittest.TestCase):
         self.assertEqual(command.reason, "traffic_light:red_contact")
 
 
-def lane_geometry(lateral_error_norm: float, heading_error: float) -> LaneGeometry:
+def lane_geometry(
+    lateral_error_norm: float,
+    heading_error: float,
+    near_lateral_error_norm: float = None,
+) -> LaneGeometry:
     return LaneGeometry(
         found=True,
         center_x=0.0,
@@ -651,6 +760,7 @@ def lane_geometry(lateral_error_norm: float, heading_error: float) -> LaneGeomet
         heading_error=heading_error,
         confidence=1.0,
         reason="test",
+        near_lateral_error_norm=near_lateral_error_norm,
     )
 
 
