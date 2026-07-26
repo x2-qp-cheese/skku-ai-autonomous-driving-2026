@@ -882,6 +882,18 @@ class LaneChangeControllerTest(unittest.TestCase):
         self.assertEqual(self.controller.return_source, "obstacle_clear")
         self.assertEqual(returning.state, "changing_to_lane2")
 
+    def test_crosswalk_pause_does_not_advance_transition_clock(self):
+        self.update(0.0)
+        self.controller.request()
+        self.update(1.0)
+
+        self.controller.pause(1.5)
+        self.controller.resume(11.5)
+        halfway = self.update(12.0)
+
+        self.assertEqual(halfway.state, "changing_to_lane1")
+        self.assertAlmostEqual(halfway.offset_px, -75.0)
+
     def test_pause_resets_controller(self):
         self.update(0.0)
         self.controller.request()

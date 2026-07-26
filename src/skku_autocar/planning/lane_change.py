@@ -72,6 +72,7 @@ class LaneChangeController:
         self._target_capture_frames = 0
         self._locked_lane_width_px = None
         self._last_reliable_shifted_lane: Optional[LaneGeometry] = None
+        self._paused_at: Optional[float] = None
 
     def reset(self) -> None:
         self.state = "lane2"
@@ -86,6 +87,35 @@ class LaneChangeController:
         self._target_capture_frames = 0
         self._locked_lane_width_px = None
         self._last_reliable_shifted_lane = None
+        self._paused_at = None
+
+    def pause(self, now: float) -> None:
+        """Freeze transition timers while another mission owns path priority."""
+        if self._paused_at is None:
+            self._paused_at = float(now)
+
+    def resume(self, now: float) -> None:
+        if self._paused_at is None:
+            return
+        paused_for = max(0.0, float(now) - self._paused_at)
+        if self._run_started_at is not None:
+            self._run_started_at += paused_for
+        if self._phase_started_at is not None:
+            self._phase_started_at += paused_for
+        self._paused_at = None
+
+    def apply_fixed_offset(
+        self,
+        lane: LaneGeometry,
+        offset_px: float,
+        bev_width_px: float,
+    ) -> LaneGeometry:
+        """Translate the current path without advancing lane-change state."""
+        return self._shift_lane_if_needed(
+            lane,
+            float(offset_px),
+            float(bev_width_px),
+        )
 
     def request(self, source: str = "external") -> bool:
         """Arm a lane change from any detector/trigger.

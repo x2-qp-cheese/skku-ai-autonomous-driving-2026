@@ -50,6 +50,13 @@ divergence caused by extending a sparse quadratic to the full image. Fixed
 anchors, bounded innovation and tangent continuation are local filtering and
 geometry rules implemented in this project, not copied external algorithms.
 
+The complete path is also checked as a forward function `x(y)`. Its tangent and
+frame-to-frame tangent change are bounded from the near field toward the far
+field, so two independently fitted mask fragments cannot form a V-shaped or
+near-horizontal splice. Points beyond the actual steering lookahead are drawn
+as a tangent continuation of the control path. They remain useful for visual
+preview but cannot bend the heading estimate away from the lane being driven.
+
 ## Technical basis
 
 - Sebastian Thrun et al., *Stanley: The Robot that Won the DARPA Grand
@@ -71,11 +78,16 @@ technical basis.
 
 ## Crosswalk and obstacle rules
 
-- Crosswalk: freeze the complete reliable path from the frame immediately before
-  the crosswalk. This cache is taken after any lane-change offset, and obstacle
-  planning cannot overwrite it during transit. Do not recenter it and do not fit
-  zebra stripes. Reacquire the lane only after three consecutive reliable
-  post-crosswalk frames.
+- Crosswalk: never fit zebra stripes as lane boundaries. Continue evaluating the
+  current center marking and outer boundary every frame and prefer that fresh,
+  bounded path whenever either valid corridor tier is available.
+- Crosswalk fallback: only while lane markings are hidden, use the last reliable
+  current-lane path. Advance that vehicle-relative cache by the measured BEV
+  motion of the zebra mask instead of freezing the entry pose. Reacquire a valid
+  current path immediately; do not wait behind a stale heading-jump gate.
+- Crosswalk ownership: pause lane-change timers and preserve only the already
+  established parallel lane offset. The obstacle layer no longer keeps a second
+  frozen path cache.
 - Obstacle: assign each instance exclusively to the closer path, with overlap and
   pixel-distance hysteresis. A current-lane obstacle that merely touches the
   projected destination corridor cannot mark both lanes blocked. Adjacent-lane
@@ -95,13 +107,14 @@ the only component that converts geometry to steering. When obstacle avoidance
 geometry is unreliable, the final steering is bounded to `[-90, 90]` in every
 active state, including lane-1 hold and stabilization.
 
-The obstacle layer cannot update its planner during a crosswalk. The traffic
+The obstacle layer cannot advance its planner during a crosswalk. The traffic
 light may stop the final command, and no other mission logic may brake it. This
 ordering is intentional:
 
 ```text
-YOLO masks -> fixed BEV path -> optional parallel lane shift
-           -> crosswalk path hold -> whole-path steering
+YOLO masks -> fresh bounded BEV path or motion-adjusted fallback
+           -> fixed existing lane offset during crosswalk
+           -> whole-path steering
            -> traffic-light stop -> fixed-speed finalization
 ```
 

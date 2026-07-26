@@ -80,6 +80,11 @@ class BevCorridorConfig:
     # Maximum accepted lateral movement of one path anchor per frame. The limit
     # is slightly looser near the vehicle, where a curve must be followed sooner.
     path_max_step_px: float = 28.0
+    # Spatial guards on the complete path. A valid track path is a smooth
+    # forward function x(y); sparse masks must never create a V-shaped splice or
+    # a near-horizontal segment in the preview line.
+    path_max_abs_slope: float = 1.20
+    path_max_slope_delta: float = 0.45
 
     # The outer side line must sit at least this far right of the center line at
     # the lookahead row to be accepted as the right boundary.
@@ -135,8 +140,17 @@ class BevCorridorConfig:
     # optionally ease it toward the vehicle axis.
     crosswalk_transit_recovery_frames: int = 16
     crosswalk_transit_recenter_alpha: float = 0.0
+    # When the lane is hidden, advance the cached vehicle-relative path using
+    # the observed longitudinal motion of the zebra mask. This prevents a
+    # world-fixed curve from remaining frozen in front of a moving vehicle.
+    crosswalk_transit_max_advance_px: float = 18.0
+    crosswalk_transit_advance_smooth_alpha: float = 0.60
+    crosswalk_transit_advance_decay: float = 0.70
+    # Recovery compares against an advanced cache, not the old entry pose. Keep
+    # the gate permissive enough to reacquire the real path while spatial path
+    # guards and temporal anchor limits still reject impossible geometry.
     crosswalk_recovery_max_center_jump_px: float = 110.0
-    crosswalk_recovery_max_heading_jump: float = 0.60
+    crosswalk_recovery_max_heading_jump: float = 1.00
     crosswalk_transit_enabled: bool = False
     # A real lane line is thin at every BEV row; rows spanning wider than this
     # (ratio of BEV width) are dropped from a single line's fit, so a stray wide
@@ -269,6 +283,8 @@ class BevCorridorLaneEstimator:
         self._crosswalk_transit_reliable_frames: int = 0
         self._crosswalk_transit_safe_lane: Optional[LaneGeometry] = None
         self._crosswalk_transit_safe_overlays: Tuple[list, list, list] = ([], [], [])
+        self._crosswalk_marker_y: Optional[float] = None
+        self._crosswalk_advance_px: float = 0.0
 
     # ------------------------------------------------------------------
     def estimate(self, bev: BevClassMasks) -> LaneGeometry:
@@ -285,27 +301,22 @@ class BevCorridorLaneEstimator:
             )
         elif self._crosswalk_transit_remaining > 0:
             self._crosswalk_transit_remaining -= 1
+        self._update_crosswalk_motion(bev, crosswalk_seen)
 
         previous_safe = self._crosswalk_transit_safe_lane
         previous_overlays = self._crosswalk_transit_safe_overlays
-        if (
-            crosswalk_seen
-            and not self.config.crosswalk_halt
-            and previous_safe is not None
-        ):
-            held = self._crosswalk_transit_hold(
-                previous_safe,
-                previous_overlays,
-                "crosswalk",
-            )
-            if held is not None:
-                return held
 
+        # Always evaluate the current lane first. The crosswalk class is already
+        # excluded from center/side fitting, so a reliable visible boundary is
+        # better evidence than a vehicle-relative path cached before the car
+        # moved onto the zebra. The cache is fallback-only.
         lane = self._estimate_lane(bev)
         transit_active = crosswalk_seen or self._crosswalk_transit_remaining > 0
 
         if not transit_active:
             self._crosswalk_transit_reliable_frames = 0
+            self._crosswalk_marker_y = None
+            self._crosswalk_advance_px = 0.0
             if lane.found and self.last_tier in (1, 2):
                 self._remember_crosswalk_transit_lane(lane)
             return lane
@@ -313,37 +324,42 @@ class BevCorridorLaneEstimator:
         name = str(self.last_class_name)
         abs_error = abs(float(lane.lateral_error_norm)) if lane.found else 99.0
         abs_heading = abs(float(lane.heading_error)) if lane.found else 99.0
+        fresh_geometry = (
+            not name.startswith("coast")
+            and "virtual-hold" not in name
+            and "crosswalk-hold" not in name
+        )
+        reliable_heading_limit = (
+            0.95
+            if self._crosswalk_transit_remaining > 0
+            else 0.70
+        )
         reliable_center = (
             lane.found
+            and fresh_geometry
             and self.last_tier in (1, 2)
             and float(lane.confidence) >= 0.45
             and abs_error <= 0.60
-            and abs_heading <= 0.70
+            and abs_heading <= reliable_heading_limit
         )
         reliable_right = (
             lane.found
+            and fresh_geometry
             and name == "virtual-lane-center+right-side"
             and float(lane.confidence) >= 0.45
             and abs_error <= 0.52
-            and abs_heading <= 0.70
+            and abs_heading <= reliable_heading_limit
         )
         if reliable_center or reliable_right:
             self._crosswalk_transit_reliable_frames += 1
-            if (
-                not crosswalk_seen
-                and self._crosswalk_transit_reliable_frames < 3
-                and previous_safe is not None
-            ):
-                held = self._crosswalk_transit_hold(
-                    previous_safe,
-                    previous_overlays,
-                    "crosswalk_exit_confirm",
-                )
-                if held is not None:
-                    return held
+            # _estimate_lane() already applies per-anchor innovation limits.
+            # Returning the fresh bounded path immediately avoids resetting that
+            # progress to the stale cache for two frames and then jumping.
             self._remember_crosswalk_transit_lane(lane)
             if not crosswalk_seen:
                 self._crosswalk_transit_remaining = 0
+                self._crosswalk_marker_y = None
+                self._crosswalk_advance_px = 0.0
             return lane
 
         self._crosswalk_transit_reliable_frames = 0
@@ -433,7 +449,15 @@ class BevCorridorLaneEstimator:
             if held is not None:
                 return held
             return self._coast_or_lost(bev.shape, "center_jump")
-        if self._is_heading_jump(raw_heading):
+        trusted_recovery_measurement = (
+            self._crosswalk_transit_remaining > 0
+            and tier in (1, 2)
+            and float(det_conf) >= 0.45
+        )
+        if (
+            self._is_heading_jump(raw_heading)
+            and not trusted_recovery_measurement
+        ):
             held = self._hold_crosswalk_lane_if_available("heading_jump")
             if held is not None:
                 return held
@@ -939,6 +963,110 @@ class BevCorridorLaneEstimator:
             list(self.last_right_line_bev),
         )
 
+    def _update_crosswalk_motion(
+        self,
+        bev: BevClassMasks,
+        crosswalk_seen: bool,
+    ) -> None:
+        """Estimate forward ego motion from the zebra mask's BEV row motion."""
+        marker_y = self._crosswalk_motion_marker(bev) if crosswalk_seen else None
+        decay = self._clip(
+            self.config.crosswalk_transit_advance_decay,
+            0.0,
+            1.0,
+        )
+        if marker_y is None:
+            self._crosswalk_marker_y = None
+            self._crosswalk_advance_px *= decay
+            if self._crosswalk_transit_remaining <= 0:
+                self._crosswalk_advance_px = 0.0
+            return
+
+        if self._crosswalk_marker_y is None:
+            self._crosswalk_marker_y = marker_y
+            self._crosswalk_advance_px = 0.0
+            return
+
+        measured = marker_y - self._crosswalk_marker_y
+        self._crosswalk_marker_y = marker_y
+        max_advance = max(
+            0.0,
+            float(self.config.crosswalk_transit_max_advance_px),
+        )
+        if measured < 0.0 or measured > max_advance * 2.0:
+            self._crosswalk_advance_px *= decay
+            return
+
+        alpha = self._clip(
+            self.config.crosswalk_transit_advance_smooth_alpha,
+            0.0,
+            1.0,
+        )
+        measured = self._clip(measured, 0.0, max_advance)
+        self._crosswalk_advance_px = (
+            alpha * measured
+            + (1.0 - alpha) * self._crosswalk_advance_px
+        )
+
+    @staticmethod
+    def _crosswalk_motion_marker(bev: BevClassMasks) -> Optional[float]:
+        import numpy as np
+
+        occupied_rows: List[float] = []
+        for mask in bev.crosswalk:
+            array = np.asarray(mask)
+            if array.ndim < 2:
+                continue
+            rows = np.flatnonzero(np.any(array > 0, axis=1))
+            if rows.size:
+                occupied_rows.extend(float(row) for row in rows)
+        if not occupied_rows:
+            return None
+        return float(np.median(np.asarray(occupied_rows, dtype=float)))
+
+    def _advance_path(
+        self,
+        points: List[Tuple[float, float]],
+        advance_px: float,
+        width: float,
+    ) -> List[Tuple[float, float]]:
+        """Move a cached world path toward the car in vehicle-relative BEV."""
+        if len(points) < 2 or advance_px <= 0.0:
+            return [(float(x), float(y)) for x, y in points]
+        import numpy as np
+
+        ordered = sorted(
+            ((float(x), float(y)) for x, y in points),
+            key=lambda point: point[1],
+        )
+        xs = np.asarray([point[0] for point in ordered], dtype=float)
+        ys = np.asarray([point[1] for point in ordered], dtype=float)
+        query = ys - float(advance_px)
+        advanced_x = np.interp(query, ys, xs)
+
+        first_dy = max(1e-6, ys[1] - ys[0])
+        last_dy = max(1e-6, ys[-1] - ys[-2])
+        max_slope = max(0.0, float(self.config.path_max_abs_slope))
+        first_slope = self._clip(
+            (xs[1] - xs[0]) / first_dy,
+            -max_slope,
+            max_slope,
+        )
+        last_slope = self._clip(
+            (xs[-1] - xs[-2]) / last_dy,
+            -max_slope,
+            max_slope,
+        )
+        below = query < ys[0]
+        above = query > ys[-1]
+        advanced_x[below] = xs[0] + first_slope * (query[below] - ys[0])
+        advanced_x[above] = xs[-1] + last_slope * (query[above] - ys[-1])
+        advanced_x = np.clip(advanced_x, 0.0, max(0.0, width - 1.0))
+        return [
+            (float(x), float(y))
+            for x, y in zip(advanced_x, ys)
+        ]
+
     def _crosswalk_transit_hold(
         self,
         base: Optional[LaneGeometry],
@@ -954,25 +1082,70 @@ class BevCorridorLaneEstimator:
             1.0,
         )
         vehicle_x = float(base.vehicle_center_x)
-        center_x = float(base.center_x) + alpha * (
-            vehicle_x - float(base.center_x)
+        width = vehicle_x / max(
+            0.01,
+            0.5 + float(self.config.vehicle_center_x_offset_ratio),
         )
-        near_base = (
-            float(base.near_center_x)
-            if base.near_center_x is not None
-            else float(base.center_x)
-        )
-        near_x = near_base + alpha * (vehicle_x - near_base)
-        heading = float(base.heading_error) * (1.0 - alpha)
-
         path_source = list(base.path_points) or list(overlays[0])
+        path = self._advance_path(
+            path_source,
+            self._crosswalk_advance_px,
+            width,
+        )
         path = [
             (
                 float(x) + alpha * (vehicle_x - float(x)),
                 float(y),
             )
-            for x, y in path_source
+            for x, y in path
         ]
+        path = self._limit_path_geometry(path)
+        path = self._stabilize_far_preview(path)
+
+        center_x = self._path_x_at(
+            path,
+            float(base.target_y),
+            float(base.center_x),
+        )
+        near_target_y = (
+            float(base.near_target_y)
+            if base.near_target_y is not None
+            else float(base.target_y)
+        )
+        near_x = self._path_x_at(
+            path,
+            near_target_y,
+            (
+                float(base.near_center_x)
+                if base.near_center_x is not None
+                else center_x
+            ),
+        )
+        heading = self._heading_from_path(
+            path,
+            max(1, int(round(float(base.height)))),
+            float(base.heading_error),
+        )
+
+        advanced_left = self._advance_path(
+            list(overlays[1]),
+            self._crosswalk_advance_px,
+            width,
+        )
+        advanced_right = self._advance_path(
+            list(overlays[2]),
+            self._crosswalk_advance_px,
+            width,
+        )
+        if alpha > 0.0:
+            advanced_left = [
+                (x + alpha * (vehicle_x - x), y)
+                for x, y in advanced_left
+            ]
+            advanced_right = [
+                (x + alpha * (vehicle_x - x), y)
+                for x, y in advanced_right
+            ]
 
         half_width = max(1.0, vehicle_x)
         if abs(float(base.lateral_error_norm)) > 1e-6:
@@ -1018,8 +1191,8 @@ class BevCorridorLaneEstimator:
         self.last_class_name = "virtual-crosswalk-transit-hold"
         self.last_tier = 3
         self.last_centerline_bev = path
-        self.last_center_line_bev = list(overlays[1])
-        self.last_right_line_bev = list(overlays[2])
+        self.last_center_line_bev = advanced_left
+        self.last_right_line_bev = advanced_right
         self._last_overlays = (
             self.last_centerline_bev,
             self.last_center_line_bev,
@@ -1298,7 +1471,9 @@ class BevCorridorLaneEstimator:
         self,
         points: List[Tuple[float, float]],
     ) -> List[Tuple[float, float]]:
-        current = [(float(x), float(y)) for x, y in points]
+        current = self._limit_path_geometry(
+            [(float(x), float(y)) for x, y in points]
+        )
         if not current:
             self._smoothed_path = []
             return []
@@ -1340,8 +1515,96 @@ class BevCorridorLaneEstimator:
                     step_limit,
                 )
             smoothed.append((previous_x + alpha * innovation, y))
-        self._smoothed_path = smoothed
-        return list(smoothed)
+        self._smoothed_path = self._stabilize_far_preview(
+            self._limit_path_geometry(smoothed)
+        )
+        return list(self._smoothed_path)
+
+    def _limit_path_geometry(
+        self,
+        points: List[Tuple[float, float]],
+    ) -> List[Tuple[float, float]]:
+        """Bound spatial tangent and curvature, anchored from the near field."""
+        if len(points) < 2:
+            return [(float(x), float(y)) for x, y in points]
+
+        ordered = sorted(
+            ((float(x), float(y)) for x, y in points),
+            key=lambda point: point[1],
+        )
+        max_slope = max(0.0, float(self.config.path_max_abs_slope))
+        max_delta = max(0.0, float(self.config.path_max_slope_delta))
+        near_to_far = list(reversed(ordered))
+        limited = [near_to_far[0]]
+        previous_slope: Optional[float] = None
+
+        for raw_x, y in near_to_far[1:]:
+            previous_x, previous_y = limited[-1]
+            dy = y - previous_y
+            if abs(dy) <= 1e-6:
+                limited.append((previous_x, y))
+                continue
+            slope = self._clip(
+                (raw_x - previous_x) / dy,
+                -max_slope,
+                max_slope,
+            )
+            if previous_slope is not None:
+                slope = self._clip(
+                    slope,
+                    previous_slope - max_delta,
+                    previous_slope + max_delta,
+                )
+            limited.append((previous_x + slope * dy, y))
+            previous_slope = slope
+
+        return list(reversed(limited))
+
+    def _stabilize_far_preview(
+        self,
+        points: List[Tuple[float, float]],
+    ) -> List[Tuple[float, float]]:
+        """Extend the control target's tangent into the unused far preview."""
+        if len(points) < 3:
+            return [(float(x), float(y)) for x, y in points]
+        import numpy as np
+
+        ordered = sorted(
+            ((float(x), float(y)) for x, y in points),
+            key=lambda point: point[1],
+        )
+        ys = np.asarray([point[1] for point in ordered], dtype=float)
+        xs = np.asarray([point[0] for point in ordered], dtype=float)
+        height = float(ys[-1]) / max(
+            1e-6,
+            float(self.config.sample_bottom_y_ratio),
+        )
+        target_y = height * float(self.config.lookahead_y_ratio)
+        if target_y <= ys[0] or target_y >= ys[-1]:
+            return ordered
+
+        target_x = float(np.interp(target_y, ys, xs))
+        tangent_y = min(
+            float(ys[-1]),
+            target_y + max(20.0, 0.16 * height),
+        )
+        tangent_x = float(np.interp(tangent_y, ys, xs))
+        slope = self._clip(
+            (tangent_x - target_x) / max(1e-6, tangent_y - target_y),
+            -float(self.config.path_max_abs_slope),
+            float(self.config.path_max_abs_slope),
+        )
+        return [
+            (
+                (
+                    target_x + slope * (y - target_y)
+                    if y < target_y
+                    else x
+                ),
+                y,
+            )
+            for x, y in ordered
+        ]
 
     def _fixed_path_points(
         self,
@@ -1386,7 +1649,11 @@ class BevCorridorLaneEstimator:
         xs[below] = min_x + min_slope * (ys[below] - min_y)
         xs[above] = max_x + max_slope * (ys[above] - max_y)
         xs = np.clip(xs, 0.0, float(max(0, width - 1)))
-        return [(float(x), float(y)) for x, y in zip(xs, ys)]
+        return self._stabilize_far_preview(
+            self._limit_path_geometry(
+                [(float(x), float(y)) for x, y in zip(xs, ys)]
+            )
+        )
 
     @staticmethod
     def _path_x_at(
@@ -1412,8 +1679,20 @@ class BevCorridorLaneEstimator:
             return float(fallback)
         import numpy as np
 
-        ys = np.asarray([point[1] for point in path], dtype=float)
-        xs = np.asarray([point[0] for point in path], dtype=float)
+        target_y = float(height) * float(self.config.lookahead_y_ratio)
+        near_y = float(height) * float(self.config.lane_change_near_y_ratio)
+        control_points = [
+            (float(x), float(y))
+            for x, y in path
+            if target_y <= float(y) <= near_y
+        ]
+        if len(control_points) < 3:
+            control_points = [
+                (float(x), float(y))
+                for x, y in path
+            ]
+        ys = np.asarray([point[1] for point in control_points], dtype=float)
+        xs = np.asarray([point[0] for point in control_points], dtype=float)
         fit = np.polyfit(ys, xs, min(2, len(path) - 1))
         return self._heading_error(fit, height)
 
@@ -1434,6 +1713,8 @@ class BevCorridorLaneEstimator:
         self._crosswalk_transit_reliable_frames = 0
         self._crosswalk_transit_safe_lane = None
         self._crosswalk_transit_safe_overlays = ([], [], [])
+        self._crosswalk_marker_y = None
+        self._crosswalk_advance_px = 0.0
         self._reset_temporal()
 
     def _lost(self, bev_shape: Tuple[int, int], reason: str) -> LaneGeometry:

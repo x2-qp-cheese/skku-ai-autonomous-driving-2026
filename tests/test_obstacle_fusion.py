@@ -1164,7 +1164,7 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertTrue(mode.enabled)
         self.assertEqual(vehicle.lines, ["USON", "USOFF"])
 
-    def test_crosswalk_priority_holds_final_lane_after_obstacle_offset(self):
+    def test_crosswalk_priority_updates_path_with_fixed_obstacle_offset(self):
         args = parse_args(["--obstacle-fusion-mode", "yolo"])
         estimator = FakeCorridorEstimator()
         mode = ObstacleDriveMode(args, IdentityTransformer(), estimator)
@@ -1192,7 +1192,7 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
             now=1.0,
             running=True,
         )
-        # Simulate the final path already translated by an obstacle maneuver.
+        # Simulate an established lane-change offset before the crosswalk.
         shifted = replace(
             normal,
             center_x=80.0,
@@ -1203,20 +1203,33 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         )
         mode._last_output_lane = shifted
         mode._last_reliable_output_lane = shifted
+        mode._result = replace(mode._result, offset_px=-60.0)
         estimator.last_crosswalk_visible = True
+        current = replace(
+            base,
+            center_x=150.0,
+            lateral_error_px=50.0,
+            lateral_error_norm=0.5,
+            path_points=tuple((150.0, float(y)) for y in range(0, 100, 5)),
+            reason="corridor_tier1",
+        )
 
         held = mode.update(
             class_masks,
             bev,
-            replace(base, center_x=20.0, reason="crosswalk_transit_hold:crosswalk"),
+            current,
             mask,
             SHAPE,
             now=2.0,
             running=True,
         )
 
-        self.assertEqual(held.center_x, shifted.center_x)
-        self.assertEqual(held.path_points, shifted.path_points)
+        self.assertEqual(held.center_x, 90.0)
+        self.assertEqual(
+            held.path_points,
+            tuple((90.0, float(y)) for y in range(0, 100, 5)),
+        )
+        self.assertNotEqual(held.path_points, shifted.path_points)
         self.assertIn("crosswalk_priority_hold", held.reason)
         self.assertEqual(mode.lane_change_state, "crosswalk_hold")
         command = ControlCommand(speed=255, steering=-47, brake=False, reason="path")

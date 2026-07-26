@@ -32,8 +32,10 @@ with the new `usbmodem` path. Do not choose `usbserial-2130`.
 
 - Normal lane: whole magenta path remains between the lane boundaries; speed is
   `255`.
-- Crosswalk: state changes to `CROSSWALK_HOLD`; the magenta path remains the
-  pre-crosswalk path and zebra stripes do not recenter it.
+- Crosswalk: state changes to `CROSSWALK_HOLD`; the magenta path follows the
+  visible current-lane boundaries. If both boundaries are briefly hidden, it
+  continues the motion-adjusted entry path until a valid boundary returns.
+  Zebra stripes never become lane boundaries.
 - Current-lane obstacle: one `lane2 -> lane1 requested` event, smooth parallel
   path translation, lane-1 hold, then one `lane1 -> lane2 requested` event.
 - Red light at the stop line: `stop=Y` and speed `0`. Green releases the stop.

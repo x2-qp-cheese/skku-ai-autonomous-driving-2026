@@ -64,6 +64,7 @@ class ObstacleDriveMode:
         self._result: Optional[LaneChangeResult] = None
         self._last_output_lane: Optional[LaneGeometry] = None
         self._last_reliable_output_lane: Optional[LaneGeometry] = None
+        self._crosswalk_offset_px: Optional[float] = None
         self._frame = ObstacleFrameResult(lane=_empty_lane())
 
     @property
@@ -136,6 +137,7 @@ class ObstacleDriveMode:
         if not running:
             self._last_output_lane = None
             self._last_reliable_output_lane = None
+            self._crosswalk_offset_px = None
 
         lane_reliable = lane_change_geometry_reliable(mask_result, lane)
         map_snapshot = self._local_map.update(
@@ -162,12 +164,16 @@ class ObstacleDriveMode:
             or "crosswalk_transit_hold:" in lane.reason
         )
         if crosswalk_priority:
+            self._lane_change.pause(now)
             return self._hold_crosswalk_path(
                 lane,
+                bev.shape,
                 class_masks,
                 debug_masks,
                 map_snapshot,
             )
+        self._lane_change.resume(now)
+        self._crosswalk_offset_px = None
 
         frame_paths = build_obstacle_frame_paths(
             self._transformer,
@@ -229,30 +235,34 @@ class ObstacleDriveMode:
     def _hold_crosswalk_path(
         self,
         lane: LaneGeometry,
+        bev_shape: tuple,
         class_masks: YoloClassMasks,
         debug_masks: Sequence[Any],
         map_snapshot: LocalOccupancySnapshot,
     ) -> LaneGeometry:
-        """Freeze the final path after lane-change offsets, not the base lane.
-
-        This priority boundary prevents an active/unfinished obstacle maneuver
-        from replacing the crosswalk cache with a stale shifted target.
-        """
-        base = (
-            self._last_reliable_output_lane
-            or self._last_output_lane
-            or lane
+        """Pause lane-change state while preserving the current path shape."""
+        if self._crosswalk_offset_px is None:
+            self._crosswalk_offset_px = (
+                float(self._result.offset_px)
+                if self._result is not None
+                else 0.0
+            )
+        bev_width = float(bev_shape[1]) if len(bev_shape) > 1 else 1.0
+        current = self._lane_change.apply_fixed_offset(
+            lane,
+            self._crosswalk_offset_px,
+            bev_width,
         )
-        reason = base.reason.split(":crosswalk_priority_hold", 1)[0]
+        reason = current.reason.split(":crosswalk_priority_hold", 1)[0]
         held = replace(
-            base,
-            confidence=min(float(base.confidence), float(lane.confidence)),
+            current,
             reason="%s:crosswalk_priority_hold" % reason,
         )
         self._corridor_estimator.last_centerline_bev = list(held.path_points)
         self._result = LaneChangeResult(
             lane=held,
             state="crosswalk_hold",
+            offset_px=self._crosswalk_offset_px,
             active=False,
             lane_reliable=False,
         )
@@ -265,6 +275,8 @@ class ObstacleDriveMode:
             blocks_light_stop=False,
         )
         self._last_output_lane = held
+        if lane.found and float(lane.confidence) >= 0.45:
+            self._last_reliable_output_lane = held
         return held
 
     def apply_steering(self, command: ControlCommand) -> ControlCommand:

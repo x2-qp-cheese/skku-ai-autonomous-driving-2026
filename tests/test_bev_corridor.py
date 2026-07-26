@@ -33,6 +33,12 @@ def crosswalk_mask(shape=(100, 200)) -> np.ndarray:
     return mask
 
 
+def crosswalk_mask_at(top: int, shape=(100, 200)) -> np.ndarray:
+    mask = np.zeros(shape, dtype=np.uint8)
+    mask[top : top + 20, :] = 255
+    return mask
+
+
 def bev_at(center_x: int, *, crosswalk: bool) -> BevClassMasks:
     return BevClassMasks(
         center=[line_mask(center_x)],
@@ -43,7 +49,7 @@ def bev_at(center_x: int, *, crosswalk: bool) -> BevClassMasks:
 
 
 class BevCorridorCrosswalkTest(unittest.TestCase):
-    def test_competition_transit_freezes_pre_crosswalk_full_path(self):
+    def test_competition_transit_prefers_fresh_lane_over_cache(self):
         estimator = BevCorridorLaneEstimator(
             BevCorridorConfig(
                 lane_width_px=60.0,
@@ -73,10 +79,86 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
             )
         )
 
-        self.assertEqual(during.reason, "crosswalk_transit_hold:crosswalk")
-        self.assertEqual(during.center_x, before.center_x)
-        self.assertEqual(during.heading_error, before.heading_error)
-        self.assertEqual(during.path_points, before.path_points)
+        self.assertEqual(during.reason, "corridor_tier2")
+        self.assertNotEqual(during.center_x, before.center_x)
+        self.assertNotEqual(during.path_points, before.path_points)
+
+    def test_competition_transit_advances_cache_only_when_lane_is_hidden(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lane_width_px=60.0,
+                center_smooth_alpha=1.0,
+                heading_smooth_alpha=1.0,
+                path_smooth_alpha=1.0,
+                crosswalk_transit_enabled=True,
+                crosswalk_transit_advance_smooth_alpha=1.0,
+                crosswalk_transit_max_advance_px=18.0,
+                vehicle_center_x_offset_ratio=0.0,
+            )
+        )
+        before = estimator.estimate(
+            BevClassMasks(
+                center=[slanted_line_mask(60.0, 0.20)],
+                center_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+        first_hold = estimator.estimate(
+            BevClassMasks(
+                crosswalk=[crosswalk_mask_at(20)],
+                crosswalk_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+        advanced_hold = estimator.estimate(
+            BevClassMasks(
+                crosswalk=[crosswalk_mask_at(30)],
+                crosswalk_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+
+        self.assertTrue(first_hold.reason.startswith("crosswalk_transit_hold:"))
+        self.assertTrue(advanced_hold.reason.startswith("crosswalk_transit_hold:"))
+        self.assertAlmostEqual(first_hold.center_x, before.center_x, delta=0.1)
+        self.assertLess(advanced_hold.center_x, first_hold.center_x)
+
+    def test_competition_transit_reacquires_without_heading_jump_deadlock(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lane_width_px=60.0,
+                center_smooth_alpha=1.0,
+                heading_smooth_alpha=1.0,
+                path_smooth_alpha=1.0,
+                crosswalk_transit_enabled=True,
+                vehicle_center_x_offset_ratio=0.0,
+            )
+        )
+        estimator.estimate(
+            BevClassMasks(
+                center=[slanted_line_mask(60.0, 0.20)],
+                center_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+        estimator.estimate(
+            BevClassMasks(
+                crosswalk=[crosswalk_mask_at(30)],
+                crosswalk_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+        recovered = estimator.estimate(
+            BevClassMasks(
+                center=[slanted_line_mask(65.0, -0.50)],
+                center_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+
+        self.assertEqual(recovered.reason, "corridor_tier2")
+        self.assertNotIn("heading_jump", recovered.reason)
+        self.assertEqual(estimator._crosswalk_transit_remaining, 0)
 
     def test_crosswalk_tracks_lane_with_stronger_smoothing(self):
         estimator = BevCorridorLaneEstimator(
@@ -461,6 +543,78 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
             np.interp(lane.near_target_y, ys, xs),
             delta=0.01,
         )
+
+    def test_spatial_path_guard_removes_v_shaped_splice(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                path_max_abs_slope=1.0,
+                path_max_slope_delta=0.25,
+            )
+        )
+
+        guarded = estimator._limit_path_geometry(
+            [
+                (10.0, 0.0),
+                (190.0, 20.0),
+                (20.0, 40.0),
+                (180.0, 60.0),
+                (100.0, 80.0),
+            ]
+        )
+        slopes = [
+            (right[0] - left[0]) / (right[1] - left[1])
+            for left, right in zip(guarded, guarded[1:])
+        ]
+
+        self.assertTrue(all(abs(slope) <= 1.0 + 1e-9 for slope in slopes))
+        self.assertTrue(
+            all(
+                abs(current - previous) <= 0.25 + 1e-9
+                for previous, current in zip(slopes, slopes[1:])
+            )
+        )
+
+    def test_far_preview_is_tangent_extension_of_control_path(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lookahead_y_ratio=0.58,
+                sample_bottom_y_ratio=0.96,
+            )
+        )
+        stabilized = estimator._stabilize_far_preview(
+            [
+                (10.0, 0.0),
+                (190.0, 20.0),
+                (20.0, 40.0),
+                (100.0, 58.0),
+                (100.0, 70.0),
+                (100.0, 82.0),
+                (100.0, 96.0),
+            ]
+        )
+
+        far_x = [x for x, y in stabilized if y < 58.0]
+        self.assertTrue(far_x)
+        self.assertTrue(all(abs(x - 100.0) < 1e-6 for x in far_x))
+
+    def test_heading_ignores_unused_far_preview_hook(self):
+        estimator = BevCorridorLaneEstimator(BevCorridorConfig())
+        heading = estimator._heading_from_path(
+            [
+                (10.0, 0.0),
+                (190.0, 20.0),
+                (20.0, 40.0),
+                (100.0, 60.0),
+                (100.0, 70.0),
+                (100.0, 80.0),
+                (100.0, 90.0),
+                (100.0, 96.0),
+            ],
+            height=100,
+            fallback=1.0,
+        )
+
+        self.assertAlmostEqual(heading, 0.0, delta=1e-6)
 
     def test_disabled_obstacle_mode_skips_obstacle_bev_warp(self):
         transformer = CountingTransformer()
