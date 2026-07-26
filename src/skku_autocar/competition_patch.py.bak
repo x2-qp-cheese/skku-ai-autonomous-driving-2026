@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Competition-time behavior fixes for the full-speed autonomous-driving runtime.
 
-This module intentionally patches eight competition-critical behaviors:
+This module intentionally patches six competition-critical behaviors:
 
 1. Prevent one obstacle mask from falsely blocking both the current lane and the
    destination lane.
@@ -15,10 +15,6 @@ This module intentionally patches eight competition-critical behaviors:
    recovery and use a short, gradually straightening transit trajectory.
 6. Make pure pursuit near-aware when the far and near lane centers disagree on
    an S-curve, preventing the far point from cancelling the current bend.
-7. Accept a strong, reliable right-boundary curve immediately after a crosswalk
-   instead of rejecting it as a temporal heading jump.
-8. Keep the urgent move into the avoidance lane, but make the return to lane 2
-   longer and cap its steering so it does not touch the outer solid line.
 
 Call ``install_competition_patch()`` before importing ``skku_autocar.runtime.yolo_drive_app``.
 """
@@ -30,10 +26,6 @@ from typing import Sequence
 _INSTALLED = False
 _ORIGINAL_ESTIMATE = None
 _ORIGINAL_CROSSWALK_VISIBLE = None
-_ORIGINAL_IS_CENTER_JUMP = None
-_ORIGINAL_IS_HEADING_JUMP = None
-_ORIGINAL_LANE_CHANGE_PROGRESS = None
-_ORIGINAL_LANE_CHANGE_STEERING_ASSIST = None
 
 
 def _assess_measurements_exclusive(
@@ -177,7 +169,7 @@ def _crosswalk_transit_hold(self, base, source_reason: str):
     if base is None or not base.found:
         return None
 
-    alpha = 0.08
+    alpha = 0.16
     vehicle_x = float(base.vehicle_center_x)
     center_x = float(base.center_x) + alpha * (vehicle_x - float(base.center_x))
 
@@ -250,7 +242,7 @@ def _estimate_with_crosswalk_transit(self, bev):
 
     recovery = int(getattr(self, "_competition_crosswalk_recovery", 0))
     if crosswalk_seen:
-        recovery = 16
+        recovery = 30
     elif recovery > 0:
         recovery -= 1
     self._competition_crosswalk_recovery = recovery
@@ -284,15 +276,15 @@ def _estimate_with_crosswalk_transit(self, bev):
         lane.found
         and self.last_tier in (1, 2)
         and float(lane.confidence) >= 0.45
-        and abs_error <= 0.60
-        and abs_heading <= 0.70
+        and abs_error <= 0.55
+        and abs_heading <= 0.35
     )
     safe_right_side = (
         lane.found
         and name == "virtual-lane-center+right-side"
         and float(lane.confidence) >= 0.45
-        and abs_error <= 0.52
-        and abs_heading <= 0.70
+        and abs_error <= 0.28
+        and abs_heading <= 0.28
     )
 
     if reliable_center or safe_right_side:
@@ -313,8 +305,8 @@ def _estimate_with_crosswalk_transit(self, bev):
         or name.startswith("left-side+virtual-right-side")
         or name.startswith("coast")
         or "virtual-hold" in name
-        or abs_error > 0.68
-        or abs_heading > 0.75
+        or abs_error > 0.55
+        or abs_heading > 0.35
     )
     if not ambiguous:
         return lane
@@ -344,84 +336,6 @@ def _estimate_with_crosswalk_transit(self, bev):
     )
     return held
 
-
-
-
-def _crosswalk_recovery_center_jump(self, raw_center_x: float) -> bool:
-    """Use a wider center gate only during crosswalk exit recovery."""
-    recovery = int(getattr(self, "_competition_crosswalk_recovery", 0))
-    if recovery <= 0:
-        return _ORIGINAL_IS_CENTER_JUMP(self, raw_center_x)
-    previous = getattr(self, "_last_raw_center_x", None)
-    if previous is None:
-        return False
-    return abs(float(raw_center_x) - float(previous)) > 110.0
-
-
-def _crosswalk_recovery_heading_jump(self, raw_heading: float) -> bool:
-    """Allow the real post-crosswalk curve to become stronger quickly.
-
-    In the observed clip, the right boundary stayed visible, but the stronger
-    left curve was rejected by the normal 0.25 heading-jump gate. The relaxed
-    0.60 gate is active only in the short recovery window; left-side-only
-    reconstructions remain rejected by the outer transit guard.
-    """
-    recovery = int(getattr(self, "_competition_crosswalk_recovery", 0))
-    if recovery <= 0:
-        return _ORIGINAL_IS_HEADING_JUMP(self, raw_heading)
-    previous = getattr(self, "_last_raw_heading", None)
-    if previous is None:
-        return False
-    return abs(float(raw_heading) - float(previous)) > 0.60
-
-
-def _asymmetric_lane_change_progress(self, now: float) -> float:
-    """Keep obstacle entry fast and make only the return to lane 2 smoother."""
-    duration = max(0.05, float(self.config.transition_seconds))
-    if self.state == "changing_to_lane2":
-        duration *= 1.35
-    if self._phase_started_at is None:
-        return 0.0
-    return min(
-        1.0,
-        max(0.0, (float(now) - float(self._phase_started_at)) / duration),
-    )
-
-
-def _smooth_lane2_return_steering(self, command, result):
-    """Cap only the lane-2 return command to prevent outer-line overshoot."""
-    adjusted = _ORIGINAL_LANE_CHANGE_STEERING_ASSIST(
-        self,
-        command,
-        result,
-    )
-    if adjusted.brake:
-        return adjusted
-
-    if result.state == "changing_to_lane2":
-        cap = 115
-    elif result.state == "stabilizing_lane2":
-        cap = 90
-    else:
-        return adjusted
-
-    steering = max(-cap, min(cap, int(adjusted.steering)))
-    if steering == adjusted.steering:
-        return adjusted
-
-    from .types import ControlCommand
-
-    reason = (
-        "%s:lane2_return_smooth" % adjusted.reason
-        if adjusted.reason
-        else "lane2_return_smooth"
-    )
-    return ControlCommand(
-        speed=adjusted.speed,
-        steering=steering,
-        brake=False,
-        reason=reason,
-    )
 
 
 def _plan_pure_pursuit_near_aware(self, lane):
@@ -546,33 +460,12 @@ def install_competition_patch() -> None:
     from .runtime import obstacle_mode as obstacle_mode_module
 
     global _ORIGINAL_ESTIMATE, _ORIGINAL_CROSSWALK_VISIBLE
-    global _ORIGINAL_IS_CENTER_JUMP, _ORIGINAL_IS_HEADING_JUMP
-    global _ORIGINAL_LANE_CHANGE_PROGRESS
-    global _ORIGINAL_LANE_CHANGE_STEERING_ASSIST
     _ORIGINAL_ESTIMATE = BevCorridorLaneEstimator.estimate
     _ORIGINAL_CROSSWALK_VISIBLE = BevCorridorLaneEstimator._crosswalk_visible
-    _ORIGINAL_IS_CENTER_JUMP = BevCorridorLaneEstimator._is_center_jump
-    _ORIGINAL_IS_HEADING_JUMP = BevCorridorLaneEstimator._is_heading_jump
-    _ORIGINAL_LANE_CHANGE_PROGRESS = LaneChangeController._progress
-    _ORIGINAL_LANE_CHANGE_STEERING_ASSIST = (
-        LaneChangeController.apply_steering_assist
-    )
-
     BevCorridorLaneEstimator._crosswalk_visible = (
         _ignore_crosswalk_for_lane_geometry
     )
-    BevCorridorLaneEstimator._is_center_jump = (
-        _crosswalk_recovery_center_jump
-    )
-    BevCorridorLaneEstimator._is_heading_jump = (
-        _crosswalk_recovery_heading_jump
-    )
     BevCorridorLaneEstimator.estimate = _estimate_with_crosswalk_transit
-
-    LaneChangeController._progress = _asymmetric_lane_change_progress
-    LaneChangeController.apply_steering_assist = (
-        _smooth_lane2_return_steering
-    )
     YoloLaneFollower._plan_pure_pursuit = _plan_pure_pursuit_near_aware
     ObstacleFusionPlanner._assess_measurements = _assess_measurements_exclusive
     LaneChangeController._uses_target_arrival = _use_smooth_lane_change

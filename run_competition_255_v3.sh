@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-python3 scripts/drive.py \
+python scripts/drive.py \
   --speed 255 \
   --fixed-speed on \
   --max-speed 255 \
@@ -12,7 +12,7 @@ python3 scripts/drive.py \
   --bev-lookahead 0.32 \
   --bev-center-smooth 0.32 \
   --bev-heading-smooth 0.22 \
-  --vehicle-center-offset 0.040 \
+  --vehicle-center-offset 0.035 \
   --corridor-centerline-bias 0.50 \
   --corridor-crosswalk-option a \
   --center-lock off \
