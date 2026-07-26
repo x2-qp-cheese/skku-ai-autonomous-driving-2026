@@ -29,6 +29,7 @@ class UltrasonicReadings:
     """
 
     front_right_mm: Optional[float] = None
+    front_center_mm: Optional[float] = None
     front_left_mm: Optional[float] = None
     side_right_mm: Optional[float] = None
     side_left_mm: Optional[float] = None
@@ -39,12 +40,16 @@ def parse_ultrasonic_line(line: str) -> Optional[UltrasonicReadings]:
         return None
     values = {
         key: _valid_ultrasonic_mm(float(value))
-        for key, value in re.findall(r"\b(FR|FL|SR|SL)=(-?\d+(?:\.\d+)?)", line)
+        for key, value in re.findall(
+            r"\b(FC|FR|FL|SR|SL|F)=(-?\d+(?:\.\d+)?)",
+            line,
+        )
     }
     if not values:
         return None
     return UltrasonicReadings(
         front_right_mm=values.get("FR"),
+        front_center_mm=values.get("FC", values.get("F")),
         front_left_mm=values.get("FL"),
         side_right_mm=values.get("SR"),
         side_left_mm=values.get("SL"),

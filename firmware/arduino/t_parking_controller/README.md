@@ -1,4 +1,9 @@
-# Arduino Mega T Parking Controller
+# Legacy Arduino T Parking Controller
+
+> Do not flash this sketch for `scripts/parking.py`. It is retained only for
+> old replay/reference tests. The live runtime now plans from the locked LiDAR
+> slot pose on the host and uses the Arduino only as a DRIVE/STOP actuator and
+> ultrasonic reporter.
 
 `t_parking_controller.ino` is a standalone mission state machine that expects
 the vehicle project to provide these functions:

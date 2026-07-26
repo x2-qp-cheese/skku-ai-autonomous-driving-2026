@@ -10,6 +10,8 @@ from .estimation.parking_fusion import ParkingFusionConfig
 from .estimation.parking_geometry import ParkingGeometryConfig
 from .estimation.parking_lidar import LidarParkingConfig, RectangleRoi
 from .perception.bev import BevConfig
+from .planning.hybrid_parking_path import HybridPathConfig, VehicleModel
+from .planning.model_based_parking import ModelBasedParkingConfig
 from .planning.reverse_parking_path import ReversePathConfig
 from .planning.t_parking_planner import ParkingPlannerConfig
 
@@ -65,6 +67,9 @@ class ParkingAppConfig:
     lidar: LidarParkingConfig
     path: ReversePathConfig
     planner: ParkingPlannerConfig
+    vehicle: VehicleModel
+    hybrid_path: HybridPathConfig
+    model_planner: ModelBasedParkingConfig
     runtime: ParkingRuntimeConfig
 
 
@@ -91,7 +96,7 @@ def load_parking_config(path: str) -> ParkingAppConfig:
             raise ValueError("config section 'slot_tracking_roi' must be an object")
         lidar_values["slot_tracking_roi"] = RectangleRoi(**tracking_roi_data)
 
-    return ParkingAppConfig(
+    config = ParkingAppConfig(
         rear_camera=CameraConfig(**section(data, "rear_camera")),
         front_camera=CameraConfig(**section(data, "front_camera")),
         serial=SerialConfig(**section(data, "serial")),
@@ -102,8 +107,13 @@ def load_parking_config(path: str) -> ParkingAppConfig:
         lidar=LidarParkingConfig(**lidar_values),
         path=ReversePathConfig(**section(data, "path")),
         planner=ParkingPlannerConfig(**section(data, "planner")),
+        vehicle=VehicleModel(**section(data, "vehicle")),
+        hybrid_path=HybridPathConfig(**section(data, "hybrid_path")),
+        model_planner=ModelBasedParkingConfig(**section(data, "model_planner")),
         runtime=ParkingRuntimeConfig(**section(data, "runtime")),
     )
+    validate_model_based_parking_config(config)
+    return config
 
 
 def section(data: Dict[str, Any], name: str) -> Dict[str, Any]:
@@ -111,3 +121,50 @@ def section(data: Dict[str, Any], name: str) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("config section '%s' must be an object" % name)
     return value
+
+
+def validate_model_based_parking_config(config: ParkingAppConfig) -> None:
+    vehicle = config.vehicle
+    planner = config.model_planner
+    path = config.hybrid_path
+    if vehicle.wheelbase_mm <= 0.0:
+        raise ValueError("vehicle.wheelbase_mm must be positive")
+    if vehicle.width_mm <= 0.0 or vehicle.length_mm <= 0.0:
+        raise ValueError("vehicle width and length must be positive")
+    if not 0.0 < vehicle.max_steering_angle_deg < 60.0:
+        raise ValueError("vehicle.max_steering_angle_deg must be between 0 and 60")
+    if not 0.0 <= vehicle.rear_axle_to_rear_bumper_mm < vehicle.length_mm:
+        raise ValueError(
+            "vehicle.rear_axle_to_rear_bumper_mm must be within vehicle length"
+        )
+    effective_width = (
+        vehicle.width_mm + 2.0 * max(0.0, vehicle.collision_clearance_mm)
+    )
+    if effective_width >= config.lidar.parking_space_width_mm:
+        raise ValueError(
+            "vehicle width plus collision clearance must fit inside parking space"
+        )
+    occupied_depth = (
+        vehicle.length_mm
+        + max(0.0, planner.back_clearance_mm)
+        + max(0.0, vehicle.collision_clearance_mm)
+    )
+    if occupied_depth >= config.lidar.parking_space_depth_mm:
+        raise ValueError(
+            "vehicle length, back clearance, and collision clearance must fit "
+            "inside parking space"
+        )
+    if not 3.0 <= planner.park_hold_s <= 5.0:
+        raise ValueError("model_planner.park_hold_s must be between 3 and 5")
+    if planner.maneuver_forward_speed <= 0:
+        raise ValueError("model_planner.maneuver_forward_speed must be positive")
+    if planner.maneuver_reverse_speed >= 0 or planner.final_reverse_speed >= 0:
+        raise ValueError("model planner reverse speeds must be negative")
+    if path.goal_position_tolerance_mm > planner.goal_position_tolerance_mm:
+        raise ValueError(
+            "hybrid path position tolerance must not exceed completion tolerance"
+        )
+    if path.goal_heading_tolerance_deg > planner.goal_heading_tolerance_deg:
+        raise ValueError(
+            "hybrid path heading tolerance must not exceed completion tolerance"
+        )

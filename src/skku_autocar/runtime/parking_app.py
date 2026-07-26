@@ -32,10 +32,15 @@ from ..estimation.parking_lidar import (
     LidarParkingSpaceEstimator,
     infer_dynamic_slot_polygon,
 )
-from ..parking_config import ParkingAppConfig, load_parking_config
+from ..parking_config import (
+    ParkingAppConfig,
+    load_parking_config,
+    validate_model_based_parking_config,
+)
 from ..perception.bev import BevTransformer
 from ..perception.yolo_lane import YoloLaneConfig, YoloLaneSegmenter
-from ..planning.t_parking_planner import ParkingState, TParkingPlanner
+from ..planning.model_based_parking import ModelBasedTParkingPlanner
+from ..planning.t_parking_planner import ParkingState
 from ..sensors.lidar import LidarCsvReplay, RplidarScanner, find_lidar_port
 
 
@@ -275,7 +280,14 @@ def run_prepared(args: argparse.Namespace) -> int:
     geometry_estimator = ParkingGeometryEstimator(config.geometry)
     lidar_estimator = LidarParkingSpaceEstimator(config.lidar)
     locked_slot_geometry = make_locked_slot_geometry(config)
-    planner = TParkingPlanner(config.planner, config.path)
+    planner = ModelBasedTParkingPlanner(
+        config.model_planner,
+        config.vehicle,
+        config.hybrid_path,
+        sensor_to_rear_axle_y_back_mm=(
+            config.lidar.sensor_to_rear_axle_y_back_mm
+        ),
+    )
 
     lidar_replay = LidarCsvReplay(str(resolve_path(args.lidar_csv))) if args.lidar_csv else None
     lidar_scanner = None
@@ -476,7 +488,7 @@ def run_prepared(args: argparse.Namespace) -> int:
             ultrasonic_fresh = (
                 last_ultrasonic is not None
                 and monotonic_now - last_ultrasonic_at
-                <= config.planner.ultrasonic_stale_after_s
+                <= config.model_planner.ultrasonic_stale_after_s
             )
             left_ultrasonic_mm = (
                 last_ultrasonic.side_left_mm if ultrasonic_fresh else None
@@ -487,17 +499,22 @@ def run_prepared(args: argparse.Namespace) -> int:
             front_left_ultrasonic_mm = (
                 last_ultrasonic.front_left_mm if ultrasonic_fresh else None
             )
+            front_center_ultrasonic_mm = (
+                last_ultrasonic.front_center_mm if ultrasonic_fresh else None
+            )
             front_right_ultrasonic_mm = (
                 last_ultrasonic.front_right_mm if ultrasonic_fresh else None
             )
             plan = planner.update(
                 geometry,
                 lidar_observation,
+                locked_slot_pose.polygon,
                 elapsed,
                 enabled=True,
                 left_ultrasonic_mm=left_ultrasonic_mm,
                 right_ultrasonic_mm=right_ultrasonic_mm,
                 front_left_ultrasonic_mm=front_left_ultrasonic_mm,
+                front_center_ultrasonic_mm=front_center_ultrasonic_mm,
                 front_right_ultrasonic_mm=front_right_ultrasonic_mm,
             )
             if planner.state != last_state:
@@ -529,6 +546,7 @@ def run_prepared(args: argparse.Namespace) -> int:
                 left_ultrasonic_mm,
                 right_ultrasonic_mm,
                 front_left_ultrasonic_mm,
+                front_center_ultrasonic_mm,
                 front_right_ultrasonic_mm,
                 show_status=False,
                 mask_geometry=camera_geometry,
@@ -563,6 +581,7 @@ def run_prepared(args: argparse.Namespace) -> int:
                 front_display=front_frame,
                 front_camera_enabled=front_camera_enabled,
                 front_left_ultrasonic_mm=front_left_ultrasonic_mm,
+                front_center_ultrasonic_mm=front_center_ultrasonic_mm,
                 front_right_ultrasonic_mm=front_right_ultrasonic_mm,
             )
             cv2.imshow("T Parking - Live Dashboard", dashboard)
@@ -839,6 +858,7 @@ def draw_live_dashboard(
     front_display: Optional[Any] = None,
     front_camera_enabled: bool = False,
     front_left_ultrasonic_mm: Optional[float] = None,
+    front_center_ultrasonic_mm: Optional[float] = None,
     front_right_ultrasonic_mm: Optional[float] = None,
 ) -> Any:
     state_color = parking_state_color(plan.state)
@@ -906,11 +926,16 @@ def draw_live_dashboard(
             depth,
             geometry.reason,
         ),
-        "ULTRASONIC FL=%s FR=%s | SL=%s SR=%s cm | BODY_MID_INSIDE=%s" % (
+        "ULTRASONIC FL=%s FC=%s FR=%s | SL=%s SR=%s cm" % (
             format_dashboard_value(
                 None
                 if front_left_ultrasonic_mm is None
                 else front_left_ultrasonic_mm / 10.0
+            ),
+            format_dashboard_value(
+                None
+                if front_center_ultrasonic_mm is None
+                else front_center_ultrasonic_mm / 10.0
             ),
             format_dashboard_value(
                 None
@@ -923,7 +948,6 @@ def draw_live_dashboard(
             format_dashboard_value(
                 None if right_ultrasonic_mm is None else right_ultrasonic_mm / 10.0
             ),
-            "Y" if getattr(plan, "body_mid_inside", False) else "N",
         ),
         "FPS=%.1f | elapsed=%.2fs | %s" % (fps, elapsed_s, wall_time),
         "Colors: CYAN=left GREEN=right RED=back MAGENTA=unclassified | SPACE start/resume R stop/reset Q quit",
@@ -993,6 +1017,7 @@ def draw_debug(
     left_ultrasonic_mm: Optional[float] = None,
     right_ultrasonic_mm: Optional[float] = None,
     front_left_ultrasonic_mm: Optional[float] = None,
+    front_center_ultrasonic_mm: Optional[float] = None,
     front_right_ultrasonic_mm: Optional[float] = None,
     show_status: bool = True,
     mask_geometry: Optional[ParkingGeometry] = None,
@@ -1057,8 +1082,9 @@ def draw_debug(
             ),
         ),
         "plan=%s" % plan.reason,
-        "ultrasonic FL=%s FR=%s SL=%s SR=%s" % (
+        "ultrasonic FL=%s FC=%s FR=%s SL=%s SR=%s" % (
             "-" if front_left_ultrasonic_mm is None else "%.0fmm" % front_left_ultrasonic_mm,
+            "-" if front_center_ultrasonic_mm is None else "%.0fmm" % front_center_ultrasonic_mm,
             "-" if front_right_ultrasonic_mm is None else "%.0fmm" % front_right_ultrasonic_mm,
             "-" if left_ultrasonic_mm is None else "%.0fmm" % left_ultrasonic_mm,
             "-" if right_ultrasonic_mm is None else "%.0fmm" % right_ultrasonic_mm,
@@ -1241,6 +1267,16 @@ def draw_lidar_debug(
         config,
         geometry,
         getattr(plan, "path", None),
+        origin,
+        scale,
+        rotation_deg,
+    )
+    draw_hybrid_path_on_lidar(
+        cv2,
+        np,
+        canvas,
+        config,
+        getattr(plan, "world_path", None),
         origin,
         scale,
         rotation_deg,
@@ -1547,6 +1583,60 @@ def draw_reverse_path_on_lidar(
             )
 
 
+def draw_hybrid_path_on_lidar(
+    cv2: Any,
+    np: Any,
+    image: Any,
+    config: ParkingAppConfig,
+    path: Any,
+    origin: Tuple[int, int],
+    scale: float,
+    rotation_deg: float,
+) -> None:
+    if path is None or not getattr(path, "poses", None):
+        return
+    sensor_to_axle = config.lidar.sensor_to_rear_axle_y_back_mm
+    world_points = tuple(
+        (
+            float(pose.x_right_mm),
+            sensor_to_axle - float(pose.y_forward_mm),
+        )
+        for pose in path.poses
+    )
+    if len(world_points) >= 2:
+        draw_world_polyline(
+            cv2,
+            np,
+            image,
+            world_points,
+            origin,
+            scale,
+            rotation_deg,
+            (255, 255, 0),
+            3,
+        )
+    if path.goal is not None:
+        goal = (
+            float(path.goal.x_right_mm),
+            sensor_to_axle - float(path.goal.y_forward_mm),
+        )
+        cv2.drawMarker(
+            image,
+            world_to_lidar_pixel(
+                goal[0],
+                goal[1],
+                origin,
+                scale,
+                rotation_deg,
+            ),
+            (255, 255, 255),
+            cv2.MARKER_TILTED_CROSS,
+            15,
+            2,
+            cv2.LINE_AA,
+        )
+
+
 def reverse_path_points_to_lidar_world(
     config: ParkingAppConfig,
     geometry: ParkingGeometry,
@@ -1720,24 +1810,14 @@ def open_vehicle(args: argparse.Namespace, config: ParkingAppConfig) -> SerialVe
             ready_timeout_s=3.0,
         ),
         max_speed=max(
-            abs(config.planner.search_speed),
-            abs(config.planner.gap_tracking_speed),
-            abs(config.planner.position_speed),
-            abs(config.planner.prealign_speed),
-            abs(config.planner.entry_setup_speed),
-            abs(config.planner.reverse_entry_speed),
-            abs(config.planner.reverse_center_speed),
-            abs(config.planner.correction_forward_speed),
-            abs(config.planner.correction_reverse_speed),
-            abs(config.planner.exit_speed),
+            abs(config.model_planner.search_speed),
+            abs(config.model_planner.gap_tracking_speed),
+            abs(config.model_planner.maneuver_forward_speed),
+            abs(config.model_planner.maneuver_reverse_speed),
+            abs(config.model_planner.final_reverse_speed),
+            abs(config.model_planner.exit_speed),
         ),
-        max_steering=max(
-            abs(config.planner.max_steering),
-            abs(config.planner.prealign_steering),
-            abs(config.planner.entry_setup_steering),
-            abs(config.planner.correction_steering),
-            abs(config.planner.exit_turn_steering),
-        ),
+        max_steering=abs(config.model_planner.max_steering_command),
     )
     client.connect()
     client.write_line("USON")
@@ -2024,6 +2104,8 @@ def apply_cli_overrides(config: ParkingAppConfig, args: argparse.Namespace) -> P
             ),
         )
     planner = config.planner
+    model_planner = config.model_planner
+    vehicle = config.vehicle
     if args.first_car_preemptive_turn is not None:
         planner = replace(
             planner,
@@ -2040,6 +2122,10 @@ def apply_cli_overrides(config: ParkingAppConfig, args: argparse.Namespace) -> P
     if args.straight_steering_trim is not None:
         planner = replace(
             planner,
+            straight_steering_trim=args.straight_steering_trim,
+        )
+        model_planner = replace(
+            model_planner,
             straight_steering_trim=args.straight_steering_trim,
         )
     if args.entry_setup_speed is not None:
@@ -2060,8 +2146,10 @@ def apply_cli_overrides(config: ParkingAppConfig, args: argparse.Namespace) -> P
         )
     if args.park_hold_s is not None:
         planner = replace(planner, park_hold_s=args.park_hold_s)
+        model_planner = replace(model_planner, park_hold_s=args.park_hold_s)
     if args.exit_speed is not None:
         planner = replace(planner, exit_speed=args.exit_speed)
+        model_planner = replace(model_planner, exit_speed=args.exit_speed)
     if args.exit_turn_steering is not None:
         planner = replace(planner, exit_turn_steering=args.exit_turn_steering)
     if args.exit_turn_s is not None:
@@ -2073,6 +2161,62 @@ def apply_cli_overrides(config: ParkingAppConfig, args: argparse.Namespace) -> P
             planner,
             exit_right_min_clearance_mm=args.exit_right_min_clearance_cm * 10.0,
         )
+    if args.wheelbase_mm is not None:
+        vehicle = replace(vehicle, wheelbase_mm=args.wheelbase_mm)
+    if args.max_steering_angle_deg is not None:
+        vehicle = replace(
+            vehicle,
+            max_steering_angle_deg=args.max_steering_angle_deg,
+        )
+    if args.vehicle_width_mm is not None:
+        vehicle = replace(vehicle, width_mm=args.vehicle_width_mm)
+    if args.vehicle_length_mm is not None:
+        vehicle = replace(vehicle, length_mm=args.vehicle_length_mm)
+    if args.rear_axle_to_rear_bumper_mm is not None:
+        vehicle = replace(
+            vehicle,
+            rear_axle_to_rear_bumper_mm=args.rear_axle_to_rear_bumper_mm,
+        )
+    if args.collision_clearance_mm is not None:
+        vehicle = replace(
+            vehicle,
+            collision_clearance_mm=args.collision_clearance_mm,
+        )
+    if args.parking_back_clearance_mm is not None:
+        model_planner = replace(
+            model_planner,
+            back_clearance_mm=args.parking_back_clearance_mm,
+        )
+    if args.forward_lookahead_mm is not None:
+        model_planner = replace(
+            model_planner,
+            forward_lookahead_mm=args.forward_lookahead_mm,
+        )
+    if args.reverse_lookahead_mm is not None:
+        model_planner = replace(
+            model_planner,
+            reverse_lookahead_mm=args.reverse_lookahead_mm,
+        )
+    if args.maneuver_forward_speed is not None:
+        model_planner = replace(
+            model_planner,
+            maneuver_forward_speed=args.maneuver_forward_speed,
+        )
+    if args.maneuver_reverse_speed is not None:
+        model_planner = replace(
+            model_planner,
+            maneuver_reverse_speed=args.maneuver_reverse_speed,
+        )
+    if args.final_reverse_speed is not None:
+        model_planner = replace(
+            model_planner,
+            final_reverse_speed=args.final_reverse_speed,
+        )
+    if args.auto_exit is not None:
+        model_planner = replace(
+            model_planner,
+            auto_exit_enabled=args.auto_exit,
+        )
     if bev.src_top_left[0] >= bev.src_top_right[0]:
         raise ValueError("BEV top-left x must be smaller than top-right x")
     if bev.src_bottom_left[0] >= bev.src_bottom_right[0]:
@@ -2081,7 +2225,17 @@ def apply_cli_overrides(config: ParkingAppConfig, args: argparse.Namespace) -> P
         raise ValueError("BEV top y must be smaller than bottom y")
     if not 0.0 <= bev.dst_x_margin < 0.5:
         raise ValueError("BEV destination margin must be at least 0 and below 0.5")
-    return replace(config, bev=bev, lidar=lidar, planner=planner, runtime=runtime)
+    updated = replace(
+        config,
+        bev=bev,
+        lidar=lidar,
+        planner=planner,
+        model_planner=model_planner,
+        vehicle=vehicle,
+        runtime=runtime,
+    )
+    validate_model_based_parking_config(updated)
+    return updated
 
 
 def resolve_path(value: str) -> Path:
@@ -2125,7 +2279,9 @@ def extract_recording_zip(zip_path: Path, destination: Path) -> Tuple[Path, Path
 
 
 def parse_args(argv: Optional[list]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="LiDAR-first T-parking runtime")
+    parser = argparse.ArgumentParser(
+        description="LiDAR-relative model-based T-parking runtime"
+    )
     parser.add_argument("--config", default="configs/parking.json")
     parser.add_argument(
         "--source",
@@ -2240,34 +2396,120 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         help="signed rear-axle coordinate from LiDAR (negative=ahead of rear-mounted LiDAR)",
     )
     parser.add_argument(
+        "--wheelbase-mm",
+        type=float,
+        default=None,
+        help="measured rear-to-front axle distance for the bicycle model",
+    )
+    parser.add_argument(
+        "--max-steering-angle-deg",
+        type=float,
+        default=None,
+        help="measured physical road-wheel angle at maximum steering command",
+    )
+    parser.add_argument(
+        "--vehicle-width-mm",
+        type=float,
+        default=None,
+        help="widest body or wheel-envelope width used by collision checking",
+    )
+    parser.add_argument(
+        "--vehicle-length-mm",
+        type=float,
+        default=None,
+        help="front-to-rear body envelope length used by collision checking",
+    )
+    parser.add_argument(
+        "--rear-axle-to-rear-bumper-mm",
+        type=float,
+        default=None,
+        help="rear axle center to the rearmost body or sensor point",
+    )
+    parser.add_argument(
+        "--collision-clearance-mm",
+        type=float,
+        default=None,
+        help="extra safety envelope added around the vehicle footprint",
+    )
+    parser.add_argument(
+        "--parking-back-clearance-mm",
+        type=float,
+        default=None,
+        help="desired rear-bumper clearance from the slot back line",
+    )
+    parser.add_argument(
+        "--forward-lookahead-mm",
+        type=float,
+        default=None,
+        help="pure-pursuit lookahead while following forward path segments",
+    )
+    parser.add_argument(
+        "--reverse-lookahead-mm",
+        type=float,
+        default=None,
+        help="pure-pursuit lookahead while following reverse path segments",
+    )
+    parser.add_argument(
+        "--maneuver-forward-speed",
+        type=int,
+        default=None,
+        help="positive motor command on planned forward parking segments",
+    )
+    parser.add_argument(
+        "--maneuver-reverse-speed",
+        type=int,
+        default=None,
+        help="negative motor command on planned reverse parking segments",
+    )
+    parser.add_argument(
+        "--final-reverse-speed",
+        type=int,
+        default=None,
+        help="negative motor command inside the final slow-down distance",
+    )
+    exit_mode = parser.add_mutually_exclusive_group()
+    exit_mode.add_argument(
+        "--auto-exit",
+        dest="auto_exit",
+        action="store_true",
+        help="after the required hold, plan a forward path out of the bay",
+    )
+    exit_mode.add_argument(
+        "--no-auto-exit",
+        dest="auto_exit",
+        action="store_false",
+        help="remain parked after the required hold (recommended during tuning)",
+    )
+    parser.set_defaults(auto_exit=None)
+    parser.add_argument(
         "--prealign-speed",
         type=int,
         default=None,
-        help="legacy prealign override; ignored by the straight-search planner",
+        help="legacy replay option; ignored by the model-based live planner",
     )
     parser.add_argument(
         "--first-car-turn-target-cm",
         type=float,
         default=None,
-        help="legacy first-car trigger calibration; ignored by the straight-search planner",
+        help="legacy replay option; ignored by the model-based live planner",
     )
     parser.add_argument(
         "--first-car-preemptive-turn",
         choices=("on", "off"),
         default=None,
-        help="legacy preemptive-turn switch; ignored by the straight-search planner",
+        help="legacy replay option; ignored by the model-based live planner",
     )
     parser.add_argument(
         "--prealign-steering",
         type=int,
         default=None,
-        help="legacy prealign steering override; ignored by the straight-search planner",
+        help="legacy replay option; ignored by the model-based live planner",
     )
     parser.add_argument(
         "--prealign-timeout-s",
         type=float,
         default=None,
-        help="legacy prealign timeout override; ignored by the straight-search planner",
+        help="legacy replay option; ignored by the model-based live planner",
     )
     parser.add_argument(
         "--straight-steering-trim",
@@ -2279,31 +2521,31 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         "--entry-setup-speed",
         type=int,
         default=None,
-        help="forward speed used to create entry angle before reversing",
+        help="legacy replay option; live setup speed is --maneuver-forward-speed",
     )
     parser.add_argument(
         "--entry-setup-steering",
         type=int,
         default=None,
-        help="signed steering command used to create entry angle before reversing",
+        help="legacy replay option; live steering comes from the planned curvature",
     )
     parser.add_argument(
         "--entry-setup-min-s",
         type=float,
         default=None,
-        help="minimum seconds to hold the entry-angle setup before reversing",
+        help="legacy replay option; live movement never transitions by elapsed time",
     )
     parser.add_argument(
         "--entry-setup-max-s",
         type=float,
         default=None,
-        help="maximum seconds allowed for entry-angle setup before aborting",
+        help="legacy replay option; live movement never transitions by elapsed time",
     )
     parser.add_argument(
         "--entry-setup-target-heading-deg",
         type=float,
         default=None,
-        help="reverse starts only when abs(slot heading error) is at or below this value",
+        help="legacy replay option; live gear changes come from Hybrid A*",
     )
     parser.add_argument(
         "--park-hold-s",
@@ -2321,25 +2563,25 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         "--exit-turn-steering",
         type=int,
         default=None,
-        help="signed steering command while leaving the slot; right is positive",
+        help="legacy replay option; live exit steering comes from its planned path",
     )
     parser.add_argument(
         "--exit-turn-s",
         type=float,
         default=None,
-        help="seconds to keep the right-turn command after parking",
+        help="legacy replay option; live exit never transitions by elapsed motion time",
     )
     parser.add_argument(
         "--exit-straight-s",
         type=float,
         default=None,
-        help="seconds to drive straight after the exit turn; 0 keeps driving until cancelled",
+        help="legacy replay option; live exit ends at a relative lane pose",
     )
     parser.add_argument(
         "--exit-right-min-clearance-cm",
         type=float,
         default=None,
-        help="stop exit turn while right ultrasonic distance is at or below this value",
+        help="legacy replay option; live emergency threshold is in model_planner",
     )
     args = parser.parse_args(argv)
     if args.auto_start and args.manual_start:
@@ -2417,8 +2659,11 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         and args.entry_setup_target_heading_deg <= 0.0
     ):
         parser.error("--entry-setup-target-heading-deg must be positive")
-    if args.park_hold_s is not None and args.park_hold_s < 0.0:
-        parser.error("--park-hold-s cannot be negative")
+    if (
+        args.park_hold_s is not None
+        and not 3.0 <= args.park_hold_s <= 5.0
+    ):
+        parser.error("--park-hold-s must be between 3 and 5 seconds")
     if args.exit_speed is not None and args.exit_speed <= 0:
         parser.error("--exit-speed must be positive")
     if args.exit_turn_steering is not None and abs(args.exit_turn_steering) > 150:
@@ -2437,6 +2682,33 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         and not -250.0 <= args.first_car_turn_target_cm <= 250.0
     ):
         parser.error("--first-car-turn-target-cm must be between -250 and 250")
+    positive_model_values = (
+        "wheelbase_mm",
+        "max_steering_angle_deg",
+        "vehicle_width_mm",
+        "vehicle_length_mm",
+        "rear_axle_to_rear_bumper_mm",
+        "forward_lookahead_mm",
+        "reverse_lookahead_mm",
+    )
+    for name in positive_model_values:
+        value = getattr(args, name)
+        if value is not None and value <= 0.0:
+            parser.error("--%s must be positive" % name.replace("_", "-"))
+    nonnegative_model_values = (
+        "collision_clearance_mm",
+        "parking_back_clearance_mm",
+    )
+    for name in nonnegative_model_values:
+        value = getattr(args, name)
+        if value is not None and value < 0.0:
+            parser.error("--%s cannot be negative" % name.replace("_", "-"))
+    if args.maneuver_forward_speed is not None and args.maneuver_forward_speed <= 0:
+        parser.error("--maneuver-forward-speed must be positive")
+    if args.maneuver_reverse_speed is not None and args.maneuver_reverse_speed >= 0:
+        parser.error("--maneuver-reverse-speed must be negative")
+    if args.final_reverse_speed is not None and args.final_reverse_speed >= 0:
+        parser.error("--final-reverse-speed must be negative")
     return args
 
 

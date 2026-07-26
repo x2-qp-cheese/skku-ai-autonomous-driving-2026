@@ -26,6 +26,14 @@ class ParkingConfigTest(unittest.TestCase):
         self.assertEqual(config.geometry.min_confirm_frames, 3)
         self.assertEqual(config.lidar.parking_space_width_mm, 950.0)
         self.assertEqual(config.lidar.parking_space_depth_mm, 1500.0)
+        self.assertEqual(config.vehicle.wheelbase_mm, 620.0)
+        self.assertEqual(config.vehicle.width_mm, 600.0)
+        self.assertEqual(config.vehicle.length_mm, 1000.0)
+        self.assertEqual(config.hybrid_path.steering_samples, 3)
+        self.assertEqual(config.hybrid_path.goal_position_tolerance_mm, 90.0)
+        self.assertTrue(config.model_planner.emergency_stop_enabled)
+        self.assertEqual(config.model_planner.park_hold_s, 3.4)
+        self.assertEqual(config.model_planner.exit_lane_advance_mm, 1200.0)
         self.assertFalse(config.lidar.clockwise_angles)
         self.assertEqual(config.lidar.angle_offset_deg, -90.0)
         self.assertGreater(
@@ -196,12 +204,25 @@ class ParkingConfigTest(unittest.TestCase):
             "--entry-setup-min-s", "1.4",
             "--entry-setup-max-s", "2.8",
             "--entry-setup-target-heading-deg", "50",
-            "--park-hold-s", "2.5",
+            "--park-hold-s", "3.5",
             "--exit-speed", "20",
             "--exit-turn-steering", "70",
             "--exit-turn-s", "1.2",
             "--exit-straight-s", "0",
             "--exit-right-min-clearance-cm", "22",
+            "--wheelbase-mm", "640",
+            "--max-steering-angle-deg", "28",
+            "--vehicle-width-mm", "610",
+            "--vehicle-length-mm", "1010",
+            "--rear-axle-to-rear-bumper-mm", "210",
+            "--collision-clearance-mm", "30",
+            "--parking-back-clearance-mm", "130",
+            "--forward-lookahead-mm", "450",
+            "--reverse-lookahead-mm", "360",
+            "--maneuver-forward-speed", "48",
+            "--maneuver-reverse-speed", "-46",
+            "--final-reverse-speed", "-32",
+            "--no-auto-exit",
         ])
         original = load_parking_config(str(ROOT / "configs" / "parking.json"))
         config = apply_cli_overrides(original, args)
@@ -227,12 +248,27 @@ class ParkingConfigTest(unittest.TestCase):
         self.assertEqual(config.planner.entry_setup_min_s, 1.4)
         self.assertEqual(config.planner.entry_setup_max_s, 2.8)
         self.assertEqual(config.planner.entry_setup_target_heading_deg, 50.0)
-        self.assertEqual(config.planner.park_hold_s, 2.5)
+        self.assertEqual(config.planner.park_hold_s, 3.5)
         self.assertEqual(config.planner.exit_speed, 20)
         self.assertEqual(config.planner.exit_turn_steering, 70)
         self.assertEqual(config.planner.exit_turn_s, 1.2)
         self.assertEqual(config.planner.exit_straight_s, 0.0)
         self.assertEqual(config.planner.exit_right_min_clearance_mm, 220.0)
+        self.assertEqual(config.vehicle.wheelbase_mm, 640.0)
+        self.assertEqual(config.vehicle.max_steering_angle_deg, 28.0)
+        self.assertEqual(config.vehicle.width_mm, 610.0)
+        self.assertEqual(config.vehicle.length_mm, 1010.0)
+        self.assertEqual(config.vehicle.rear_axle_to_rear_bumper_mm, 210.0)
+        self.assertEqual(config.vehicle.collision_clearance_mm, 30.0)
+        self.assertEqual(config.model_planner.back_clearance_mm, 130.0)
+        self.assertEqual(config.model_planner.forward_lookahead_mm, 450.0)
+        self.assertEqual(config.model_planner.reverse_lookahead_mm, 360.0)
+        self.assertEqual(config.model_planner.maneuver_forward_speed, 48)
+        self.assertEqual(config.model_planner.maneuver_reverse_speed, -46)
+        self.assertEqual(config.model_planner.final_reverse_speed, -32)
+        self.assertEqual(config.model_planner.park_hold_s, 3.5)
+        self.assertEqual(config.model_planner.exit_speed, 20)
+        self.assertFalse(config.model_planner.auto_exit_enabled)
 
     def test_parking_mask_colors_follow_semantic_line_role(self):
         def line(index):

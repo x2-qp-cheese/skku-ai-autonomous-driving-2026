@@ -1,3 +1,10 @@
+// ================= LEGACY REFERENCE - DO NOT FLASH FOR LIVE PARKING =====
+//
+// scripts/parking.py now runs the model-based closed-loop planner on the host
+// and sends DRIVE/STOP commands through SerialVehicleClient. This older
+// standalone state machine contains fixed-duration fallback manoeuvres and is
+// intentionally not used by the live runtime.
+//
 // ================= Arduino Mega - Autonomous T Parking =================
 //
 // Required hardware-layer functions (provide them in another Arduino tab or
