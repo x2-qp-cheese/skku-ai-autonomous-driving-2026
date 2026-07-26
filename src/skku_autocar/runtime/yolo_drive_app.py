@@ -137,7 +137,7 @@ def run(args: argparse.Namespace) -> int:
         LOG.info("serial disabled: dry video/control preview mode")
 
     recorder = DriveRecorder(cv2, args, first_frame.shape)
-    running = False
+    running = bool(args.auto_start)
     last_command_at = 0.0
     last_log_at = 0.0
     last_frame_at = time.monotonic()
@@ -162,9 +162,15 @@ def run(args: argparse.Namespace) -> int:
         while True:
             if pending_frame is None:
                 ok, frame = cap.read()
-                if not ok and is_video_file:  # loop the clip for review
+                if (
+                    not ok
+                    and is_video_file
+                    and args.video_loop == "on"
+                ):
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     ok, frame = cap.read()
+                if not ok and is_video_file and args.video_loop == "off":
+                    break
                 if not ok:
                     raise RuntimeError("camera frame read failed")
             else:
@@ -179,11 +185,16 @@ def run(args: argparse.Namespace) -> int:
                 policy=args.camera_resolution_policy,
             )
 
-            now = time.monotonic()
-            obstacle_mode.update_serial(vehicle, now)
-            dt = max(1e-6, now - last_frame_at)
+            wall_now = time.monotonic()
+            control_now = (
+                max(0.0, float(cap.get(cv2.CAP_PROP_POS_MSEC)) / 1000.0)
+                if is_video_file
+                else wall_now
+            )
+            obstacle_mode.update_serial(vehicle, control_now)
+            dt = max(1e-6, wall_now - last_frame_at)
             fps = 0.9 * fps + 0.1 * (1.0 / dt) if fps else 1.0 / dt
-            last_frame_at = now
+            last_frame_at = wall_now
 
             bev_mask = None
             light_masks = ()
@@ -203,7 +214,7 @@ def run(args: argparse.Namespace) -> int:
                 lane,
                 mask_result,
                 frame.shape,
-                now,
+                control_now,
                 running,
             )
             stop_crosswalk_masks = (
@@ -224,10 +235,10 @@ def run(args: argparse.Namespace) -> int:
                 traffic_light,
             )
 
-            if vehicle is not None and now - last_command_at >= 1.0 / args.command_rate:
+            if vehicle is not None and wall_now - last_command_at >= 1.0 / args.command_rate:
                 serial_lines = vehicle.send(command)
-                obstacle_mode.accept_serial_lines(serial_lines, now)
-                last_command_at = now
+                obstacle_mode.accept_serial_lines(serial_lines, control_now)
+                last_command_at = wall_now
 
             display = draw_debug(
                 cv2, frame, mask_result, lane, command, running, fps,
@@ -239,8 +250,9 @@ def run(args: argparse.Namespace) -> int:
                 obstacle_mode.frame_obstacle_masks,
             )
             recorder.write(frame, display)
-            cv2.imshow("YOLO Drive", display)
-            if args.show_mask:
+            if not args.headless:
+                cv2.imshow("YOLO Drive", display)
+            if args.show_mask and not args.headless:
                 # In BEV mode show the warped (bird's-eye) road mask so the road is
                 # separated in top-down view; otherwise fall back to the frame mask.
                 if bev_mask is not None:
@@ -256,11 +268,11 @@ def run(args: argparse.Namespace) -> int:
                 elif mask_result is not None:
                     cv2.imshow("YOLO Lane Mask", mask_result.mask)
 
-            if now - last_log_at >= args.log_interval:
+            if wall_now - last_log_at >= args.log_interval:
                 log_status(mask_result, lane, command, running, fps, segmenter.device)
-                last_log_at = now
+                last_log_at = wall_now
 
-            key = cv2.waitKey(1) & 0xFF
+            key = -1 if args.headless else cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
             if key == ord(" "):
@@ -305,6 +317,8 @@ def build_bev_corridor_config(args: argparse.Namespace) -> BevCorridorConfig:
         heading_gain=args.bev_heading_gain,
         center_smooth_alpha=args.bev_center_smooth,
         heading_smooth_alpha=args.bev_heading_smooth,
+        path_smooth_alpha=args.bev_path_smooth,
+        path_max_step_px=args.bev_path_max_step,
         center_anchor=args.corridor_center_anchor == "on",
         max_center_jump_px=args.corridor_max_center_jump,
         max_heading_jump=args.corridor_max_heading_jump,
@@ -320,6 +334,7 @@ def build_bev_corridor_config(args: argparse.Namespace) -> BevCorridorConfig:
         crosswalk_max_center_jump_px=args.corridor_crosswalk_max_center_jump,
         crosswalk_option=args.corridor_crosswalk_option,
         crosswalk_right_offset_px=args.corridor_crosswalk_right_offset_px,
+        crosswalk_transit_enabled=True,
     )
 
 
@@ -401,6 +416,14 @@ def build_follower_config(args: argparse.Namespace) -> YoloLaneFollowerConfig:
         center_lock_min_steering=args.center_lock_min_steering,
         lane_lost_hold_frames=args.lane_lost_hold_frames,
         lane_lost_steering_release_rate_limit=args.lane_lost_steering_release_rate_limit,
+        path_tracking=args.path_tracking,
+        path_lateral_gain=args.path_lateral_gain,
+        path_heading_gain=args.path_heading_gain,
+        path_derivative_gain=args.path_derivative_gain,
+        path_near_weight=args.path_near_weight,
+        path_far_weight=args.path_far_weight,
+        path_steering_rise_alpha=args.path_steering_rise_alpha,
+        path_steering_release_alpha=args.path_steering_release_alpha,
         pure_pursuit=args.pure_pursuit,
         pure_pursuit_gain=args.pp_gain,
         pure_pursuit_full_angle=args.pp_full_angle,
@@ -413,7 +436,7 @@ def log_effective_config(
     follower_config: YoloLaneFollowerConfig,
 ) -> None:
     LOG.info(
-        "lane pipeline=bev-corridor lookahead=%.2f lane_change_near=%.2f sample=%.2f..%.2f vehicle_offset=%.3f center_smooth=%.2f heading_smooth=%.2f heading_gain=%.2f",
+        "lane pipeline=bev-corridor lookahead=%.2f lane_change_near=%.2f sample=%.2f..%.2f vehicle_offset=%.3f center_smooth=%.2f heading_smooth=%.2f path_smooth=%.2f path_max_step=%.1f heading_gain=%.2f",
         corridor_config.lookahead_y_ratio,
         corridor_config.lane_change_near_y_ratio,
         corridor_config.sample_top_y_ratio,
@@ -421,6 +444,8 @@ def log_effective_config(
         corridor_config.vehicle_center_x_offset_ratio,
         corridor_config.center_smooth_alpha,
         corridor_config.heading_smooth_alpha,
+        corridor_config.path_smooth_alpha,
+        corridor_config.path_max_step_px,
         corridor_config.heading_gain,
     )
 
@@ -431,23 +456,24 @@ def log_effective_config(
             follower_config.steering_release_rate_limit,
         )
     LOG.info(
-        "control speed=%d min_curve=%d max=%d max_steer=%d kp_lat=%.1f kd_lat=%.1f kp_head=%.1f kd_head=%.1f scale=%.2f..%.2f lateral_priority=%.2f curve_alpha=%.2f/%.2f center_lock=%s threshold=%.2f min=%d lane_lost_release=%d/frame",
+        "control mode=%s speed=%d min_curve=%d max=%d max_steer=%d path_gain=%.1f/%.1f/%.1f path_weight=%.2f..%.2f path_alpha=%.2f/%.2f center_lock=%s lane_lost_release=%d/frame",
+        (
+            "whole_path"
+            if follower_config.path_tracking
+            else ("pure_pursuit" if follower_config.pure_pursuit else "pd")
+        ),
         follower_config.base_speed,
         follower_config.min_curve_speed,
         follower_config.max_speed,
         follower_config.max_steering,
-        follower_config.kp_lateral,
-        follower_config.kd_lateral,
-        follower_config.kp_heading,
-        follower_config.kd_heading,
-        follower_config.straight_steering_scale,
-        follower_config.curve_steering_scale,
-        follower_config.lateral_priority_threshold,
-        follower_config.curve_strength_alpha,
-        follower_config.curve_strength_release_alpha,
+        follower_config.path_lateral_gain,
+        follower_config.path_heading_gain,
+        follower_config.path_derivative_gain,
+        follower_config.path_far_weight,
+        follower_config.path_near_weight,
+        follower_config.path_steering_rise_alpha,
+        follower_config.path_steering_release_alpha,
         "on" if follower_config.center_lock_enabled else "off",
-        follower_config.center_lock_error_threshold,
-        follower_config.center_lock_min_steering,
         lane_lost_release,
     )
     LOG.info(
@@ -756,6 +782,22 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         default="0",
         help="front camera index or video path",
     )
+    parser.add_argument(
+        "--video-loop",
+        choices=("on", "off"),
+        default="on",
+        help="loop a video-file camera source; off processes it exactly once",
+    )
+    parser.add_argument(
+        "--auto-start",
+        action="store_true",
+        help="start driving immediately (intended for no-serial video replay)",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="disable OpenCV windows while still producing debug recordings",
+    )
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--fourcc", default="MJPG")
@@ -1024,6 +1066,18 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         default=0.30,
         help="BEV heading EMA factor (0..1). 1.0 = no smoothing, lower = smoother",
     )
+    parser.add_argument(
+        "--bev-path-smooth",
+        type=float,
+        default=BevCorridorConfig.path_smooth_alpha,
+        help="EMA factor applied to the complete fitted BEV center path",
+    )
+    parser.add_argument(
+        "--bev-path-max-step",
+        type=float,
+        default=BevCorridorConfig.path_max_step_px,
+        help="maximum accepted lateral movement of one BEV path anchor per frame",
+    )
     parser.add_argument("--bev-heading-gain", type=float, default=BevCorridorConfig.heading_gain)
     parser.add_argument(
         "--lookahead",
@@ -1041,6 +1095,46 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         "--pure-pursuit",
         action="store_true",
         help="steer via pure pursuit toward the BEV lookahead point (better on curves/S/hairpins) instead of the lateral+heading PID",
+    )
+    parser.add_argument(
+        "--path-tracking",
+        action="store_true",
+        help="track the complete fitted BEV center path instead of one lookahead point",
+    )
+    parser.add_argument(
+        "--path-lateral-gain",
+        type=float,
+        default=YoloLaneFollowerConfig.path_lateral_gain,
+    )
+    parser.add_argument(
+        "--path-heading-gain",
+        type=float,
+        default=YoloLaneFollowerConfig.path_heading_gain,
+    )
+    parser.add_argument(
+        "--path-derivative-gain",
+        type=float,
+        default=YoloLaneFollowerConfig.path_derivative_gain,
+    )
+    parser.add_argument(
+        "--path-near-weight",
+        type=float,
+        default=YoloLaneFollowerConfig.path_near_weight,
+    )
+    parser.add_argument(
+        "--path-far-weight",
+        type=float,
+        default=YoloLaneFollowerConfig.path_far_weight,
+    )
+    parser.add_argument(
+        "--path-steering-rise-alpha",
+        type=float,
+        default=YoloLaneFollowerConfig.path_steering_rise_alpha,
+    )
+    parser.add_argument(
+        "--path-steering-release-alpha",
+        type=float,
+        default=YoloLaneFollowerConfig.path_steering_release_alpha,
     )
     parser.add_argument(
         "--pp-gain",
@@ -1068,6 +1162,11 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         help="save the annotated debug screen. auto=follow --record (on when --record on), on=always, off=never",
     )
     parser.add_argument("--debug-dir", default="data/processed", help="output dir for the debug screen video")
+    parser.add_argument(
+        "--debug-output",
+        default=None,
+        help="exact output path for the annotated debug video",
+    )
     return parser.parse_args(argv)
 
 
@@ -1127,9 +1226,18 @@ class DriveRecorder:
                 raise RuntimeError("failed to open raw recorder: %s" % self.raw_video_path)
 
         if self.debug_enabled:
-            debug_dir = self._resolve(args.debug_dir)
-            debug_dir.mkdir(parents=True, exist_ok=True)
-            self.debug_video_path = debug_dir / ("%s_debug.mp4" % session_id)
+            if args.debug_output:
+                self.debug_video_path = self._resolve(args.debug_output)
+                self.debug_video_path.parent.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+            else:
+                debug_dir = self._resolve(args.debug_dir)
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                self.debug_video_path = debug_dir / (
+                    "%s_debug.mp4" % session_id
+                )
             self.debug_writer = cv2.VideoWriter(str(self.debug_video_path), fourcc, fps, (width, height))
             if not self.debug_writer.isOpened():
                 if self.raw_writer is not None:
@@ -1269,9 +1377,47 @@ def draw_debug(
         vehicle_x = int(width * (0.5 + offset))
         cv2.line(display, (vehicle_x, height), (vehicle_x, 0), (255, 255, 0), 1)
         if lane.found:
+            boundary_specs = (
+                (
+                    getattr(bev_estimator, "last_center_line_bev", ()),
+                    (0, 200, 255),
+                ),
+                (
+                    getattr(bev_estimator, "last_right_line_bev", ()),
+                    (255, 200, 0),
+                ),
+            )
+            for boundary, boundary_color in boundary_specs:
+                if len(boundary) < 2:
+                    continue
+                projected = transformer.bev_to_frame(
+                    boundary,
+                    (height, width),
+                ).astype("int32")
+                cv2.polylines(
+                    display,
+                    [projected],
+                    isClosed=False,
+                    color=boundary_color,
+                    thickness=2,
+                )
+            if lane.path_points:
+                path = transformer.bev_to_frame(
+                    lane.path_points,
+                    (height, width),
+                ).astype("int32")
+                if len(path) >= 2:
+                    cv2.polylines(
+                        display,
+                        [path],
+                        isClosed=False,
+                        color=(255, 0, 255),
+                        thickness=4,
+                    )
             target = transformer.bev_to_frame([(lane.center_x, lane.target_y)], (height, width))[0]
             tp = (int(target[0]), int(target[1]))
-            cv2.line(display, (vehicle_x, height - 1), tp, (0, 0, 255), 2)
+            if not lane.path_points:
+                cv2.line(display, (vehicle_x, height - 1), tp, (0, 0, 255), 2)
             cv2.circle(display, tp, 9, (255, 255, 255), -1)
             cv2.circle(display, tp, 6, (0, 0, 255), -1)
             if lane.near_center_x is not None and lane.near_target_y is not None:
@@ -1304,6 +1450,7 @@ def draw_debug(
             if lane.near_lateral_error_norm is None
             else "%.3f" % lane.near_lateral_error_norm
         ),
+        "path_points=%d" % len(lane.path_points),
         "fps=%.1f" % fps,
     ]
     if light_observation is not None:
@@ -1354,9 +1501,22 @@ def draw_bev_mask_debug(
     cv2.line(canvas, (cx, 0), (cx, h), (255, 255, 0), 1)
 
     if lane is not None and lane.found:
+        if lane.path_points:
+            points = [
+                (int(round(x)), int(round(y)))
+                for x, y in lane.path_points
+            ]
+            for index in range(1, len(points)):
+                cv2.line(
+                    canvas,
+                    points[index - 1],
+                    points[index],
+                    (255, 0, 255),
+                    4,
+                )
         target = (int(lane.center_x), int(lane.target_y))
-        # single line connecting the center axis (car, bottom) to the target point
-        cv2.line(canvas, (cx, h - 1), target, (0, 0, 255), 2)
+        if not lane.path_points:
+            cv2.line(canvas, (cx, h - 1), target, (0, 0, 255), 2)
         # tracked target point: red dot with a white outline for visibility
         cv2.circle(canvas, target, 7, (255, 255, 255), -1)
         cv2.circle(canvas, target, 5, (0, 0, 255), -1)

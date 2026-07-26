@@ -28,6 +28,8 @@ class ObstacleFusionConfig:
     frame_min_path_half_width_px: float = 12.0
     min_path_overlap_ratio: float = 0.15
     max_current_path_distance_ratio: float = 0.58
+    path_assignment_margin_px: float = 8.0
+    path_assignment_overlap_margin: float = 0.10
     contact_band_ratio: float = 0.25
     visual_action_confidence: float = 0.75
     range_visual_fallback_enabled: bool = True
@@ -844,26 +846,36 @@ class ObstacleFusionPlanner:
             0.0,
             float(self.config.max_current_path_distance_ratio),
         )
-        dominance_margin_px = 5.0
+        assignment_margin_px = max(
+            0.0,
+            float(self.config.path_assignment_margin_px),
+        )
+        assignment_overlap_margin = max(
+            0.0,
+            float(self.config.path_assignment_overlap_margin),
+        )
 
         def inside_current_path(item: PathOccupancy) -> bool:
             return item.current_distance_ratio <= max_current_distance
 
         def current_preferred(item: PathOccupancy) -> bool:
             return (
-                item.current_overlap >= item.target_overlap
+                item.current_overlap >= overlap_min
+                and inside_current_path(item)
+                and not target_preferred(item)
                 and item.current_distance_px
-                <= item.target_distance_px + dominance_margin_px
+                <= item.target_distance_px + assignment_margin_px
             )
 
         def target_preferred(item: PathOccupancy) -> bool:
-            if item.target_overlap >= overlap_min and (
-                item.target_overlap > item.current_overlap
-            ):
-                return True
             return (
-                item.target_distance_px + dominance_margin_px
-                < item.current_distance_px
+                item.target_overlap >= overlap_min
+                and (
+                    item.target_overlap
+                    >= item.current_overlap + assignment_overlap_margin
+                    or item.target_distance_px + assignment_margin_px
+                    < item.current_distance_px
+                )
             )
 
         current = [
@@ -874,22 +886,24 @@ class ObstacleFusionPlanner:
             and inside_current_path(item)
             and current_preferred(item)
         ]
+        target = [
+            item
+            for item in measurements
+            if item.bottom_y_ratio >= target_y_threshold
+            and target_preferred(item)
+        ]
         target_lookahead = [
             item
             for item in measurements
             if item.bottom_y_ratio >= current_y_threshold
             and target_preferred(item)
         ]
-        target_blocked = any(
-            item.bottom_y_ratio >= target_y_threshold
-            and item.target_overlap >= overlap_min
-            and target_preferred(item)
-            for item in measurements
-        ) or bool(target_lookahead)
+        target_blocked = bool(target or target_lookahead)
         range_fallback = any(
             item.bottom_y_ratio >= current_y_threshold
             and inside_current_path(item)
-            and current_preferred(item)
+            and item.current_distance_px
+            <= item.target_distance_px + assignment_margin_px
             and not target_preferred(item)
             for item in measurements
         )

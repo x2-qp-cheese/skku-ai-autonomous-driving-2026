@@ -3,8 +3,10 @@ from dataclasses import replace
 
 import numpy as np
 
+from skku_autocar.estimation.bev_corridor import BevClassMasks
 from skku_autocar.estimation.lane_geometry import LaneGeometry
 from skku_autocar.perception.yolo_lane import (
+    YoloClassMasks,
     YoloLaneConfig,
     YoloLaneMask,
     YoloLaneSegmenter,
@@ -14,6 +16,7 @@ from skku_autocar.planning.obstacle_fusion import (
     FramePathGeometry,
     ObstacleFusionConfig,
     ObstacleFusionPlanner,
+    PathOccupancy,
 )
 from skku_autocar.runtime.obstacle_mode import (
     ObstacleDriveMode,
@@ -105,6 +108,27 @@ def planner(**overrides):
 
 
 class ObstacleFusionPlannerTest(unittest.TestCase):
+    def test_current_obstacle_touching_target_projection_does_not_block_target(self):
+        fusion = planner()
+        assessment = fusion._assess_measurements(
+            [
+                PathOccupancy(
+                    bottom_y_ratio=0.75,
+                    current_overlap=0.62,
+                    target_overlap=0.28,
+                    current_distance_px=8.0,
+                    target_distance_px=19.0,
+                    current_distance_ratio=0.12,
+                    target_distance_ratio=0.32,
+                )
+            ],
+            current_y_threshold=0.30,
+            target_y_threshold=0.65,
+        )
+
+        self.assertTrue(assessment.current_detected)
+        self.assertFalse(assessment.target_blocked)
+
     def test_obstacle_class_is_kept_separate_from_lane_classes(self):
         segmenter = object.__new__(YoloLaneSegmenter)
         segmenter.config = YoloLaneConfig()
@@ -1140,6 +1164,65 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertTrue(mode.enabled)
         self.assertEqual(vehicle.lines, ["USON", "USOFF"])
 
+    def test_crosswalk_priority_holds_final_lane_after_obstacle_offset(self):
+        args = parse_args(["--obstacle-fusion-mode", "yolo"])
+        estimator = FakeCorridorEstimator()
+        mode = ObstacleDriveMode(args, IdentityTransformer(), estimator)
+        base = replace(
+            lane(),
+            path_points=tuple((140.0, float(y)) for y in range(0, 100, 5)),
+        )
+        mask = YoloLaneMask(
+            mask=np.zeros(SHAPE, dtype=np.uint8),
+            confidence=1.0,
+            class_id=0,
+            class_name="center+right-side",
+            device="cpu",
+            inference_ms=0.0,
+        )
+        class_masks = YoloClassMasks()
+        bev = BevClassMasks(shape=SHAPE)
+
+        normal = mode.update(
+            class_masks,
+            bev,
+            base,
+            mask,
+            SHAPE,
+            now=1.0,
+            running=True,
+        )
+        # Simulate the final path already translated by an obstacle maneuver.
+        shifted = replace(
+            normal,
+            center_x=80.0,
+            lateral_error_px=-20.0,
+            lateral_error_norm=-0.2,
+            path_points=tuple((80.0, float(y)) for y in range(0, 100, 5)),
+            reason="corridor:lane_change",
+        )
+        mode._last_output_lane = shifted
+        mode._last_reliable_output_lane = shifted
+        estimator.last_crosswalk_visible = True
+
+        held = mode.update(
+            class_masks,
+            bev,
+            replace(base, center_x=20.0, reason="crosswalk_transit_hold:crosswalk"),
+            mask,
+            SHAPE,
+            now=2.0,
+            running=True,
+        )
+
+        self.assertEqual(held.center_x, shifted.center_x)
+        self.assertEqual(held.path_points, shifted.path_points)
+        self.assertIn("crosswalk_priority_hold", held.reason)
+        self.assertEqual(mode.lane_change_state, "crosswalk_hold")
+        command = ControlCommand(speed=255, steering=-47, brake=False, reason="path")
+        self.assertEqual(mode.apply_steering(command), command)
+        self.assertEqual(mode.apply_speed_cap(command), command)
+
 
 class RecordingVehicle:
     def __init__(self):
@@ -1147,6 +1230,19 @@ class RecordingVehicle:
 
     def write_line(self, line):
         self.lines.append(line)
+
+
+class IdentityTransformer:
+    @staticmethod
+    def bev_to_frame(points, frame_hw):
+        return points
+
+
+class FakeCorridorEstimator:
+    def __init__(self):
+        self.last_centerline_bev = list(CENTERLINE)
+        self.last_lane_width_px = 60.0
+        self.last_crosswalk_visible = False
 
 
 if __name__ == "__main__":

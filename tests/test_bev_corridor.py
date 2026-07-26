@@ -43,6 +43,41 @@ def bev_at(center_x: int, *, crosswalk: bool) -> BevClassMasks:
 
 
 class BevCorridorCrosswalkTest(unittest.TestCase):
+    def test_competition_transit_freezes_pre_crosswalk_full_path(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lane_width_px=60.0,
+                center_smooth_alpha=1.0,
+                heading_smooth_alpha=1.0,
+                path_smooth_alpha=1.0,
+                crosswalk_transit_enabled=True,
+                crosswalk_transit_recenter_alpha=0.0,
+                vehicle_center_x_offset_ratio=0.0,
+            )
+        )
+        before = estimator.estimate(
+            BevClassMasks(
+                center=[slanted_line_mask(60.0, 0.20)],
+                center_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+
+        during = estimator.estimate(
+            BevClassMasks(
+                center=[slanted_line_mask(120.0, -0.20)],
+                crosswalk=[crosswalk_mask()],
+                center_conf=1.0,
+                crosswalk_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+
+        self.assertEqual(during.reason, "crosswalk_transit_hold:crosswalk")
+        self.assertEqual(during.center_x, before.center_x)
+        self.assertEqual(during.heading_error, before.heading_error)
+        self.assertEqual(during.path_points, before.path_points)
+
     def test_crosswalk_tracks_lane_with_stronger_smoothing(self):
         estimator = BevCorridorLaneEstimator(
             BevCorridorConfig(
@@ -365,6 +400,67 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
 
         self.assertLess(abs(virtual.lateral_error_norm), abs(before.lateral_error_norm))
         self.assertAlmostEqual(virtual.heading_error, before.heading_error, delta=0.01)
+
+    def test_path_anchors_stay_fixed_when_visible_line_span_changes(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lane_width_px=60.0,
+                path_smooth_alpha=0.36,
+                path_max_step_px=28.0,
+                vehicle_center_x_offset_ratio=0.0,
+            )
+        )
+        full = slanted_line_mask(70.0, 0.15)
+        partial = full.copy()
+        partial[:20, :] = 0
+        partial[85:, :] = 0
+
+        first = estimator.estimate(
+            BevClassMasks(center=[full], center_conf=1.0, shape=(100, 200))
+        )
+        second = estimator.estimate(
+            BevClassMasks(center=[partial], center_conf=1.0, shape=(100, 200))
+        )
+
+        self.assertEqual(len(first.path_points), 24)
+        self.assertEqual(len(second.path_points), 24)
+        self.assertEqual(
+            [round(point[1], 6) for point in first.path_points],
+            [round(point[1], 6) for point in second.path_points],
+        )
+
+    def test_lane_targets_are_derived_from_the_stabilized_path(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lane_width_px=60.0,
+                path_smooth_alpha=0.36,
+                path_max_step_px=28.0,
+                vehicle_center_x_offset_ratio=0.0,
+            )
+        )
+        estimator.estimate(
+            BevClassMasks(
+                center=[slanted_line_mask(55.0, 0.10)],
+                center_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+        lane = estimator.estimate(
+            BevClassMasks(
+                center=[slanted_line_mask(90.0, 0.35)],
+                center_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+        ys = np.asarray([point[1] for point in lane.path_points])
+        xs = np.asarray([point[0] for point in lane.path_points])
+
+        self.assertAlmostEqual(lane.center_x, np.interp(lane.target_y, ys, xs), delta=0.01)
+        self.assertAlmostEqual(
+            lane.near_center_x,
+            np.interp(lane.near_target_y, ys, xs),
+            delta=0.01,
+        )
 
     def test_disabled_obstacle_mode_skips_obstacle_bev_warp(self):
         transformer = CountingTransformer()

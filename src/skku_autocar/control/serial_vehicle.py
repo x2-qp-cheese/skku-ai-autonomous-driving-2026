@@ -60,7 +60,13 @@ def _score_port(port: Any) -> int:
         return 0
 
     score = 0
-    for token in ("arduino", "usbmodem", "usbserial", "wchusbserial", "ch340", "cp210", "ttyacm"):
+    if "arduino" in text:
+        score += 100
+    if "usbmodem" in text or "ttyacm" in text:
+        score += 80
+    if getattr(port, "vid", None) in (0x2341, 0x2A03):
+        score += 100
+    for token in ("usbserial", "wchusbserial", "ch340", "cp210"):
         if token in text:
             score += 10
     if "vid:pid" in text:

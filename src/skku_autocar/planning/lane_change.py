@@ -31,6 +31,10 @@ class LaneChangeConfig:
     target_capture_error: float = 0.20
     target_capture_frames: int = 2
     allow_virtual_stabilize: bool = False
+    smooth_avoidance: bool = False
+    return_duration_scale: float = 1.0
+    return_steering_cap: int = 0
+    return_stabilizing_steering_cap: int = 0
 
 
 @dataclass(frozen=True)
@@ -49,11 +53,9 @@ class LaneChangeController:
     """Reusable 2 -> 1 -> 2 lane-change trajectory controller.
 
     The normal BEV corridor produces the lane-2 driving target. Lane changes
-    shift that target by the effective adjacent-lane offset supplied by the
-    runtime. Keyboard/timer changes move with a smoothstep profile. Obstacle
-    avoidance selects the complete adjacent-lane target immediately, preserves
-    direction-priority steering until the vehicle reaches that target, and then
-    releases steering to the normal controller for parallel stabilization.
+    shift that full target path by the measured adjacent-lane width. Every change,
+    including obstacle avoidance, follows one smoothstep trajectory so no state
+    can jump the target by a complete lane in one frame.
     """
 
     def __init__(self, config: LaneChangeConfig = LaneChangeConfig()):
@@ -321,30 +323,69 @@ class LaneChangeController:
         command: ControlCommand,
         result: LaneChangeResult,
     ) -> ControlCommand:
+        adjusted = self._apply_steering_assist_base(command, result)
+        if adjusted.brake:
+            return adjusted
+        if result.state == "changing_to_lane2":
+            cap = max(0, int(self.config.return_steering_cap))
+        elif result.state == "stabilizing_lane2":
+            cap = max(
+                0,
+                int(self.config.return_stabilizing_steering_cap),
+            )
+        else:
+            return adjusted
+        if cap <= 0:
+            return adjusted
+        steering = self._clip(adjusted.steering, -cap, cap)
+        if steering == adjusted.steering:
+            return adjusted
+        reason = (
+            "%s:lane2_return_smooth" % adjusted.reason
+            if adjusted.reason
+            else "lane2_return_smooth"
+        )
+        return ControlCommand(
+            speed=adjusted.speed,
+            steering=steering,
+            brake=False,
+            reason=reason,
+        )
+
+    def _apply_steering_assist_base(
+        self,
+        command: ControlCommand,
+        result: LaneChangeResult,
+    ) -> ControlCommand:
         if command.brake:
             return command
+        if not result.lane_reliable and self._hold_unreliable_target_active():
+            adjusted = command
+            if (
+                (
+                    self.config.smooth_avoidance
+                    or self._uses_target_arrival(result.state)
+                )
+                and result.direction != 0
+            ):
+                adjusted = self._apply_unreliable_directional_steering(
+                    adjusted,
+                    result,
+                )
+            return self._cap_unreliable_steering(adjusted)
         if self._uses_avoidance_profile(result.state):
             return self._apply_stabilizing_steering(command, result)
         if (
             not result.lane_reliable
-            and self._uses_target_arrival(result.state)
+            and (
+                self.config.smooth_avoidance
+                or self._uses_target_arrival(result.state)
+            )
             and result.direction != 0
         ):
             return self._apply_unreliable_directional_steering(command, result)
         if not result.lane_reliable and self.speed_cap_active(result):
-            cap = max(0, int(self.config.unreliable_steering_cap))
-            steering = self._clip(command.steering, -cap, cap)
-            reason = (
-                "%s:lane_change_unreliable" % command.reason
-                if command.reason
-                else "lane_change_unreliable"
-            )
-            return ControlCommand(
-                speed=command.speed,
-                steering=steering,
-                brake=False,
-                reason=reason,
-            )
+            return self._cap_unreliable_steering(command)
         if result.direction == 0:
             return command
         if self.config.steering_min <= 0 and self.config.steering_boost <= 0:
@@ -459,8 +500,30 @@ class LaneChangeController:
             reason=reason,
         )
 
+    def _cap_unreliable_steering(
+        self,
+        command: ControlCommand,
+    ) -> ControlCommand:
+        cap = max(0, int(self.config.unreliable_steering_cap))
+        steering = self._clip(command.steering, -cap, cap)
+        reason = command.reason
+        if "lane_change_unreliable" not in reason:
+            reason = (
+                "%s:lane_change_unreliable" % reason
+                if reason
+                else "lane_change_unreliable"
+            )
+        return ControlCommand(
+            speed=command.speed,
+            steering=steering,
+            brake=False,
+            reason=reason,
+        )
+
     def _progress(self, now: float) -> float:
         duration = max(0.05, self.config.transition_seconds)
+        if self.state == "changing_to_lane2":
+            duration *= max(1.0, float(self.config.return_duration_scale))
         if self._phase_started_at is None:
             return 0.0
         return min(1.0, max(0.0, (now - self._phase_started_at) / duration))
@@ -509,6 +572,8 @@ class LaneChangeController:
         )
 
     def _uses_target_arrival(self, state: str) -> bool:
+        if self.config.smooth_avoidance:
+            return False
         if state == "changing_to_lane1":
             return self._request_profile == "avoidance"
         if state == "changing_to_lane2":
@@ -638,17 +703,18 @@ class LaneChangeController:
     @staticmethod
     def _shift_lane(lane: LaneGeometry, offset_px: float, bev_width_px: float) -> LaneGeometry:
         half_width = max(1.0, bev_width_px / 2.0)
-        center_x = max(0.0, min(max(0.0, bev_width_px - 1.0), lane.center_x + offset_px))
+        # Preserve a parallel translated path even when its far preview leaves
+        # the BEV canvas. Clipping every point to an image edge creates a false
+        # kink while heading still describes the unclipped curve. Control error
+        # is bounded below, so geometry itself does not need destructive clipping.
+        center_x = lane.center_x + offset_px
         lateral_error_px = center_x - lane.vehicle_center_x
         lateral_error_norm = max(-1.0, min(1.0, lateral_error_px / half_width))
         near_center_x = None
         near_lateral_error_px = None
         near_lateral_error_norm = None
         if lane.near_center_x is not None:
-            near_center_x = max(
-                0.0,
-                min(max(0.0, bev_width_px - 1.0), lane.near_center_x + offset_px),
-            )
+            near_center_x = lane.near_center_x + offset_px
             near_lateral_error_px = near_center_x - lane.vehicle_center_x
             near_lateral_error_norm = max(
                 -1.0,
@@ -662,5 +728,9 @@ class LaneChangeController:
             near_center_x=near_center_x,
             near_lateral_error_px=near_lateral_error_px,
             near_lateral_error_norm=near_lateral_error_norm,
+            path_points=tuple(
+                (float(x) + offset_px, float(y))
+                for x, y in lane.path_points
+            ),
             reason="%s:lane_change" % lane.reason,
         )

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -26,3 +26,7 @@ class LaneGeometry:
     near_target_y: Optional[float] = None
     near_lateral_error_px: Optional[float] = None
     near_lateral_error_norm: Optional[float] = None
+    # Full, temporally filtered BEV driving path. Controllers should prefer this
+    # over steering at one lookahead dot; the dot fields remain for diagnostics,
+    # compatibility and lane-change completion checks.
+    path_points: Tuple[Tuple[float, float], ...] = ()

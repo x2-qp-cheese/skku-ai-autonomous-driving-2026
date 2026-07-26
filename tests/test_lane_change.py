@@ -90,6 +90,34 @@ class LaneChangeControllerTest(unittest.TestCase):
         self.assertEqual(completed.state, "completed")
         self.assertAlmostEqual(completed.offset_px, 0.0)
 
+    def test_parallel_path_translation_is_not_clipped_at_bev_edge(self):
+        controller = LaneChangeController(
+            LaneChangeConfig(
+                mode="external",
+                transition_seconds=1.0,
+                max_straight_heading=0.30,
+                stable_required_frames=0,
+            )
+        )
+        base = replace(
+            lane(),
+            center_x=40.0,
+            lateral_error_px=-360.0,
+            lateral_error_norm=-0.9,
+            heading_error=0.25,
+            path_points=((20.0, 10.0), (40.0, 200.0), (80.0, 490.0)),
+        )
+        controller.request("test")
+        controller.update(base, 150.0, 800.0, 0.0, True)
+        shifted = controller.update(base, 150.0, 800.0, 1.0, True).lane
+
+        self.assertAlmostEqual(shifted.center_x, -110.0)
+        self.assertEqual(
+            shifted.path_points,
+            ((-130.0, 10.0), (-110.0, 200.0), (-70.0, 490.0)),
+        )
+        self.assertAlmostEqual(shifted.heading_error, base.heading_error)
+
     def test_request_waits_until_straight(self):
         self.update(0.0)
         self.controller.request()
@@ -547,6 +575,33 @@ class LaneChangeControllerTest(unittest.TestCase):
         self.assertEqual(adjusted.steering, -90)
         self.assertIn("lane_change_unreliable_steer", adjusted.reason)
 
+    def test_unreliable_lane1_hold_caps_path_feedback(self):
+        self.controller = LaneChangeController(
+            LaneChangeConfig(
+                mode="external",
+                unreliable_steering_cap=90,
+            )
+        )
+        self.controller.state = "lane1"
+        lane1 = self.controller.update(
+            lane(),
+            150.0,
+            800.0,
+            0.0,
+            True,
+            lane_reliable=True,
+        )
+        unreliable = replace(lane1, lane_reliable=False)
+
+        adjusted = self.controller.apply_steering_assist(
+            ControlCommand(speed=255, steering=121, reason="lane"),
+            unreliable,
+        )
+
+        self.assertEqual(unreliable.state, "lane1")
+        self.assertEqual(adjusted.steering, 90)
+        self.assertIn("lane_change_unreliable", adjusted.reason)
+
     def test_unreliable_geometry_cannot_confirm_target_capture(self):
         self.controller = LaneChangeController(
             LaneChangeConfig(
@@ -672,7 +727,7 @@ class LaneChangeControllerTest(unittest.TestCase):
         self.assertEqual(adjusted.steering, 70)
         self.assertIn("lane_change_stabilize", adjusted.reason)
 
-    def test_unreliable_avoidance_stabilization_still_forces_return_steering(self):
+    def test_unreliable_avoidance_stabilization_uses_bounded_path_feedback(self):
         self.controller = LaneChangeController(
             LaneChangeConfig(
                 mode="external",
@@ -711,8 +766,8 @@ class LaneChangeControllerTest(unittest.TestCase):
         self.assertEqual(captured.state, "stabilizing_lane1")
         self.assertEqual(stabilizing.state, "stabilizing_lane1")
         self.assertFalse(stabilizing.lane_reliable)
-        self.assertEqual(adjusted.steering, 90)
-        self.assertIn("lane_change_stabilize", adjusted.reason)
+        self.assertEqual(adjusted.steering, 40)
+        self.assertIn("lane_change_unreliable", adjusted.reason)
 
     def test_target_capture_requires_consecutive_frames(self):
         self.controller = LaneChangeController(

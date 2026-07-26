@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional, Sequence, Tuple
 
 from ..estimation.bev_corridor import BevClassMasks, BevCorridorLaneEstimator
@@ -62,6 +62,8 @@ class ObstacleDriveMode:
         self._local_map = LocalOccupancyGrid(build_local_occupancy_config(args))
         self._ultrasonic = UltrasonicFilter(build_ultrasonic_config(args))
         self._result: Optional[LaneChangeResult] = None
+        self._last_output_lane: Optional[LaneGeometry] = None
+        self._last_reliable_output_lane: Optional[LaneGeometry] = None
         self._frame = ObstacleFrameResult(lane=_empty_lane())
 
     @property
@@ -131,6 +133,9 @@ class ObstacleDriveMode:
             self._result = None
             self._frame = ObstacleFrameResult(lane=lane)
             return lane
+        if not running:
+            self._last_output_lane = None
+            self._last_reliable_output_lane = None
 
         lane_reliable = lane_change_geometry_reliable(mask_result, lane)
         map_snapshot = self._local_map.update(
@@ -151,6 +156,19 @@ class ObstacleDriveMode:
             planning_masks = tuple(bev.obstacle)
             planning_confidence = float(class_masks.obstacle_conf)
             debug_masks = planning_masks
+
+        crosswalk_priority = running and (
+            self._corridor_estimator.last_crosswalk_visible
+            or "crosswalk_transit_hold:" in lane.reason
+        )
+        if crosswalk_priority:
+            return self._hold_crosswalk_path(
+                lane,
+                class_masks,
+                debug_masks,
+                map_snapshot,
+            )
+
         frame_paths = build_obstacle_frame_paths(
             self._transformer,
             self._corridor_estimator.last_centerline_bev,
@@ -198,7 +216,56 @@ class ObstacleDriveMode:
             bev_obstacle_masks=tuple(debug_masks),
             blocks_light_stop=active_transition and not self._allow_light_stop,
         )
+        self._last_output_lane = result.lane if running else None
+        if (
+            running
+            and lane_reliable
+            and result.lane.found
+            and float(result.lane.confidence) >= 0.45
+        ):
+            self._last_reliable_output_lane = result.lane
         return result.lane
+
+    def _hold_crosswalk_path(
+        self,
+        lane: LaneGeometry,
+        class_masks: YoloClassMasks,
+        debug_masks: Sequence[Any],
+        map_snapshot: LocalOccupancySnapshot,
+    ) -> LaneGeometry:
+        """Freeze the final path after lane-change offsets, not the base lane.
+
+        This priority boundary prevents an active/unfinished obstacle maneuver
+        from replacing the crosswalk cache with a stale shifted target.
+        """
+        base = (
+            self._last_reliable_output_lane
+            or self._last_output_lane
+            or lane
+        )
+        reason = base.reason.split(":crosswalk_priority_hold", 1)[0]
+        held = replace(
+            base,
+            confidence=min(float(base.confidence), float(lane.confidence)),
+            reason="%s:crosswalk_priority_hold" % reason,
+        )
+        self._corridor_estimator.last_centerline_bev = list(held.path_points)
+        self._result = LaneChangeResult(
+            lane=held,
+            state="crosswalk_hold",
+            active=False,
+            lane_reliable=False,
+        )
+        self._frame = ObstacleFrameResult(
+            lane=held,
+            lane_change_state="crosswalk_hold",
+            status="%s crosswalk-priority" % self._status_text(map_snapshot),
+            frame_obstacle_masks=tuple(class_masks.obstacle),
+            bev_obstacle_masks=tuple(debug_masks),
+            blocks_light_stop=False,
+        )
+        self._last_output_lane = held
+        return held
 
     def apply_steering(self, command: ControlCommand) -> ControlCommand:
         if not self.enabled or self._result is None:
@@ -224,11 +291,7 @@ class ObstacleDriveMode:
         configured = max(0.0, float(self._lane_change.config.target_lane_width_px))
         if configured > 0.0:
             return configured
-        bias = max(
-            0.0,
-            min(1.0, float(self._corridor_estimator.config.centerline_bias)),
-        )
-        return max(0.0, float(lane_width_px)) * 2.0 * bias
+        return max(0.0, float(lane_width_px))
 
     def handle_key(self, running: bool) -> tuple:
         if not self.enabled:
@@ -324,6 +387,10 @@ def build_lane_change_config(args: argparse.Namespace) -> LaneChangeConfig:
         target_capture_error=args.lane_change_target_capture_error,
         target_capture_frames=args.lane_change_target_capture_frames,
         allow_virtual_stabilize=args.lane_change_allow_virtual_stabilize == "on",
+        smooth_avoidance=True,
+        return_duration_scale=1.35,
+        return_steering_cap=115,
+        return_stabilizing_steering_cap=90,
     )
 
 
@@ -331,8 +398,7 @@ def resolve_lane_change_target_width_px(args: argparse.Namespace) -> float:
     configured = max(0.0, float(args.lane_change_target_width_px))
     if configured > 0.0:
         return configured
-    bias = max(0.0, min(1.0, float(args.corridor_centerline_bias)))
-    return max(0.0, float(args.corridor_lane_width_px)) * 2.0 * bias
+    return max(0.0, float(args.corridor_lane_width_px))
 
 
 def build_obstacle_frame_paths(

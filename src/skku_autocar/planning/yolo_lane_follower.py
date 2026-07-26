@@ -39,6 +39,18 @@ class YoloLaneFollowerConfig:
     lane_lost_hold_frames: int = 20
     lane_lost_steering_release_rate_limit: Optional[int] = None
 
+    # Full-path tracking uses every fitted BEV centerline point between the near
+    # and far control rows. It is less sensitive than steering at one dot when a
+    # dashed line fit or an S-curve moves that dot laterally between frames.
+    path_tracking: bool = False
+    path_lateral_gain: float = 225.0
+    path_heading_gain: float = 70.0
+    path_derivative_gain: float = 18.0
+    path_near_weight: float = 1.25
+    path_far_weight: float = 0.70
+    path_steering_rise_alpha: float = 0.55
+    path_steering_release_alpha: float = 0.28
+
     # Pure-pursuit steering: instead of summing a lateral-error PID and a heading
     # PID, steer the wheel directly toward the BEV centerline's lookahead point
     # (center_x, target_y) from the vehicle origin (vehicle_center_x, height). The
@@ -58,6 +70,7 @@ class YoloLaneFollower:
         self._last_steering = 0
         self._last_lateral_error: Optional[float] = None
         self._last_heading_error: Optional[float] = None
+        self._last_path_error: Optional[float] = None
         self._curve_strength = 0.0
         self._last_command: Optional[ControlCommand] = None
         self._lane_lost_frames = 0
@@ -65,6 +78,9 @@ class YoloLaneFollower:
     def plan(self, lane: LaneGeometry) -> ControlCommand:
         if not lane.found or lane.confidence < self.config.min_confidence:
             return self._hold_last_direction(lane)
+
+        if self.config.path_tracking:
+            return self._plan_path_tracking(lane)
 
         if self.config.pure_pursuit:
             return self._plan_pure_pursuit(lane)
@@ -111,6 +127,124 @@ class YoloLaneFollower:
         self._lane_lost_frames = 0
         return command
 
+    def _plan_path_tracking(self, lane: LaneGeometry) -> ControlCommand:
+        """Track the complete BEV centerline with bounded temporal response."""
+        path_error = self._weighted_path_error(lane)
+        derivative = self._derivative(path_error, self._last_path_error)
+        raw_steering = (
+            self.config.path_lateral_gain * path_error
+            + self.config.path_heading_gain * lane.heading_error
+            + self.config.path_derivative_gain * derivative
+        )
+
+        alpha = self._path_steering_alpha(raw_steering, lane.reason)
+        filtered = (
+            float(self._last_steering)
+            + alpha * (raw_steering - float(self._last_steering))
+        )
+        raw_curve = min(
+            1.0,
+            max(abs(path_error) / 0.55, abs(lane.heading_error) / 0.85),
+        )
+        curve_strength = self._smooth_curve_strength(raw_curve)
+        steering = self._rate_limit(
+            int(round(filtered)),
+            curve_strength,
+            0.0,
+        )
+        steering = self._clip(
+            steering,
+            -self.config.max_steering,
+            self.config.max_steering,
+        )
+
+        speed = int(
+            round(
+                self.config.base_speed
+                - self.config.speed_curve_slowdown * raw_curve
+            )
+        )
+        speed = self._clip(
+            speed,
+            self.config.min_curve_speed,
+            self.config.max_speed,
+        )
+
+        self._last_steering = steering
+        self._last_lateral_error = lane.lateral_error_norm
+        self._last_heading_error = lane.heading_error
+        self._last_path_error = path_error
+        command = ControlCommand(
+            speed=speed,
+            steering=steering,
+            brake=False,
+            reason="path_tracking:whole_centerline",
+        )
+        self._last_command = command
+        self._lane_lost_frames = 0
+        return command
+
+    def _weighted_path_error(self, lane: LaneGeometry) -> float:
+        points = list(lane.path_points)
+        near_y = (
+            float(lane.near_target_y)
+            if lane.near_target_y is not None
+            else float(lane.height) * 0.88
+        )
+        far_y = float(lane.target_y)
+        if near_y <= far_y + 1.0 or len(points) < 3:
+            near = lane.near_lateral_error_norm
+            if near is None:
+                return float(lane.lateral_error_norm)
+            return self._clip_float(
+                0.65 * float(near)
+                + 0.35 * float(lane.lateral_error_norm),
+                -1.0,
+                1.0,
+            )
+
+        half_width = max(1.0, float(lane.vehicle_center_x))
+        samples = []
+        for x, y in points:
+            y = float(y)
+            if y < far_y or y > near_y:
+                continue
+            progress = (y - far_y) / (near_y - far_y)
+            weight = (
+                self.config.path_far_weight
+                + (
+                    self.config.path_near_weight
+                    - self.config.path_far_weight
+                )
+                * progress
+            )
+            error = (float(x) - float(lane.vehicle_center_x)) / half_width
+            samples.append((error, max(0.0, float(weight))))
+        if not samples:
+            return float(lane.lateral_error_norm)
+
+        weight_sum = sum(weight for _, weight in samples)
+        if weight_sum <= 1e-6:
+            return float(lane.lateral_error_norm)
+        return self._clip_float(
+            sum(error * weight for error, weight in samples) / weight_sum,
+            -1.0,
+            1.0,
+        )
+
+    def _path_steering_alpha(self, raw_steering: float, reason: str) -> float:
+        previous = float(self._last_steering)
+        same_direction = raw_steering == 0.0 or raw_steering * previous >= 0.0
+        increasing = same_direction and abs(raw_steering) >= abs(previous)
+        alpha = (
+            self.config.path_steering_rise_alpha
+            if increasing
+            else self.config.path_steering_release_alpha
+        )
+        if ":lane_change" in reason:
+            alpha = max(alpha, 0.65)
+        return self._clip_float(alpha, 0.0, 1.0)
+
     def _plan_pure_pursuit(self, lane: LaneGeometry) -> ControlCommand:
         """Geometric steering straight from the BEV lookahead point.
 
@@ -128,6 +262,43 @@ class YoloLaneFollower:
             # lateral error (treats the lookahead as ~45 deg full-scale).
             alpha = lane.lateral_error_norm * (math.pi / 4.0)
 
+        near_x = lane.near_center_x
+        near_y = lane.near_target_y
+        near_error = lane.near_lateral_error_norm
+        far_error = float(lane.lateral_error_norm)
+        reason = "pure_pursuit"
+        if near_x is not None and near_y is not None and near_error is not None:
+            near_error = float(near_error)
+            sign_conflict = far_error * near_error < 0.0
+            near_dominant = abs(near_error) > abs(far_error) + 0.07
+            if sign_conflict or near_dominant:
+                blend = 0.55 if sign_conflict else 0.38
+                aim_x = (
+                    (1.0 - blend) * float(lane.center_x)
+                    + blend * float(near_x)
+                )
+                aim_y = (
+                    (1.0 - blend) * float(lane.target_y)
+                    + blend * float(near_y)
+                )
+                aim_dx = aim_x - float(lane.vehicle_center_x)
+                aim_dy = float(lane.height) - aim_y
+                candidate_alpha = (
+                    math.atan2(aim_dx, aim_dy)
+                    if aim_dy > 1.0
+                    else near_error * (math.pi / 4.0)
+                )
+                gain = max(1e-6, float(self.config.pure_pursuit_gain))
+                far_raw = gain * alpha
+                candidate_raw = gain * candidate_alpha
+                bounded_delta = self._clip_float(
+                    candidate_raw - far_raw,
+                    -35.0,
+                    35.0,
+                )
+                alpha = (far_raw + bounded_delta) / gain
+                reason = "pure_pursuit:near_guard"
+
         raw_curve = min(1.0, abs(alpha) / max(1e-6, self.config.pure_pursuit_full_angle))
         curve_strength = self._smooth_curve_strength(raw_curve)
 
@@ -141,7 +312,7 @@ class YoloLaneFollower:
         self._last_steering = steering
         self._last_lateral_error = lane.lateral_error_norm
         self._last_heading_error = lane.heading_error
-        command = ControlCommand(speed=speed, steering=steering, brake=False, reason="pure_pursuit")
+        command = ControlCommand(speed=speed, steering=steering, brake=False, reason=reason)
         self._last_command = command
         self._lane_lost_frames = 0
         return command
@@ -182,6 +353,7 @@ class YoloLaneFollower:
         self._last_steering = 0
         self._last_lateral_error = None
         self._last_heading_error = None
+        self._last_path_error = None
         self._curve_strength = 0.0
         self._last_command = None
         self._lane_lost_frames = 0

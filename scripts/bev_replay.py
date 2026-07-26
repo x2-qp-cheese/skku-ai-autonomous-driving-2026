@@ -94,7 +94,11 @@ class ReplayPipeline:
                     lane_width_px=args.lane_width_px,
                     center_anchor=args.center_anchor == "on",
                     center_smooth_alpha=args.center_smooth,
+                    heading_smooth_alpha=args.heading_smooth,
+                    path_smooth_alpha=args.path_smooth,
+                    path_max_step_px=args.path_max_step,
                     max_center_jump_px=args.max_center_jump,
+                    max_heading_jump=args.max_heading_jump,
                     max_coast_frames=args.max_coast_frames,
                     max_width_jump_px=args.max_width_jump,
                     crosswalk_halt=args.crosswalk_halt == "on",
@@ -103,6 +107,7 @@ class ReplayPipeline:
                     crosswalk_max_center_jump_px=args.crosswalk_max_center_jump,
                     crosswalk_option=args.crosswalk_option,
                     crosswalk_right_offset_px=args.crosswalk_right_offset_px,
+                    crosswalk_transit_enabled=args.crosswalk_transit == "on",
                     virtual_hold=args.virtual_hold == "on",
                     vehicle_width_px=args.vehicle_width_px,
                     virtual_hold_max_frames=args.virtual_hold_max_frames,
@@ -142,6 +147,14 @@ class ReplayPipeline:
                     center_recovery_rate_limit=args.center_recovery_rate_limit,
                     center_recovery_max_speed=args.center_recovery_max_speed,
                     lane_lost_hold_frames=args.lane_lost_hold_frames,
+                    path_tracking=args.path_tracking,
+                    path_lateral_gain=args.path_lateral_gain,
+                    path_heading_gain=args.path_heading_gain,
+                    path_derivative_gain=args.path_derivative_gain,
+                    path_near_weight=args.path_near_weight,
+                    path_far_weight=args.path_far_weight,
+                    path_steering_rise_alpha=args.path_steering_rise_alpha,
+                    path_steering_release_alpha=args.path_steering_release_alpha,
                     pure_pursuit=args.pure_pursuit,
                     pure_pursuit_gain=args.pp_gain,
                     pure_pursuit_full_angle=args.pp_full_angle,
@@ -326,8 +339,16 @@ def parse_args(argv):
                         help="[--corridor] anchor centerline on center line + half smoothed width (less jitter); off = raw midpoint")
     parser.add_argument("--center-smooth", type=float, default=BevCorridorConfig.center_smooth_alpha,
                         help="[--corridor] center-x EMA factor (lower = smoother/laggier)")
+    parser.add_argument("--heading-smooth", type=float, default=BevCorridorConfig.heading_smooth_alpha,
+                        help="[--corridor] heading EMA factor; use 1 when heading comes from the stabilized path")
+    parser.add_argument("--path-smooth", type=float, default=BevCorridorConfig.path_smooth_alpha,
+                        help="[--corridor] EMA factor applied to the complete fitted path")
+    parser.add_argument("--path-max-step", type=float, default=BevCorridorConfig.path_max_step_px,
+                        help="[--corridor] max lateral movement of one path anchor per frame")
     parser.add_argument("--max-center-jump", type=float, default=BevCorridorConfig.max_center_jump_px,
                         help="[--corridor] reject+coast a frame whose center_x jumps more than this many BEV px")
+    parser.add_argument("--max-heading-jump", type=float, default=BevCorridorConfig.max_heading_jump,
+                        help="[--corridor] reject+coast a frame whose raw heading jumps more than this amount")
     parser.add_argument("--max-coast-frames", type=int, default=BevCorridorConfig.max_coast_frames,
                         help="[--corridor] max rejected frames to coast before lost")
     parser.add_argument("--max-width-jump", type=float, default=BevCorridorConfig.max_width_jump_px,
@@ -348,6 +369,8 @@ def parse_args(argv):
     parser.add_argument("--crosswalk-right-offset-px", type=float,
                         default=BevCorridorConfig.crosswalk_right_offset_px,
                         help="[--corridor] option B target distance left of the detected right boundary")
+    parser.add_argument("--crosswalk-transit", choices=("on", "off"), default="on",
+                        help="[--corridor] freeze the pre-crosswalk full path until stable exit reacquisition")
     # [--corridor] vehicle-width virtual-lane hold: when all lane evidence is gone
     # and coasting is exhausted, hold a straight vehicle-width virtual lane and
     # keep the car centered instead of braking.
@@ -395,6 +418,15 @@ def parse_args(argv):
     parser.add_argument("--center-recovery-rate-limit", type=int, default=YoloLaneFollowerConfig.center_recovery_rate_limit)
     parser.add_argument("--center-recovery-max-speed", type=int, default=YoloLaneFollowerConfig.center_recovery_max_speed)
     parser.add_argument("--lane-lost-hold-frames", type=int, default=YoloLaneFollowerConfig.lane_lost_hold_frames)
+    parser.add_argument("--path-tracking", action="store_true",
+                        help="[--follower] track the complete fitted BEV center path")
+    parser.add_argument("--path-lateral-gain", type=float, default=YoloLaneFollowerConfig.path_lateral_gain)
+    parser.add_argument("--path-heading-gain", type=float, default=YoloLaneFollowerConfig.path_heading_gain)
+    parser.add_argument("--path-derivative-gain", type=float, default=YoloLaneFollowerConfig.path_derivative_gain)
+    parser.add_argument("--path-near-weight", type=float, default=YoloLaneFollowerConfig.path_near_weight)
+    parser.add_argument("--path-far-weight", type=float, default=YoloLaneFollowerConfig.path_far_weight)
+    parser.add_argument("--path-steering-rise-alpha", type=float, default=YoloLaneFollowerConfig.path_steering_rise_alpha)
+    parser.add_argument("--path-steering-release-alpha", type=float, default=YoloLaneFollowerConfig.path_steering_release_alpha)
     parser.add_argument("--pure-pursuit", action="store_true",
                         help="[--follower] steer via pure pursuit toward the BEV lookahead point (better on curves) instead of the lateral+heading PID")
     parser.add_argument("--pp-gain", type=float, default=YoloLaneFollowerConfig.pure_pursuit_gain,

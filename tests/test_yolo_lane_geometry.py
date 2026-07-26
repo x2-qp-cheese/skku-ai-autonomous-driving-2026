@@ -18,6 +18,59 @@ from skku_autocar.types import ControlCommand
 
 
 class YoloLaneGeometryTest(unittest.TestCase):
+    def test_full_path_tracking_does_not_chase_extreme_far_dot(self):
+        lane = LaneGeometry(
+            found=True,
+            center_x=250.0,
+            vehicle_center_x=400.0,
+            target_y=160.0,
+            lateral_error_px=-150.0,
+            lateral_error_norm=-0.375,
+            heading_error=-0.04,
+            confidence=1.0,
+            reason="corridor",
+            height=500.0,
+            near_center_x=380.0,
+            near_target_y=440.0,
+            near_lateral_error_px=-20.0,
+            near_lateral_error_norm=-0.05,
+            path_points=tuple(
+                (250.0 + 130.0 * index / 9.0, 160.0 + 280.0 * index / 9.0)
+                for index in range(10)
+            ),
+        )
+        path_follower = YoloLaneFollower(
+            YoloLaneFollowerConfig(
+                path_tracking=True,
+                path_steering_rise_alpha=1.0,
+                path_steering_release_alpha=1.0,
+                steering_rate_limit=500,
+                min_steering_rate_limit=500,
+                steering_release_rate_limit=500,
+                max_steering=500,
+            )
+        )
+        dot_follower = YoloLaneFollower(
+            YoloLaneFollowerConfig(
+                pure_pursuit=True,
+                pure_pursuit_gain=330.0,
+                steering_rate_limit=500,
+                min_steering_rate_limit=500,
+                steering_release_rate_limit=500,
+                max_steering=500,
+            )
+        )
+
+        path_command = path_follower.plan(lane)
+        dot_command = dot_follower.plan(lane)
+
+        self.assertLess(path_command.steering, 0)
+        self.assertLess(
+            abs(path_command.steering),
+            abs(dot_command.steering),
+        )
+        self.assertIn("whole_centerline", path_command.reason)
+
     def test_pd_steering_adds_derivative_when_error_changes(self):
         follower = YoloLaneFollower(
             YoloLaneFollowerConfig(
@@ -477,6 +530,8 @@ class YoloLaneGeometryTest(unittest.TestCase):
         lane_change_config = build_lane_change_config(args)
 
         self.assertEqual(lane_change_config.mode, "external")
+        self.assertTrue(lane_change_config.smooth_avoidance)
+        self.assertGreater(lane_change_config.return_duration_scale, 1.0)
         self.assertLess(lane_change_config.transition_seconds, 2.0)
         self.assertGreaterEqual(lane_change_config.speed_cap, 85)
         self.assertGreaterEqual(lane_change_config.steering_min, 100)
