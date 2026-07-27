@@ -64,6 +64,11 @@ class YoloLaneFollowerConfig:
     path_reversal_min_geometry: float = 0.08
     path_reversal_output_min_steering: float = 60.0
     path_reversal_rate_limit: int = 220
+    # During an S transition, the far path can reverse before the near path has
+    # reached the vehicle. Release the old command immediately, but do not steer
+    # toward the far path while that would move away from the near path.
+    path_near_conflict_error_threshold: float = 0.01
+    path_near_conflict_release_alpha: float = 0.90
     # A large far-path heading with an already centered near field is curve
     # preview, not permission to keep increasing steering into the inner line.
     path_curve_guard_heading_threshold: float = 0.25
@@ -206,6 +211,13 @@ class YoloLaneFollower:
                 raw_steering,
                 near_error,
             )
+        near_conflict = self._path_near_conflict_active(
+            lane,
+            near_error,
+            raw_steering,
+        )
+        if near_conflict:
+            raw_steering = 0.0
         curve_guard = self._path_curve_guard_active(
             lane,
             path_error,
@@ -251,6 +263,15 @@ class YoloLaneFollower:
                     1.0,
                 ),
             )
+        if near_conflict:
+            alpha = max(
+                alpha,
+                self._clip_float(
+                    float(self.config.path_near_conflict_release_alpha),
+                    0.0,
+                    1.0,
+                ),
+            )
         filtered = (
             float(self._last_steering)
             + alpha * (raw_steering - float(self._last_steering))
@@ -280,10 +301,11 @@ class YoloLaneFollower:
                 ),
                 (
                     int(self.config.path_reversal_rate_limit)
-                    if direction_reversal
+                    if direction_reversal or near_conflict
                     else 0
                 ),
             ),
+            fast_release=near_conflict,
         )
         if curve_guard:
             curve_limit = int(
@@ -413,6 +435,35 @@ class YoloLaneFollower:
             and raw_steering * float(lane.heading_error) > 0.0
         )
         return coherent_path or coherent_heading
+
+    def _path_near_conflict_active(
+        self,
+        lane: LaneGeometry,
+        near_error: float,
+        raw_steering: float,
+    ) -> bool:
+        reason = str(lane.reason)
+        if not reason.startswith("corridor_tier1"):
+            return False
+        if any(
+            token in reason
+            for token in ("lane_change", "crosswalk", "coast", "virtual")
+        ):
+            return False
+        return (
+            float(lane.confidence) >= 0.75
+            and abs(float(near_error))
+            >= max(
+                0.0,
+                float(self.config.path_near_conflict_error_threshold),
+            )
+            and abs(float(raw_steering))
+            >= max(
+                0.0,
+                float(self.config.path_reversal_min_steering),
+            )
+            and float(near_error) * float(raw_steering) < 0.0
+        )
 
     def _path_curve_guard_active(
         self,
@@ -828,6 +879,7 @@ class YoloLaneFollower:
         curve_strength: float,
         recovery_strength: float,
         minimum_rate_limit: int = 0,
+        fast_release: bool = False,
     ) -> int:
         delta = steering - self._last_steering
         min_limit = min(self.config.min_steering_rate_limit, self.config.steering_rate_limit)
@@ -839,7 +891,7 @@ class YoloLaneFollower:
                 limit + (self.config.center_recovery_rate_limit - limit) * recovery_strength
             ))
             limit = max(limit, recovery_limit)
-        if self._is_releasing_steering(steering):
+        if self._is_releasing_steering(steering) and not fast_release:
             limit = min(limit, self.config.steering_release_rate_limit)
         if delta > limit:
             return self._last_steering + limit

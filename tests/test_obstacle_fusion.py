@@ -149,6 +149,29 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertTrue(assessment.current_detected)
         self.assertFalse(assessment.target_blocked)
 
+    def test_physical_current_lane_overrides_unstable_target_projection(self):
+        fusion = planner(min_physical_lane_overlap_ratio=0.65)
+        assessment = fusion._assess_measurements(
+            [
+                PathOccupancy(
+                    bottom_y_ratio=0.75,
+                    current_overlap=0.62,
+                    target_overlap=0.84,
+                    current_distance_px=18.0,
+                    target_distance_px=7.0,
+                    current_distance_ratio=0.30,
+                    target_distance_ratio=0.12,
+                    physical_lane_overlap=1.0,
+                )
+            ],
+            current_y_threshold=0.30,
+            target_y_threshold=0.65,
+            physical_lane_known=True,
+        )
+
+        self.assertTrue(assessment.current_detected)
+        self.assertFalse(assessment.physical_target_blocked)
+
     def test_obstacle_class_is_kept_separate_from_lane_classes(self):
         segmenter = object.__new__(YoloLaneSegmenter)
         segmenter.config = YoloLaneConfig()

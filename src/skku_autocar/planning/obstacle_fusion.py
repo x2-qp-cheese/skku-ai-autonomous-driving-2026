@@ -992,9 +992,15 @@ class ObstacleFusionPlanner:
                 item.current_overlap >= current_overlap_min
                 and inside_current_path(item)
                 and inside_physical_lane(item)
-                and not target_preferred(item)
-                and item.current_distance_px
-                <= item.target_distance_px + assignment_margin_px
+                and (
+                    physical_lane_known
+                    or not target_preferred(item)
+                )
+                and (
+                    physical_lane_known
+                    or item.current_distance_px
+                    <= item.target_distance_px + assignment_margin_px
+                )
             )
 
         def target_preferred(item: PathOccupancy) -> bool:
@@ -1030,10 +1036,17 @@ class ObstacleFusionPlanner:
             and target_preferred(item)
         ]
         target_blocked = bool(target or target_lookahead)
+        # A projected target path can cross a wide current-lane mask on a
+        # curve. Treat only a mask with negligible current-lane contact as a
+        # separately occupied destination lane.
+        physical_target_overlap_max = min(
+            0.25,
+            0.5 * min_physical_overlap,
+        )
         physical_target_blocked = (
             physical_lane_known
             and any(
-                not inside_physical_lane(item)
+                item.physical_lane_overlap <= physical_target_overlap_max
                 for item in (*target, *target_lookahead)
             )
         )
