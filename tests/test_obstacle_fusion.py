@@ -503,6 +503,35 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertTrue(fusion.observation.range_confirmed)
         self.assertIsNone(fusion.observation.front_mm)
 
+    def test_bev_target_overlap_from_current_obstacle_does_not_veto_escape(self):
+        fusion = planner(
+            visual_confirm_frames=1,
+            visual_commit_enabled=True,
+            visual_commit_confidence=0.90,
+            visual_commit_frame_y_ratio=0.40,
+        )
+        change = controller()
+        current = obstacle_mask(130, 151, 45, 70)
+        bev_projection_overlap = obstacle_mask(96, 121, 45, 70)
+
+        event = fusion.update(
+            [current, bev_projection_overlap],
+            SHAPE,
+            CENTERLINE,
+            lane(),
+            change,
+            ultrasound(fc=760),
+            1.0,
+            True,
+            frame_obstacle_masks=[current],
+            frame_paths=projected_paths(),
+            obstacle_confidence=0.98,
+        )
+
+        self.assertIn("lane2 -> lane1", event)
+        self.assertFalse(fusion.observation.target_blocked)
+        self.assertTrue(fusion.observation.visual_commit_confirmed)
+
     def test_range_backed_visual_commit_ignores_transient_side_dropout(self):
         fusion = planner(
             visual_confirm_frames=1,

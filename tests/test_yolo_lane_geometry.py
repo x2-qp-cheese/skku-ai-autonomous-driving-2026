@@ -362,6 +362,49 @@ class YoloLaneGeometryTest(unittest.TestCase):
 
         self.assertGreater(command.steering, 0)
 
+    def test_weak_s_curve_reversal_unwinds_instead_of_flipping_direction(self):
+        follower = YoloLaneFollower(
+            YoloLaneFollowerConfig(
+                path_tracking=True,
+                path_lateral_gain=225.0,
+                path_heading_gain=65.0,
+                path_derivative_gain=0.0,
+                path_near_weight=1.0,
+                path_far_weight=1.0,
+                path_heading_lead_gain=170.0,
+                path_heading_lead_span=0.16,
+                path_heading_lead_max_steering=32.0,
+                path_center_recovery_error_threshold=2.0,
+                path_reversal_alpha=0.90,
+                path_reversal_min_steering=25.0,
+                path_reversal_min_geometry=0.05,
+                path_reversal_output_min_steering=70.0,
+                path_reversal_near_guard_error=0.025,
+                path_near_conflict_heading_limit=0.18,
+                path_steering_rise_alpha=0.72,
+                path_steering_release_alpha=0.28,
+                steering_rate_limit=80,
+                min_steering_rate_limit=35,
+                steering_release_rate_limit=55,
+                max_steering=150,
+            )
+        )
+        follower.accept_applied_command(
+            ControlCommand(speed=255, steering=-60, reason="previous_curve")
+        )
+
+        command = follower.plan(
+            lane_geometry(
+                lateral_error_norm=0.028,
+                heading_error=0.054,
+                near_lateral_error_norm=-0.010,
+                reason="corridor_tier1",
+            )
+        )
+
+        self.assertLessEqual(command.steering, 0)
+        self.assertIn("curve_transition", command.reason)
+
     def test_path_curve_guard_caps_inner_cut_while_near_field_is_centered(self):
         follower = YoloLaneFollower(
             YoloLaneFollowerConfig(

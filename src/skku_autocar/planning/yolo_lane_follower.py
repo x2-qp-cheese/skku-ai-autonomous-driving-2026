@@ -247,6 +247,14 @@ class YoloLaneFollower:
             raw_steering += reversal_near_guard * (
                 near_steering - raw_steering
             )
+        weak_reversal_hold = self._path_weak_reversal_hold_active(
+            lane,
+            path_error,
+            near_error,
+            raw_steering,
+        )
+        if weak_reversal_hold:
+            raw_steering = 0.0
         curve_guard_limit = self._path_curve_guard_limit(
             lane,
             path_error,
@@ -376,7 +384,7 @@ class YoloLaneFollower:
         self._path_heading_lead = heading_lead
         self._path_state = (
             "curve_transition"
-            if reversal_near_guard > 0.0
+            if reversal_near_guard > 0.0 or weak_reversal_hold
             else self._classify_path_state(
                 path_error,
                 lane.heading_error,
@@ -473,6 +481,69 @@ class YoloLaneFollower:
             and raw_steering * float(lane.heading_error) > 0.0
         )
         return coherent_path or coherent_heading
+
+    def _path_weak_reversal_hold_active(
+        self,
+        lane: LaneGeometry,
+        path_error: float,
+        near_error: float,
+        raw_steering: float,
+    ) -> bool:
+        """Suppress one-frame S-curve sign flips before geometry is committed."""
+        reason = str(lane.reason)
+        previous = float(self._last_steering)
+        if (
+            not reason.startswith("corridor_tier1")
+            or any(
+                token in reason
+                for token in ("lane_change", "crosswalk", "coast", "virtual")
+            )
+            or float(lane.confidence) < 0.75
+            or raw_steering * previous >= 0.0
+        ):
+            return False
+
+        minimum_steering = max(
+            0.0,
+            float(self.config.path_reversal_min_steering),
+        )
+        if abs(previous) < minimum_steering:
+            return False
+
+        previous_direction = 1.0 if previous >= 0.0 else -1.0
+        near_supports_previous = (
+            float(near_error) * previous_direction >= 0.0
+            or abs(float(near_error))
+            <= max(0.0, float(self.config.path_reversal_near_guard_error))
+        )
+        if not near_supports_previous:
+            return False
+
+        minimum_geometry = max(
+            0.0,
+            float(self.config.path_reversal_min_geometry),
+        )
+        strong_geometry = (
+            (
+                abs(float(path_error)) >= 2.0 * minimum_geometry
+                and raw_steering * float(path_error) > 0.0
+            )
+            or (
+                abs(float(lane.heading_error))
+                >= max(
+                    2.0 * minimum_geometry,
+                    float(self.config.path_near_conflict_heading_limit),
+                )
+                and raw_steering * float(lane.heading_error) > 0.0
+            )
+        )
+        if strong_geometry:
+            return False
+
+        return abs(float(raw_steering)) < max(
+            minimum_steering,
+            0.5 * max(0.0, float(self.config.path_reversal_output_min_steering)),
+        )
 
     def _path_reversal_near_guard_strength(
         self,

@@ -155,6 +155,7 @@ class PathAssessment:
     range_fallback_candidate: bool = False
     closest_y_ratio: float = 0.0
     physical_lane_overlap: float = 0.0
+    path_known: bool = False
     physical_lane_known: bool = False
     obstacle_count: int = 0
 
@@ -262,15 +263,12 @@ class ObstacleFusionPlanner:
             and frame_assessment.current_detected
             and not frame_assessment.physical_target_blocked
         )
-        target_blocked = (
-            bev_assessment.target_blocked
-            or frame_assessment.target_blocked
+        target_blocked = self._target_lane_blocked(
+            bev_assessment,
+            frame_assessment,
+            raw_path_visual,
+            physical_current_only,
         )
-        if physical_current_only:
-            # YOLO can split one source-lane vehicle into several masks. Physical
-            # lane boundaries, rather than mask count, decide whether a separate
-            # destination-lane obstacle actually exists.
-            target_blocked = False
         solid_blocked = self._solid_boundary_blocked(
             solid_masks,
             bev_shape,
@@ -480,6 +478,28 @@ class ObstacleFusionPlanner:
         )
         return visual_confidence >= required_confidence
 
+    def _target_lane_blocked(
+        self,
+        bev_assessment: PathAssessment,
+        frame_assessment: PathAssessment,
+        raw_path_visual: bool,
+        physical_current_only: bool,
+    ) -> bool:
+        """Return true only for a separate destination-lane blocker."""
+        if physical_current_only:
+            # YOLO can split one source-lane vehicle into several masks. Physical
+            # lane boundaries, rather than mask count, decide whether a separate
+            # destination-lane obstacle actually exists.
+            return False
+        if frame_assessment.target_blocked:
+            return True
+        if frame_assessment.path_known and raw_path_visual:
+            # BEV projection can make one current-lane obstacle overlap the
+            # destination path on curves. A destination veto needs frame-space
+            # evidence once frame paths are available.
+            return False
+        return bev_assessment.target_blocked
+
     def apply_safety(
         self,
         command: ControlCommand,
@@ -591,7 +611,13 @@ class ObstacleFusionPlanner:
         else:
             dual_domain_current = (
                 bev_assessment.current_detected
-                and not bev_assessment.target_blocked
+                and (
+                    not bev_assessment.target_blocked
+                    or (
+                        frame_assessment.path_known
+                        and not frame_assessment.target_blocked
+                    )
+                )
                 and not frame_assessment.target_blocked
             )
             if not allow_projected_current and not dual_domain_current:
@@ -814,6 +840,7 @@ class ObstacleFusionPlanner:
             measurements,
             self.config.visual_trigger_y_ratio,
             self.config.target_block_y_ratio,
+            path_known=True,
         )
 
     def _measure_frame_paths(
@@ -920,6 +947,7 @@ class ObstacleFusionPlanner:
             measurements,
             self.config.frame_visual_trigger_y_ratio,
             self.config.frame_target_block_y_ratio,
+            path_known=True,
             physical_lane_known=physical_bounds is not None,
         )
 
@@ -1022,6 +1050,7 @@ class ObstacleFusionPlanner:
         measurements: Sequence[PathOccupancy],
         current_y_threshold: float,
         target_y_threshold: float,
+        path_known: bool = False,
         physical_lane_known: bool = False,
     ) -> PathAssessment:
         overlap_min = max(0.0, min(1.0, self.config.min_path_overlap_ratio))
@@ -1139,6 +1168,7 @@ class ObstacleFusionPlanner:
                 ),
                 default=0.0,
             ),
+            path_known=path_known,
             physical_lane_known=physical_lane_known,
             obstacle_count=len(measurements),
         )
