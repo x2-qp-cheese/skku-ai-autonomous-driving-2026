@@ -704,7 +704,7 @@ def add_obstacle_arguments(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--lane-change-smooth-avoidance",
         choices=("on", "off"),
-        default="off",
+        default="on",
         help="use timed smoothstep obstacle lane changes; off uses immediate target-lane capture",
     )
 

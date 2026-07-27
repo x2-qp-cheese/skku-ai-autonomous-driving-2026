@@ -716,6 +716,34 @@ class LaneChangeControllerTest(unittest.TestCase):
 
         self.assertEqual(returning.state, "changing_to_lane2")
 
+    def test_smooth_avoidance_does_not_jump_to_full_offset_on_commit(self):
+        self.controller = LaneChangeController(
+            LaneChangeConfig(
+                mode="external",
+                transition_seconds=0.60,
+                smooth_avoidance=True,
+                stable_required_frames=0,
+            )
+        )
+        self.assertTrue(
+            self.controller.request_avoidance("obstacle_fusion")
+        )
+
+        started = self.controller.update(
+            lane(), 150.0, 800.0, 0.0, True
+        )
+        progressing = self.controller.update(
+            lane(), 150.0, 800.0, 0.30, True
+        )
+        finished = self.controller.update(
+            lane(), 150.0, 800.0, 0.60, True
+        )
+
+        self.assertEqual(started.state, "changing_to_lane1")
+        self.assertAlmostEqual(started.offset_px, 0.0)
+        self.assertLess(abs(progressing.offset_px), 150.0)
+        self.assertEqual(finished.state, "lane1")
+
     def test_avoidance_steering_slew_is_continuous_through_stabilization(self):
         self.controller = LaneChangeController(
             LaneChangeConfig(

@@ -89,15 +89,15 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --obstacle-visual-commit-frame-y 0.40 \
   --obstacle-range-visual-fallback on \
   --lane-change-target-width-px 0 \
-  --lane-change-smooth-avoidance off \
+  --lane-change-smooth-avoidance on \
   --lane-change-steering-override off \
-  --lane-change-steering-min 80 \
+  --lane-change-steering-min 95 \
   --lane-change-steering-boost 25 \
   --lane-change-steering-cap 150 \
   --lane-change-steering-slew-limit 0 \
   --lane-change-unreliable-steering-cap 120 \
   --lane-change-stabilizing-steering-min 55 \
-  --lane-change-transition-seconds 0.85 \
+  --lane-change-transition-seconds 0.60 \
   --lane-change-return-duration-scale 1.35 \
   --lane-change-return-steering-cap 115 \
   --lane-change-return-stabilizing-steering-cap 90 \

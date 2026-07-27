@@ -1599,7 +1599,7 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertEqual(lane_config.steering_min, 150)
         self.assertEqual(lane_config.steering_cap, 150)
         self.assertTrue(lane_config.steering_override)
-        self.assertFalse(lane_config.smooth_avoidance)
+        self.assertTrue(lane_config.smooth_avoidance)
         self.assertEqual(lane_config.unreliable_speed_cap, 255)
         self.assertEqual(lane_config.stabilizing_steering_min, 90)
         self.assertAlmostEqual(lane_config.target_approach_error, 0.20)
