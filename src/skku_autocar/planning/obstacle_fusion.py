@@ -116,6 +116,7 @@ class ObstacleFusionObservation:
     target_blocked: bool = False
     solid_blocked: bool = False
     side_clear: bool = False
+    side_vetoed: bool = False
     emergency: bool = False
     maneuver_active: bool = False
     clearing_source: bool = False
@@ -367,6 +368,7 @@ class ObstacleFusionPlanner:
             frame_obstacle_masks,
             visual_confidence,
             allow_projected_current=separated_path_event,
+            range_backed=self._range_hazard,
         )
         range_confirmed = (
             self.config.fusion_mode == "yolo"
@@ -374,7 +376,14 @@ class ObstacleFusionPlanner:
             or visual_commit_confirmed
         )
         fused_hazard = self._visual_confirmed and range_confirmed
-        blocked = target_blocked or solid_blocked or not side_clear
+        range_backed_visual_escape = (
+            visual_commit_confirmed
+            and self._range_hazard
+            and not target_blocked
+            and not solid_blocked
+        )
+        side_vetoed = (not side_clear) and not range_backed_visual_escape
+        blocked = target_blocked or solid_blocked or side_vetoed
         emergency = self._emergency_present(
             raw_visual,
             bev_assessment.closest_y_ratio,
@@ -395,6 +404,7 @@ class ObstacleFusionPlanner:
             target_blocked=target_blocked,
             solid_blocked=solid_blocked,
             side_clear=side_clear,
+            side_vetoed=side_vetoed,
             emergency=emergency,
             maneuver_active=maneuver_active,
             clearing_source=clearing_source,
@@ -520,7 +530,7 @@ class ObstacleFusionPlanner:
             state = "SOLID_BLOCKED"
         elif obs.fused_hazard and obs.target_blocked:
             state = "TARGET_BLOCKED"
-        elif obs.fused_hazard and not obs.side_clear:
+        elif obs.fused_hazard and obs.side_vetoed:
             state = "SIDE_BLOCKED"
         elif obs.fused_hazard:
             state = "READY"
@@ -565,6 +575,7 @@ class ObstacleFusionPlanner:
         frame_obstacle_masks: Sequence[Any],
         visual_confidence: float,
         allow_projected_current: bool = False,
+        range_backed: bool = False,
     ) -> bool:
         if not self.config.visual_commit_enabled:
             return False
@@ -587,10 +598,13 @@ class ObstacleFusionPlanner:
                 return False
             if frame_assessment.target_blocked:
                 return False
-        if visual_confidence < max(
-            float(self.config.visual_action_confidence),
-            float(self.config.visual_commit_confidence),
-        ):
+        required_confidence = float(self.config.visual_action_confidence)
+        if not range_backed:
+            required_confidence = max(
+                required_confidence,
+                float(self.config.visual_commit_confidence),
+            )
+        if visual_confidence < max(0.0, required_confidence):
             return False
         return frame_assessment.closest_y_ratio >= max(
             float(self.config.frame_visual_trigger_y_ratio),

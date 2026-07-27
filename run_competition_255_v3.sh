@@ -50,9 +50,9 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-heading-lead-gain 170 \
   --path-heading-lead-span 0.16 \
   --path-heading-lead-max-steering 32 \
-  --path-integral-gain 45 \
-  --path-integral-limit 0.25 \
-  --path-integral-decay 0.65 \
+  --path-integral-gain 20 \
+  --path-integral-limit 0.16 \
+  --path-integral-decay 0.45 \
   --bev-lookahead 0.32 \
   --bev-center-smooth 0.32 \
   --bev-heading-smooth 1.0 \
@@ -76,25 +76,27 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --obstacle-clear-mm 3150 \
   --obstacle-min-front-sensors 2 \
   --obstacle-range-confirm-frames 1 \
+  --obstacle-range-clear-frames 8 \
   --obstacle-visual-confirm-frames 1 \
   --obstacle-rearm-clear-frames 4 \
   --obstacle-source-clear-frames 2 \
-  --obstacle-current-path-min-overlap 0.40 \
+  --obstacle-current-path-min-overlap 0.30 \
   --obstacle-physical-lane-min-overlap 0.65 \
-  --obstacle-current-path-max-distance-ratio 0.48 \
+  --obstacle-current-path-max-distance-ratio 0.58 \
   --obstacle-frame-boundary-margin-px 3 \
   --obstacle-visual-commit on \
   --obstacle-visual-commit-confidence 0.90 \
   --obstacle-visual-commit-frame-y 0.40 \
-  --obstacle-range-visual-fallback off \
-  --lane-change-target-width-px 160 \
+  --obstacle-range-visual-fallback on \
+  --lane-change-target-width-px 0 \
+  --lane-change-smooth-avoidance off \
   --lane-change-steering-override off \
   --lane-change-steering-min 80 \
   --lane-change-steering-boost 25 \
   --lane-change-steering-cap 150 \
-  --lane-change-steering-slew-limit 35 \
+  --lane-change-steering-slew-limit 0 \
   --lane-change-unreliable-steering-cap 120 \
-  --lane-change-stabilizing-steering-min 0 \
+  --lane-change-stabilizing-steering-min 55 \
   --lane-change-transition-seconds 0.85 \
   --lane-change-return-duration-scale 1.35 \
   --lane-change-return-steering-cap 115 \

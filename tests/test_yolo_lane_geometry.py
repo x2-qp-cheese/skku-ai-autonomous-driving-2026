@@ -1110,7 +1110,7 @@ class YoloLaneGeometryTest(unittest.TestCase):
         lane_change_config = build_lane_change_config(args)
 
         self.assertEqual(lane_change_config.mode, "external")
-        self.assertTrue(lane_change_config.smooth_avoidance)
+        self.assertFalse(lane_change_config.smooth_avoidance)
         self.assertGreater(lane_change_config.return_duration_scale, 1.0)
         self.assertLess(lane_change_config.transition_seconds, 2.0)
         self.assertGreaterEqual(lane_change_config.speed_cap, 85)

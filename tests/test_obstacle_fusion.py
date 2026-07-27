@@ -503,6 +503,48 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertTrue(fusion.observation.range_confirmed)
         self.assertIsNone(fusion.observation.front_mm)
 
+    def test_range_backed_visual_commit_ignores_transient_side_dropout(self):
+        fusion = planner(
+            visual_confirm_frames=1,
+            min_physical_lane_overlap_ratio=0.65,
+            visual_commit_enabled=True,
+            visual_commit_confidence=0.90,
+            visual_commit_frame_y_ratio=0.40,
+        )
+        change = controller()
+        frame_paths = FramePathGeometry(
+            lane1=tuple((80.0, float(y)) for y in range(0, 100, 5)),
+            lane2=tuple((140.0, float(y)) for y in range(0, 100, 5)),
+            lane2_left_boundary=tuple(
+                (110.0, float(y)) for y in range(0, 100, 5)
+            ),
+            lane2_right_boundary=tuple(
+                (170.0, float(y)) for y in range(0, 100, 5)
+            ),
+        )
+        current = obstacle_mask(130, 151, 45, 70)
+        side_dropout = ultrasound(fc=850, sl=150)
+
+        event = fusion.update(
+            [],
+            SHAPE,
+            CENTERLINE,
+            lane(),
+            change,
+            side_dropout,
+            1.0,
+            True,
+            frame_obstacle_masks=[current],
+            frame_paths=frame_paths,
+            obstacle_confidence=0.84,
+        )
+
+        self.assertIn("lane2 -> lane1", event)
+        self.assertTrue(fusion.observation.visual_commit_confirmed)
+        self.assertTrue(fusion.observation.range_confirmed)
+        self.assertFalse(fusion.observation.side_clear)
+        self.assertFalse(fusion.observation.side_vetoed)
+
     def test_range_backed_visual_fallback_ignores_target_lane_obstacle(self):
         fusion = planner(
             visual_trigger_y_ratio=0.30,
@@ -1460,6 +1502,8 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
                 "125",
                 "--lane-change-return-stabilizing-steering-cap",
                 "85",
+                "--lane-change-smooth-avoidance",
+                "on",
                 "--obstacle-side-clearance-mm",
                 "350",
                 "--obstacle-emergency-stop",
@@ -1496,6 +1540,7 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertAlmostEqual(lane_config.stable_near_lateral_error, 0.19)
         self.assertEqual(lane_config.stabilizing_steering_min, 75)
         self.assertEqual(lane_config.steering_slew_limit, 32)
+        self.assertTrue(lane_config.smooth_avoidance)
         self.assertAlmostEqual(lane_config.return_duration_scale, 1.25)
         self.assertEqual(lane_config.return_steering_cap, 125)
         self.assertEqual(lane_config.return_stabilizing_steering_cap, 85)
@@ -1525,6 +1570,7 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertEqual(lane_config.steering_min, 150)
         self.assertEqual(lane_config.steering_cap, 150)
         self.assertTrue(lane_config.steering_override)
+        self.assertFalse(lane_config.smooth_avoidance)
         self.assertEqual(lane_config.unreliable_speed_cap, 255)
         self.assertEqual(lane_config.stabilizing_steering_min, 90)
         self.assertAlmostEqual(lane_config.target_approach_error, 0.20)
