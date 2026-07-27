@@ -891,6 +891,62 @@ class LaneChangeControllerTest(unittest.TestCase):
         self.assertEqual(adjusted.steering, 55)
         self.assertIn("lane_change_stabilize", adjusted.reason)
 
+    def test_avoidance_lane1_stability_uses_general_limits_not_return_limits(self):
+        self.controller = LaneChangeController(
+            LaneChangeConfig(
+                mode="external",
+                stable_lateral_error=0.25,
+                stable_near_lateral_error=0.35,
+                stable_required_frames=1,
+                target_capture_frames=1,
+                return_stable_lateral_error=0.12,
+                return_stable_near_lateral_error=0.16,
+                return_stable_required_frames=4,
+            )
+        )
+        self.controller.request_avoidance("obstacle_fusion")
+        self.controller.update(lane(), 150.0, 800.0, 0.0, True)
+        almost_lane1 = lane_for_target_error(lateral_error_norm=0.20)
+
+        result = self.controller.update(almost_lane1, 150.0, 800.0, 1.0, True)
+
+        self.assertEqual(result.state, "lane1")
+
+    def test_avoidance_lane2_return_uses_return_stability_limits(self):
+        self.controller = LaneChangeController(
+            LaneChangeConfig(
+                mode="external",
+                stable_lateral_error=0.25,
+                stable_near_lateral_error=0.35,
+                stable_required_frames=1,
+                return_stable_lateral_error=0.12,
+                return_stable_near_lateral_error=0.16,
+                return_stable_required_frames=2,
+            )
+        )
+        self.controller.state = "stabilizing_lane2"
+        self.controller._return_profile = "avoidance"
+        loose_only = replace(
+            lane(),
+            lateral_error_norm=0.20,
+            near_lateral_error_norm=0.14,
+        )
+        tight = replace(
+            lane(),
+            lateral_error_norm=0.08,
+            near_lateral_error_norm=0.06,
+        )
+
+        still_stabilizing = self.controller.update(
+            loose_only, 150.0, 800.0, 0.0, True
+        )
+        first_tight = self.controller.update(tight, 150.0, 800.0, 0.1, True)
+        completed = self.controller.update(tight, 150.0, 800.0, 0.2, True)
+
+        self.assertEqual(still_stabilizing.state, "stabilizing_lane2")
+        self.assertEqual(first_tight.state, "stabilizing_lane2")
+        self.assertEqual(completed.state, "completed")
+
     def test_unreliable_avoidance_stabilization_uses_bounded_path_feedback(self):
         self.controller = LaneChangeController(
             LaneChangeConfig(

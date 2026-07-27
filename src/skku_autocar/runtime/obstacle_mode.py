@@ -424,6 +424,11 @@ def build_lane_change_config(args: argparse.Namespace) -> LaneChangeConfig:
         return_stabilizing_steering_cap=(
             args.lane_change_return_stabilizing_steering_cap
         ),
+        return_stable_lateral_error=args.lane_change_return_stable_lateral_error,
+        return_stable_near_lateral_error=(
+            args.lane_change_return_stable_near_error
+        ),
+        return_stable_required_frames=args.lane_change_return_stable_frames,
     )
 
 
@@ -682,6 +687,9 @@ def add_obstacle_arguments(parser: argparse.ArgumentParser) -> None:
         ("--lane-change-return-duration-scale", float, 1.35),
         ("--lane-change-return-steering-cap", int, 115),
         ("--lane-change-return-stabilizing-steering-cap", int, 90),
+        ("--lane-change-return-stable-lateral-error", float, 0.0),
+        ("--lane-change-return-stable-near-error", float, 0.0),
+        ("--lane-change-return-stable-frames", int, 0),
     )
     for name, value_type, default in lane_specs:
         group.add_argument(name, type=value_type, default=default)
