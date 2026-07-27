@@ -149,6 +149,7 @@ class PathOccupancy:
 class PathAssessment:
     current_detected: bool = False
     target_blocked: bool = False
+    physical_target_blocked: bool = False
     range_fallback_candidate: bool = False
     closest_y_ratio: float = 0.0
     physical_lane_overlap: float = 0.0
@@ -252,20 +253,19 @@ class ObstacleFusionPlanner:
             or frame_assessment.current_detected
         )
         visual_confidence = max(0.0, min(1.0, float(obstacle_confidence)))
-        single_physical_current = (
+        physical_current_only = (
             frame_assessment.physical_lane_known
             and frame_assessment.current_detected
-            and frame_assessment.obstacle_count == 1
-            and len(frame_obstacle_masks) == 1
+            and not frame_assessment.physical_target_blocked
         )
         target_blocked = (
             bev_assessment.target_blocked
             or frame_assessment.target_blocked
         )
-        if single_physical_current:
-            # The same wide source-lane mask can touch both projected paths in a
-            # curve. A separately detected destination-lane object still blocks,
-            # but one physically current-lane object must not block its own exit.
+        if physical_current_only:
+            # YOLO can split one source-lane vehicle into several masks. Physical
+            # lane boundaries, rather than mask count, decide whether a separate
+            # destination-lane obstacle actually exists.
             target_blocked = False
         solid_blocked = self._solid_boundary_blocked(
             solid_masks,
@@ -530,11 +530,12 @@ class ObstacleFusionPlanner:
             return False
         if not self._visual_confirmed:
             return False
-        if len(frame_obstacle_masks) != 1:
+        if not frame_obstacle_masks:
             return False
         if (
             not frame_assessment.physical_lane_known
             or not frame_assessment.current_detected
+            or frame_assessment.physical_target_blocked
         ):
             return False
         if visual_confidence < max(
@@ -1029,6 +1030,13 @@ class ObstacleFusionPlanner:
             and target_preferred(item)
         ]
         target_blocked = bool(target or target_lookahead)
+        physical_target_blocked = (
+            physical_lane_known
+            and any(
+                not inside_physical_lane(item)
+                for item in (*target, *target_lookahead)
+            )
+        )
         range_fallback = any(
             item.bottom_y_ratio >= current_y_threshold
             and inside_current_path(item)
@@ -1041,6 +1049,7 @@ class ObstacleFusionPlanner:
         return PathAssessment(
             current_detected=bool(current),
             target_blocked=target_blocked,
+            physical_target_blocked=physical_target_blocked,
             range_fallback_candidate=range_fallback,
             closest_y_ratio=max(
                 (item.bottom_y_ratio for item in current),

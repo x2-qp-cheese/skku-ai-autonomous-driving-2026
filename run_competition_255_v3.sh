@@ -28,18 +28,19 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-far-weight 0.55 \
   --path-steering-rise-alpha 0.72 \
   --path-steering-release-alpha 0.28 \
-  --path-center-recovery-error-threshold 0.10 \
+  --path-center-recovery-error-threshold 0.07 \
   --path-center-recovery-heading-limit 0.12 \
-  --path-center-recovery-min-steering 70 \
+  --path-center-recovery-min-steering 60 \
   --path-center-recovery-alpha 0.90 \
   --path-center-recovery-rate-limit 120 \
   --path-reversal-alpha 0.90 \
   --path-reversal-min-steering 25 \
   --path-reversal-min-geometry 0.08 \
-  --path-reversal-rate-limit 160 \
+  --path-reversal-output-min-steering 60 \
+  --path-reversal-rate-limit 220 \
   --path-curve-guard-heading-threshold 0.25 \
-  --path-curve-guard-near-error 0.08 \
-  --path-curve-guard-steering-limit 110 \
+  --path-curve-guard-near-error 0.13 \
+  --path-curve-guard-steering-limit 115 \
   --path-heading-lead-gain 170 \
   --path-heading-lead-span 0.16 \
   --path-heading-lead-max-steering 32 \

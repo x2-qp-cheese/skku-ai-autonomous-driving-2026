@@ -52,9 +52,9 @@ class YoloLaneFollowerConfig:
     path_steering_release_alpha: float = 0.28
     # Recover a car that starts measurably off-center before full-speed travel
     # turns a correct but small path command into a boundary approach.
-    path_center_recovery_error_threshold: float = 0.10
+    path_center_recovery_error_threshold: float = 0.07
     path_center_recovery_heading_limit: float = 0.12
-    path_center_recovery_min_steering: float = 70.0
+    path_center_recovery_min_steering: float = 60.0
     path_center_recovery_alpha: float = 0.90
     path_center_recovery_rate_limit: int = 120
     # S-curves need the old steering direction removed in one control frame,
@@ -62,12 +62,13 @@ class YoloLaneFollowerConfig:
     path_reversal_alpha: float = 0.90
     path_reversal_min_steering: float = 25.0
     path_reversal_min_geometry: float = 0.08
-    path_reversal_rate_limit: int = 160
+    path_reversal_output_min_steering: float = 60.0
+    path_reversal_rate_limit: int = 220
     # A large far-path heading with an already centered near field is curve
     # preview, not permission to keep increasing steering into the inner line.
     path_curve_guard_heading_threshold: float = 0.25
-    path_curve_guard_near_error: float = 0.08
-    path_curve_guard_steering_limit: float = 110.0
+    path_curve_guard_near_error: float = 0.13
+    path_curve_guard_steering_limit: float = 115.0
     # A curve first appears as a change in path heading while the near-field
     # lateral error is still small. Convert that geometric lead into continuous
     # steering feed-forward instead of waiting until the car has drifted.
@@ -254,6 +255,14 @@ class YoloLaneFollower:
             float(self._last_steering)
             + alpha * (raw_steering - float(self._last_steering))
         )
+        if direction_reversal:
+            reversal_direction = 1.0 if raw_steering >= 0.0 else -1.0
+            reversal_minimum = max(
+                0.0,
+                float(self.config.path_reversal_output_min_steering),
+            )
+            if filtered * reversal_direction < reversal_minimum:
+                filtered = reversal_direction * reversal_minimum
         raw_curve = min(
             1.0,
             max(abs(path_error) / 0.55, abs(lane.heading_error) / 0.85),
