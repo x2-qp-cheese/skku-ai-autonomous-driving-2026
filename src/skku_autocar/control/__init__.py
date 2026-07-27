@@ -1,3 +1,3 @@
-from .protocol import decode_status, encode_command
+from .serial_vehicle import SerialVehicle, find_arduino_port
 
-__all__ = ["decode_status", "encode_command"]
+__all__ = ["SerialVehicle", "find_arduino_port"]

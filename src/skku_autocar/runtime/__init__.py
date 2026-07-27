@@ -1,2 +1,1 @@
-"""Runtime entry points for live autonomous driving."""
-
+"""Live runtime for rear 2D LiDAR parking."""

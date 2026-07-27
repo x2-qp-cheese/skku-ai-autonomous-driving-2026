@@ -1,5 +1,4 @@
-numpy
-opencv-python
-pyserial
-rplidar-roboticia
-ultralytics
+numpy>=1.24
+opencv-python>=4.8
+pyserial>=3.5
+rplidar-roboticia>=0.9.5

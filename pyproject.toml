@@ -1,12 +1,18 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "skku-autocar"
-version = "0.1.0"
-description = "SKKU AI autonomous driving competition software stack"
+name = "skku-rear-lidar-parking"
+version = "2.0.0"
+description = "Rear 2D LiDAR automatic perpendicular parking"
 requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.24",
+  "opencv-python>=4.8",
+  "pyserial>=3.5",
+  "rplidar-roboticia>=0.9.5",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

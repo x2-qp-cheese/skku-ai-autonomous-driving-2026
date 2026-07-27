@@ -1,0 +1,9 @@
+{
+  "success": false,
+  "reason": "simulation_stopped_before_parked",
+  "state": "search_first_car",
+  "pose_x_m": 0.017230660321450948,
+  "pose_y_m": 2.8231625516614938,
+  "pose_yaw_deg": -0.13641854876754692,
+  "trajectory_csv": "/parking/data/simulation/trajectory.csv"
+}

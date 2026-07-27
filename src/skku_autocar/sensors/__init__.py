@@ -4,10 +4,7 @@ from .lidar import (
     LidarPoint,
     LidarScan,
     RplidarScanner,
-    angle_in_window,
     find_lidar_port,
-    load_lidar_csv,
-    nearest_distance_mm,
 )
 
 __all__ = [
@@ -16,8 +13,5 @@ __all__ = [
     "LidarPoint",
     "LidarScan",
     "RplidarScanner",
-    "angle_in_window",
     "find_lidar_port",
-    "load_lidar_csv",
-    "nearest_distance_mm",
 ]

@@ -1,0 +1,46 @@
+Gazebo multi-robot simulator, version 11.10.2
+Copyright (C) 2012 Open Source Robotics Foundation.
+Released under the Apache 2 License.
+http://gazebosim.org
+
+[1;32m[Msg] [0m[1;32mWaiting for master.[0m[1;32m
+[0m[1;32m[0m[1;32m[0m[1;32m[Msg] [0m[1;32mConnected to gazebo master @ [0m[1;32mhttp://127.0.0.1:11345[0m[1;32m
+[0m[1;32m[0m[1;32m[0m[1;32m[Msg] [0m[1;32mPublicized address: [0m[1;32m172.17.0.2[0m[1;32m
+[0m[1;32m[0m[1;32m[0m[1;31m[Err] [RenderEngine.cc:749] [0m[1;31mCan't open display: [0m[1;31m[0m[1;31m
+[0m[1;33m[Wrn] [RenderEngine.cc:89] [0m[1;33mUnable to create X window. Rendering will be disabled
+[0m[1;33m[Wrn] [RenderEngine.cc:292] [0m[1;33mCannot initialize render engine since [0m[1;33mrender path type is NONE. Ignore this warning if[0m[1;33mrendering has been turned off on purpose.
+[0mALSA lib confmisc.c:855:(parse_card) cannot find card '0'
+ALSA lib conf.c:5178:(_snd_config_evaluate) function snd_func_card_inum returned error: No such file or directory
+ALSA lib confmisc.c:422:(snd_func_concat) error evaluating strings
+ALSA lib conf.c:5178:(_snd_config_evaluate) function snd_func_concat returned error: No such file or directory
+ALSA lib confmisc.c:1334:(snd_func_refer) error evaluating name
+ALSA lib conf.c:5178:(_snd_config_evaluate) function snd_func_refer returned error: No such file or directory
+ALSA lib conf.c:5701:(snd_config_expand) Evaluate error: No such file or directory
+ALSA lib pcm.c:2664:(snd_pcm_open_noupdate) Unknown PCM default
+AL lib: (EE) ALCplaybackAlsa_open: Could not open playback device 'default': No such file or directory
+[1;32m[Msg] [0m[1;32mLoading world file [[0m[1;32m/parking/simulation/hmobility/parking_headless.world[0m[1;32m][0m[1;32m
+[0m[1;32m[0m[1;32m[0m[1;31m[Err] [OpenAL.cc:84] [0m[1;31mUnable to open audio device[[0m[1;31mdefault[0m[1;31m]
+ Audio will be disabled.
+[0m[INFO] [1785165709.340610138] [gazebo_ros_node]: ROS was initialized without arguments.
+[INFO] [1785165729.936002633] [chassis_contact]: Publishing contact states to [/chassis_collision]
+[INFO] [1785165729.946813258] [fl_contact]: Publishing contact states to [/fl_collision]
+[INFO] [1785165729.953712008] [fr_contact]: Publishing contact states to [/fr_collision]
+[1;31m[Err] [CameraSensor.cc:125] [0m[1;31mUnable to create CameraSensor. Rendering is disabled.
+[0m[1;31m[Err] [CameraSensor.cc:125] [0m[1;31mUnable to create CameraSensor. Rendering is disabled.
+[0m[INFO] [1785165730.288425425] [simulation_pruis_hybrid_drive]: Subscribed to [/cmd_vel]
+[INFO] [1785165730.295660634] [simulation_pruis_hybrid_drive]: Advertise odometry on [/odom]
+[INFO] [1785165730.297076467] [simulation_pruis_hybrid_drive]: Advertise distance on [/distance]
+[INFO] [1785165730.301257592] [simulation_pruis_hybrid_drive]: Publishing odom transforms between [odom] and [chassis]
+[INFO] [1785165730.301426217] [simulation_pruis_hybrid_drive]: Publishing wheel transforms between [chassis], [front_right_combined_joint] and [front_right_combined_joint]
+[INFO] [1785165730.301571092] [simulation_pruis_hybrid_drive]: Publishing wheel transforms between [chassis], [front_left_combined_joint] and [front_left_combined_joint]
+[INFO] [1785165730.301695967] [simulation_pruis_hybrid_drive]: Publishing wheel transforms between [chassis], [rear_right_wheel_joint] and [rear_right_wheel_joint]
+[INFO] [1785165730.301804092] [simulation_pruis_hybrid_drive]: Publishing wheel transforms between [chassis], [rear_left_wheel_joint] and [rear_left_wheel_joint]
+[INFO] [1785165730.301887592] [simulation_pruis_hybrid_drive]: Publishing wheel transforms between [chassis], [front_right_combined_joint] and [front_right_combined_joint]
+[INFO] [1785165730.301953634] [simulation_pruis_hybrid_drive]: Publishing wheel transforms between [chassis], [front_left_combined_joint] and [front_left_combined_joint]
+[INFO] [1785165730.302013134] [simulation_pruis_hybrid_drive]: Publishing wheel transforms between [chassis], [steering_joint] and [steering_joint]
+[INFO] [1785165730.314986217] [simulation_joint_state]: Going to publish joint [front_left_combined_joint]
+[INFO] [1785165730.315604550] [simulation_joint_state]: Going to publish joint [front_right_combined_joint]
+[INFO] [1785165730.315769842] [simulation_joint_state]: Going to publish joint [rear_left_wheel_joint]
+[INFO] [1785165730.315875967] [simulation_joint_state]: Going to publish joint [rear_right_wheel_joint]
+[INFO] [1785165730.316023092] [simulation_joint_state]: Going to publish joint [steering_joint]
+[1;33m[0m[1;36m[0m[1;31m[0m[1;32m[0m

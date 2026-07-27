@@ -16,6 +16,7 @@ logs/*
 data/raw/*
 data/processed/*
 data/calibration/*
+data/parking_v2/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 !data/calibration/.gitkeep
