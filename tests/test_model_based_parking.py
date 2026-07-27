@@ -5,6 +5,7 @@ from skku_autocar.estimation.parking_geometry import ParkingGeometry
 from skku_autocar.estimation.lidar_slot_geometry import point_in_convex_polygon
 from skku_autocar.estimation.parking_lidar import LidarParkingObservation
 from skku_autocar.planning.hybrid_parking_path import (
+    HybridParkingPath,
     PathPose,
     VehicleModel,
     vehicle_footprint,
@@ -49,32 +50,85 @@ def current_pose_is_parked_bay():
     )
 
 
-def confirmed_lidar(unsafe=False):
+def confirmed_lidar(unsafe=False, first_car_confirmed=False):
     return LidarParkingObservation(
         valid=True,
         unsafe=unsafe,
         gap_found=True,
         gap_confirmed=True,
         gap_pair_observed=True,
+        first_car_confirmed=first_car_confirmed,
     )
+
+
+def missing_path(reason="no_reverse_path"):
+    return HybridParkingPath(reason=reason)
+
+
+def reverse_path():
+    goal = PathPose(900.0, -900.0, -math.pi / 2.0)
+    return HybridParkingPath(
+        found=True,
+        poses=(
+            PathPose(0.0, 0.0, 0.0),
+            PathPose(250.0, -250.0, -0.20, gear=-1, steering_rad=0.25),
+            PathPose(650.0, -650.0, -0.90, gear=-1, steering_rad=0.25),
+        ),
+        goal=goal,
+        reason="hybrid_astar_ready",
+    )
+
+
+def looping_reverse_path():
+    goal = PathPose(900.0, -900.0, -math.pi / 2.0)
+    return HybridParkingPath(
+        found=True,
+        poses=(
+            PathPose(0.0, 0.0, 0.0),
+            PathPose(-320.0, 120.0, 0.15, gear=-1, steering_rad=-0.25),
+            PathPose(-700.0, -250.0, -0.40, gear=-1, steering_rad=-0.25),
+            PathPose(900.0, -900.0, -1.57, gear=-1, steering_rad=0.25),
+        ),
+        goal=goal,
+        reason="hybrid_astar_ready",
+    )
+
+
+class FakePathPlanner:
+    def __init__(self, *paths):
+        self.paths = list(paths)
+        self.calls = []
+
+    def plan(self, goal, obstacles, *, initial_gear=0, allowed_gears=(-1, 1)):
+        self.calls.append(tuple(allowed_gears))
+        if self.paths:
+            return self.paths.pop(0)
+        return reverse_path()
 
 
 class ModelBasedParkingPlannerTest(unittest.TestCase):
     def make_planner(self, **changes):
-        config = ModelBasedParkingConfig(
+        values = dict(
             slot_lock_confirm_scans=2,
             gear_change_stop_frames=2,
             auto_exit_enabled=False,
-            emergency_stop_enabled=True,
-            **changes,
+            emergency_stop_enabled=False,
         )
+        values.update(changes)
+        config = ModelBasedParkingConfig(**values)
         return ModelBasedTParkingPlanner(
             config,
             sensor_to_rear_axle_y_back_mm=SENSOR_TO_AXLE_Y_BACK_MM,
         )
 
-    def test_motion_is_path_and_pose_driven_without_entry_seconds(self):
-        planner = self.make_planner()
+    def test_entry_setup_left_until_reverse_only_path_is_available(self):
+        planner = self.make_planner(
+            slot_lock_confirm_scans=1,
+            entry_setup_path_confirm_scans=1,
+            gear_change_stop_frames=1,
+        )
+        fake = FakePathPlanner(missing_path(), reverse_path())
+        planner.path_planner = fake
         geometry = ParkingGeometry(
             found=True,
             has_side_pair=True,
@@ -85,23 +139,276 @@ class ModelBasedParkingPlannerTest(unittest.TestCase):
         polygon = right_bay()
         planner.start(0.0)
 
-        first = planner.update(geometry, lidar, polygon, 0.1)
-        second = planner.update(geometry, lidar, polygon, 0.2)
-        armed = planner.update(geometry, lidar, polygon, 0.3)
-        settle_one = planner.update(geometry, lidar, polygon, 0.4)
-        settle_two = planner.update(geometry, lidar, polygon, 0.5)
+        locked = planner.update(geometry, lidar, polygon, 0.1)
+        armed_setup = planner.update(geometry, lidar, polygon, 0.2)
+        setup = planner.update(geometry, lidar, polygon, 0.3)
+        armed_reverse = planner.update(geometry, lidar, polygon, 0.4)
+        settle = planner.update(geometry, lidar, polygon, 0.5)
         moving = planner.update(geometry, lidar, polygon, 0.6)
 
-        self.assertEqual(first.state, ParkingState.TRACK_GAP)
-        self.assertEqual(second.state, ParkingState.VERIFY_SLOT_BOX)
-        self.assertEqual(armed.state, ParkingState.FOLLOW_ENTRY_CURVE)
-        self.assertEqual(settle_one.command.speed, 0)
-        self.assertEqual(settle_two.command.speed, 0)
-        self.assertGreater(moving.command.speed, 0)
-        self.assertIsNotNone(moving.world_path)
-        self.assertTrue(moving.world_path.found)
+        self.assertEqual(locked.state, ParkingState.VERIFY_SLOT_BOX)
+        self.assertEqual(armed_setup.state, ParkingState.ENTRY_SETUP)
+        self.assertEqual(setup.state, ParkingState.ENTRY_SETUP)
+        self.assertGreater(setup.command.speed, 0)
+        self.assertLess(setup.command.steering, 0)
+        self.assertIn("entry_setup_left", setup.reason)
+        self.assertEqual(armed_reverse.state, ParkingState.FOLLOW_ENTRY_CURVE)
+        self.assertIn("reverse_only", armed_reverse.reason)
+        self.assertEqual(settle.command.speed, 0)
+        self.assertLess(moving.command.speed, 0)
+        self.assertTrue(all(call == (-1,) for call in fake.calls))
 
-    def test_front_center_sensor_latches_emergency_stop(self):
+    def test_entry_setup_rejects_looping_reverse_path(self):
+        planner = self.make_planner(
+            slot_lock_confirm_scans=1,
+            entry_setup_path_confirm_scans=1,
+        )
+        fake = FakePathPlanner(looping_reverse_path())
+        planner.path_planner = fake
+        geometry = ParkingGeometry(
+            found=True,
+            has_side_pair=True,
+            has_back_line=True,
+            confidence=0.95,
+        )
+        lidar = confirmed_lidar()
+        polygon = right_bay()
+        planner.start(0.0)
+
+        planner.update(geometry, lidar, polygon, 0.1)
+        planner.update(geometry, lidar, polygon, 0.2)
+        rejected = planner.update(geometry, lidar, polygon, 0.3)
+
+        self.assertEqual(rejected.state, ParkingState.ENTRY_SETUP)
+        self.assertGreater(rejected.command.speed, 0)
+        self.assertLess(rejected.command.steering, 0)
+        self.assertIn("reverse_path_moves_left_of_vehicle", rejected.reason)
+
+    def test_right_ultrasonic_first_car_lost_starts_entry_setup(self):
+        planner = self.make_planner(
+            slot_lock_confirm_scans=5,
+            right_ultrasonic_slot_confirm_enabled=True,
+            right_ultrasonic_confirm_scans=2,
+            right_ultrasonic_lidar_fallback_scans=99,
+            right_ultrasonic_first_car_speed=50,
+        )
+        geometry = ParkingGeometry(found=True, confidence=0.95)
+        lidar = confirmed_lidar(first_car_confirmed=True)
+        polygon = right_bay()
+        planner.start(0.0)
+
+        first_close = planner.update(
+            geometry,
+            lidar,
+            polygon,
+            0.1,
+            right_ultrasonic_mm=950.0,
+        )
+        first_open = planner.update(
+            geometry,
+            lidar,
+            polygon,
+            0.2,
+            right_ultrasonic_mm=None,
+        )
+
+        self.assertEqual(first_close.state, ParkingState.TRACK_GAP)
+        self.assertEqual(first_close.command.speed, 50)
+        self.assertEqual(first_open.state, ParkingState.ENTRY_SETUP)
+        self.assertIn("first_car_lost", first_open.reason)
+
+    def test_lidar_gap_does_not_lock_before_ultrasonic_open_gate(self):
+        planner = self.make_planner(
+            slot_lock_confirm_scans=1,
+            right_ultrasonic_slot_confirm_enabled=True,
+            right_ultrasonic_lidar_fallback_scans=1,
+            right_ultrasonic_first_car_speed=50,
+        )
+        geometry = ParkingGeometry(found=True, confidence=0.95)
+        lidar = confirmed_lidar(first_car_confirmed=True)
+        polygon = right_bay()
+        planner.start(0.0)
+
+        for index in range(5):
+            plan = planner.update(
+                geometry,
+                lidar,
+                polygon,
+                0.1 + 0.1 * index,
+                right_ultrasonic_mm=950.0,
+            )
+
+        self.assertEqual(plan.state, ParkingState.TRACK_GAP)
+        self.assertEqual(plan.command.speed, 50)
+        self.assertNotIn("slot_pose_locked", plan.reason)
+
+    def test_right_ultrasonic_close_before_open_gap_slows_until_lost(self):
+        planner = self.make_planner(
+            slot_lock_confirm_scans=5,
+            right_ultrasonic_slot_confirm_enabled=True,
+            right_ultrasonic_confirm_scans=1,
+            right_ultrasonic_lidar_fallback_scans=99,
+            right_ultrasonic_first_car_speed=50,
+        )
+        geometry = ParkingGeometry(found=True, confidence=0.95)
+        lidar = confirmed_lidar(first_car_confirmed=True)
+        polygon = right_bay()
+        planner.start(0.0)
+
+        first_close = planner.update(
+            geometry,
+            lidar,
+            polygon,
+            0.1,
+            right_ultrasonic_mm=950.0,
+        )
+        still_close = planner.update(
+            geometry,
+            lidar,
+            polygon,
+            0.2,
+            right_ultrasonic_mm=950.0,
+        )
+        first_open = planner.update(
+            geometry,
+            lidar,
+            polygon,
+            0.3,
+            right_ultrasonic_mm=None,
+        )
+
+        self.assertEqual(first_close.state, ParkingState.TRACK_GAP)
+        self.assertEqual(still_close.state, ParkingState.TRACK_GAP)
+        self.assertEqual(first_close.command.speed, 50)
+        self.assertEqual(still_close.command.speed, 50)
+        self.assertEqual(first_open.state, ParkingState.ENTRY_SETUP)
+        self.assertIn("first_car_lost", first_open.reason)
+
+    def test_ultrasonic_first_car_lost_starts_entry_setup_before_slot_pose(self):
+        planner = self.make_planner(
+            slot_lock_confirm_scans=5,
+            right_ultrasonic_slot_confirm_enabled=True,
+            right_ultrasonic_confirm_scans=1,
+            right_ultrasonic_lidar_fallback_scans=99,
+            entry_setup_speed=90,
+        )
+        geometry = ParkingGeometry(found=False)
+        lidar = LidarParkingObservation(
+            valid=True,
+            first_car_confirmed=True,
+            first_car_seen=True,
+        )
+        planner.start(0.0)
+
+        planner.update(
+            geometry,
+            lidar,
+            None,
+            0.1,
+            right_ultrasonic_mm=950.0,
+        )
+        first_open = planner.update(
+            geometry,
+            lidar,
+            None,
+            0.2,
+            right_ultrasonic_mm=None,
+        )
+        waiting_slot_pose = planner.update(
+            geometry,
+            lidar,
+            None,
+            0.3,
+            right_ultrasonic_mm=None,
+        )
+
+        self.assertEqual(first_open.state, ParkingState.ENTRY_SETUP)
+        self.assertGreater(first_open.command.speed, 0)
+        self.assertLess(first_open.command.steering, 0)
+        self.assertEqual(waiting_slot_pose.state, ParkingState.ENTRY_SETUP)
+        self.assertEqual(waiting_slot_pose.command.speed, 90)
+        self.assertIn("until_two_lidar_cars_confirmed", waiting_slot_pose.reason)
+
+    def test_entry_setup_keeps_moving_on_stale_lidar_until_lidar_confirms_slot(self):
+        planner = self.make_planner(
+            slot_lock_confirm_scans=5,
+            right_ultrasonic_slot_confirm_enabled=True,
+            entry_setup_speed=90,
+        )
+        geometry = ParkingGeometry(found=False)
+        lidar = LidarParkingObservation(valid=True)
+        planner.start(0.0)
+        planner.update(
+            geometry,
+            lidar,
+            None,
+            0.1,
+            right_ultrasonic_mm=950.0,
+        )
+        planner.update(
+            geometry,
+            lidar,
+            None,
+            0.2,
+            right_ultrasonic_mm=None,
+        )
+
+        moving = planner.update(
+            geometry,
+            LidarParkingObservation(valid=False, reason="stale_scan"),
+            None,
+            0.3,
+        )
+
+        self.assertEqual(moving.state, ParkingState.ENTRY_SETUP)
+        self.assertEqual(moving.command.speed, 90)
+        self.assertIn("until_two_lidar_cars_confirmed", moving.reason)
+
+    def test_entry_setup_does_not_arm_reverse_from_camera_polygon_without_lidar_gap(self):
+        planner = self.make_planner(
+            slot_lock_confirm_scans=5,
+            right_ultrasonic_slot_confirm_enabled=True,
+            entry_setup_speed=90,
+        )
+        geometry = ParkingGeometry(found=True, confidence=0.95)
+        lidar = LidarParkingObservation(valid=True)
+        polygon = right_bay()
+        planner.start(0.0)
+        planner.update(
+            geometry,
+            lidar,
+            polygon,
+            0.1,
+            right_ultrasonic_mm=950.0,
+        )
+        planner.update(
+            geometry,
+            lidar,
+            polygon,
+            0.2,
+            right_ultrasonic_mm=None,
+        )
+        triggered = planner.update(
+            geometry,
+            lidar,
+            polygon,
+            0.3,
+            right_ultrasonic_mm=None,
+        )
+        still_setup = planner.update(
+            geometry,
+            lidar,
+            polygon,
+            0.4,
+            right_ultrasonic_mm=None,
+        )
+
+        self.assertEqual(triggered.state, ParkingState.ENTRY_SETUP)
+        self.assertEqual(still_setup.state, ParkingState.ENTRY_SETUP)
+        self.assertGreater(still_setup.command.speed, 0)
+        self.assertIn("until_two_lidar_cars_confirmed", still_setup.reason)
+
+    def test_front_center_sensor_no_longer_latches_emergency_stop(self):
         planner = self.make_planner()
         planner.start(0.0)
 
@@ -113,11 +420,14 @@ class ModelBasedParkingPlannerTest(unittest.TestCase):
             front_center_ultrasonic_mm=90.0,
         )
 
-        self.assertEqual(plan.state, ParkingState.EMERGENCY_STOP)
-        self.assertEqual(plan.command.speed, 0)
+        self.assertEqual(plan.state, ParkingState.SEARCH_CARS)
+        self.assertGreater(plan.command.speed, 0)
 
     def test_parking_completion_requires_pose_and_full_footprint(self):
-        planner = self.make_planner(parking_complete_confirm_scans=2)
+        planner = self.make_planner(
+            parking_complete_confirm_scans=2,
+            entry_setup_enabled=False,
+        )
         geometry = ParkingGeometry(
             found=True,
             has_side_pair=True,

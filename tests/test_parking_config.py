@@ -20,7 +20,7 @@ class ParkingConfigTest(unittest.TestCase):
     def test_repository_parking_config_loads_nested_rois(self):
         config = load_parking_config(str(ROOT / "configs" / "parking.json"))
 
-        self.assertEqual(config.yolo.model_path, "trained_model/parking_best.pt")
+        self.assertEqual(config.yolo.model_path, "trained_model/0725best.pt")
         self.assertEqual(config.rear_camera.index, 1)
         self.assertEqual(config.front_camera.index, 0)
         self.assertEqual(config.geometry.min_confirm_frames, 3)
@@ -29,11 +29,65 @@ class ParkingConfigTest(unittest.TestCase):
         self.assertEqual(config.vehicle.wheelbase_mm, 620.0)
         self.assertEqual(config.vehicle.width_mm, 600.0)
         self.assertEqual(config.vehicle.length_mm, 1000.0)
+        self.assertEqual(config.vehicle.collision_clearance_mm, 40.0)
         self.assertEqual(config.hybrid_path.steering_samples, 3)
         self.assertEqual(config.hybrid_path.goal_position_tolerance_mm, 90.0)
-        self.assertTrue(config.model_planner.emergency_stop_enabled)
+        self.assertFalse(config.model_planner.emergency_stop_enabled)
+        self.assertEqual(config.model_planner.search_speed, 90)
+        self.assertEqual(config.model_planner.gap_tracking_speed, 90)
+        self.assertEqual(config.model_planner.maneuver_forward_speed, 90)
+        self.assertEqual(config.model_planner.maneuver_reverse_speed, -90)
+        self.assertEqual(config.model_planner.final_reverse_speed, -60)
+        self.assertEqual(config.model_planner.straight_steering_trim, -33)
         self.assertEqual(config.model_planner.park_hold_s, 3.4)
         self.assertEqual(config.model_planner.exit_lane_advance_mm, 1200.0)
+        self.assertTrue(config.model_planner.lidar_only_enabled)
+        self.assertEqual(
+            config.model_planner.lidar_first_car_gate_min_x_mm,
+            350.0,
+        )
+        self.assertEqual(
+            config.model_planner.lidar_first_car_gate_max_x_mm,
+            1100.0,
+        )
+        self.assertEqual(
+            config.model_planner.lidar_first_car_confirm_scans,
+            3,
+        )
+        self.assertEqual(
+            config.model_planner.lidar_first_car_lost_scans,
+            6,
+        )
+        self.assertEqual(config.model_planner.lidar_first_car_speed, 50)
+        self.assertFalse(
+            config.model_planner.right_ultrasonic_slot_confirm_enabled
+        )
+        self.assertEqual(config.model_planner.right_ultrasonic_first_car_max_mm, 1100.0)
+        self.assertEqual(config.model_planner.right_ultrasonic_open_gap_min_mm, 1300.0)
+        self.assertEqual(config.model_planner.right_ultrasonic_open_rise_min_mm, 55.0)
+        self.assertEqual(config.model_planner.right_ultrasonic_open_confirm_scans, 3)
+        self.assertEqual(config.model_planner.right_ultrasonic_second_car_max_mm, 1100.0)
+        self.assertEqual(config.model_planner.right_ultrasonic_confirm_scans, 2)
+        self.assertEqual(config.model_planner.right_ultrasonic_lidar_fallback_scans, 6)
+        self.assertTrue(config.model_planner.right_ultrasonic_early_entry_setup)
+        self.assertTrue(config.model_planner.right_ultrasonic_entry_on_first_car_lost)
+        self.assertEqual(config.model_planner.right_ultrasonic_first_car_speed, 50)
+        self.assertTrue(config.model_planner.entry_setup_enabled)
+        self.assertEqual(config.model_planner.entry_setup_speed, 90)
+        self.assertEqual(config.model_planner.entry_setup_align_speed, 50)
+        self.assertEqual(config.model_planner.entry_setup_steering, -150)
+        self.assertEqual(config.model_planner.entry_setup_path_confirm_scans, 3)
+        self.assertEqual(config.model_planner.entry_setup_max_goal_jump_mm, 180.0)
+        self.assertEqual(config.model_planner.entry_setup_max_heading_jump_deg, 12.0)
+        self.assertEqual(config.model_planner.entry_setup_goal_max_distance_mm, 3500.0)
+        self.assertTrue(config.model_planner.parking_reverse_only)
+        self.assertEqual(config.model_planner.reverse_path_max_length_mm, 4200.0)
+        self.assertEqual(config.model_planner.reverse_path_max_extra_ratio, 1.65)
+        self.assertEqual(config.model_planner.reverse_path_max_left_mm, 250.0)
+        self.assertEqual(config.model_planner.reverse_path_max_forward_mm, 300.0)
+        self.assertEqual(config.model_planner.reverse_path_feedback_blend, 0.20)
+        self.assertEqual(config.model_planner.reverse_collision_hold_mm, 300.0)
+        self.assertEqual(config.model_planner.reverse_collision_release_mm, 380.0)
         self.assertFalse(config.lidar.clockwise_angles)
         self.assertEqual(config.lidar.angle_offset_deg, -90.0)
         self.assertGreater(
@@ -41,29 +95,33 @@ class ParkingConfigTest(unittest.TestCase):
             config.lidar.car_detection_roi.x_min_mm,
         )
         self.assertEqual(config.lidar.quality_min, 1)
-        self.assertEqual(config.lidar.car_detection_roi.x_min_mm, 250.0)
-        self.assertEqual(config.lidar.car_detection_roi.x_max_mm, 4000.0)
-        self.assertEqual(config.lidar.car_detection_roi.y_back_max_mm, 1800.0)
+        self.assertEqual(config.lidar.car_detection_roi.x_min_mm, -2200.0)
+        self.assertEqual(config.lidar.car_detection_roi.x_max_mm, 3000.0)
+        self.assertEqual(config.lidar.car_detection_roi.y_back_min_mm, -1500.0)
+        self.assertEqual(config.lidar.car_detection_roi.y_back_max_mm, 3500.0)
         self.assertIsNotNone(config.lidar.slot_tracking_roi)
         self.assertEqual(config.lidar.slot_tracking_roi.x_min_mm, -2200.0)
-        self.assertEqual(config.lidar.slot_tracking_roi.x_max_mm, 4200.0)
+        self.assertEqual(config.lidar.slot_tracking_roi.x_max_mm, 3000.0)
+        self.assertEqual(config.lidar.slot_tracking_roi.y_back_min_mm, -1500.0)
+        self.assertEqual(config.lidar.slot_tracking_roi.y_back_max_mm, 3800.0)
         self.assertEqual(config.lidar.car_cluster_radius_mm, 350.0)
         self.assertEqual(config.lidar.car_cluster_min_points, 3)
-        self.assertEqual(config.lidar.detection_accumulation_scans, 3)
+        self.assertEqual(config.lidar.detection_accumulation_scans, 2)
         self.assertEqual(config.lidar.gap_cluster_min_points, 5)
         self.assertEqual(config.lidar.gap_cluster_min_scans, 2)
         self.assertEqual(config.lidar.gap_cluster_min_span_mm, 80.0)
+        self.assertEqual(config.lidar.gap_cluster_max_span_mm, 1500.0)
         self.assertEqual(config.lidar.gap_pair_min_points, 10)
-        self.assertEqual(config.lidar.gap_pair_max_lateral_offset_mm, 450.0)
-        self.assertEqual(config.lidar.gap_pair_min_longitudinal_alignment, 0.82)
+        self.assertEqual(config.lidar.gap_pair_max_lateral_offset_mm, 1500.0)
+        self.assertEqual(config.lidar.gap_pair_min_longitudinal_alignment, 0.45)
         self.assertEqual(config.lidar.gap_center_x_min_mm, 0.0)
         self.assertEqual(config.lidar.gap_center_y_back_min_mm, 200.0)
         self.assertEqual(config.lidar.gap_confirm_scans, 2)
         self.assertEqual(config.lidar.gap_candidate_hold_s, 0.45)
-        self.assertTrue(config.lidar.gap_single_cluster_track_enabled)
+        self.assertFalse(config.lidar.gap_single_cluster_track_enabled)
         self.assertEqual(config.lidar.gap_single_cluster_max_edge_jump_mm, 700.0)
-        self.assertEqual(config.lidar.gap_coast_scans, 15)
-        self.assertTrue(config.lidar.gap_hold_confirmed_until_reset)
+        self.assertEqual(config.lidar.gap_coast_scans, 3)
+        self.assertFalse(config.lidar.gap_hold_confirmed_until_reset)
         self.assertEqual(config.lidar.gap_orientation_smooth_alpha, 0.25)
         self.assertEqual(config.lidar.gap_max_orientation_jump_deg, 35.0)
         self.assertGreater(config.lidar.expected_observed_gap_mm, config.lidar.parking_space_width_mm)
@@ -71,8 +129,8 @@ class ParkingConfigTest(unittest.TestCase):
         self.assertGreater(config.path.lookahead_px, 0.0)
         self.assertEqual(config.runtime.lidar_display_rotation_deg, 0.0)
         self.assertFalse(config.runtime.auto_start)
-        self.assertTrue(config.runtime.camera_enabled)
-        self.assertTrue(config.runtime.front_camera_enabled)
+        self.assertFalse(config.runtime.camera_enabled)
+        self.assertFalse(config.runtime.front_camera_enabled)
         self.assertEqual(config.fusion.camera_min_confidence, 0.35)
         self.assertEqual(config.fusion.max_heading_disagreement_deg, 25.0)
         self.assertTrue(config.fusion.prefer_camera_back_line)
@@ -87,6 +145,7 @@ class ParkingConfigTest(unittest.TestCase):
         self.assertEqual(config.lidar.first_car_min_scans, 2)
         self.assertEqual(config.lidar.first_car_min_span_mm, 80.0)
         self.assertEqual(config.lidar.first_car_max_center_jump_mm, 450.0)
+        self.assertEqual(config.lidar.stale_after_s, 0.45)
         self.assertFalse(config.planner.first_car_preemptive_turn_enabled)
         self.assertFalse(config.planner.first_car_only_prealign_enabled)
         self.assertEqual(config.planner.start_forward_s, 0.0)
@@ -148,9 +207,17 @@ class ParkingConfigTest(unittest.TestCase):
         self.assertEqual(tuple(config.bev.src_top_right), (0.82, 0.56))
         self.assertTrue(config.runtime.locked_slot_tracking_enabled)
         self.assertEqual(config.runtime.locked_slot_min_points, 8)
-        self.assertEqual(config.runtime.locked_slot_max_range_mm, 4500.0)
+        self.assertEqual(config.runtime.locked_slot_max_range_mm, 3500.0)
         self.assertEqual(config.runtime.locked_slot_trim_ratio, 0.65)
-        self.assertEqual(config.runtime.locked_slot_max_hold_scans, 3)
+        self.assertEqual(
+            config.runtime.locked_slot_max_translation_per_scan_mm,
+            120.0,
+        )
+        self.assertEqual(
+            config.runtime.locked_slot_max_rotation_per_scan_deg,
+            8.0,
+        )
+        self.assertEqual(config.runtime.locked_slot_max_hold_scans, 12)
 
     def test_recording_zip_finds_video_and_lidar_csv(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -229,6 +296,9 @@ class ParkingConfigTest(unittest.TestCase):
             "--maneuver-forward-speed", "48",
             "--maneuver-reverse-speed", "-46",
             "--final-reverse-speed", "-32",
+            "--right-ultrasonic-first-car-max-cm", "105",
+            "--right-ultrasonic-open-gap-min-cm", "118",
+            "--right-ultrasonic-open-confirm-scans", "3",
             "--no-auto-exit",
         ])
         original = load_parking_config(str(ROOT / "configs" / "parking.json"))
@@ -273,6 +343,18 @@ class ParkingConfigTest(unittest.TestCase):
         self.assertEqual(config.model_planner.maneuver_forward_speed, 48)
         self.assertEqual(config.model_planner.maneuver_reverse_speed, -46)
         self.assertEqual(config.model_planner.final_reverse_speed, -32)
+        self.assertEqual(
+            config.model_planner.right_ultrasonic_first_car_max_mm,
+            1050.0,
+        )
+        self.assertEqual(
+            config.model_planner.right_ultrasonic_open_gap_min_mm,
+            1180.0,
+        )
+        self.assertEqual(
+            config.model_planner.right_ultrasonic_open_confirm_scans,
+            3,
+        )
         self.assertEqual(config.model_planner.park_hold_s, 3.5)
         self.assertEqual(config.model_planner.exit_speed, 20)
         self.assertFalse(config.model_planner.auto_exit_enabled)

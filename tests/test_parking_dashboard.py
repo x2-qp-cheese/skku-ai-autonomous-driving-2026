@@ -46,7 +46,7 @@ class ParkingDashboardTest(unittest.TestCase):
         self.assertEqual(args.source, "auto")
         self.assertEqual(args.front_source, "auto")
 
-    def test_slot_lock_starts_on_pair_candidate_before_confirmation(self):
+    def test_slot_lock_requires_confirmed_pair_during_entry_setup(self):
         candidate = LidarParkingObservation(
             valid=True,
             gap_found=True,
@@ -54,7 +54,18 @@ class ParkingDashboardTest(unittest.TestCase):
             gap_confirmed=False,
         )
 
-        self.assertTrue(slot_lock_requested(ParkingState.SEARCH_CARS, candidate))
+        self.assertFalse(slot_lock_requested(ParkingState.SEARCH_CARS, candidate))
+        self.assertFalse(slot_lock_requested(ParkingState.ENTRY_SETUP, candidate))
+        confirmed = LidarParkingObservation(
+            valid=True,
+            gap_found=True,
+            gap_pair_observed=True,
+            gap_confirmed=True,
+            second_car_seen=True,
+        )
+        self.assertTrue(
+            slot_lock_requested(ParkingState.ENTRY_SETUP, confirmed)
+        )
 
     def test_timestamp_path_avoids_collision(self):
         with tempfile.TemporaryDirectory() as directory:

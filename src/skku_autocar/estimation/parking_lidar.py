@@ -28,7 +28,7 @@ class RectangleRoi:
 
 @dataclass(frozen=True)
 class CarCluster:
-    """One parked-car surface observed in the side-facing LiDAR ROI."""
+    """One parked-car surface observed in the rear parking LiDAR ROI."""
 
     point_count: int
     x_min_mm: float
@@ -71,13 +71,14 @@ class LidarParkingConfig:
     sensor_x_right_mm: float = 0.0
     sensor_y_forward_mm: float = 0.0
 
-    # This ROI looks sideways at the row of parked cars. It is not a parking
-    # line or a claim that the bay interior is empty.
-    car_detection_roi: RectangleRoi = RectangleRoi(250.0, 2600.0, -2500.0, 2500.0)
+    # This ROI watches the rear/rear-right parking area.  In LiDAR-only mode a
+    # dense first-car return followed by a debounced loss gates the left setup;
+    # a bay still requires a fresh two-car decision triangle after that turn.
+    car_detection_roi: RectangleRoi = RectangleRoi(-1000.0, 2800.0, -1200.0, 3500.0)
     # Once the slot is confirmed, the ego vehicle may rotate enough that one
-    # bordering car moves out of the initial right-side ROI. Use this wider ROI
-    # only for tracking an already confirmed slot.
-    slot_tracking_roi: Optional[RectangleRoi] = RectangleRoi(-1800.0, 2600.0, -2500.0, 2500.0)
+    # bordering car moves out of the initial rear ROI. Use this wider ROI only
+    # for tracking an already confirmed slot.
+    slot_tracking_roi: Optional[RectangleRoi] = RectangleRoi(-2200.0, 3000.0, -1500.0, 3800.0)
     # Separate collision envelope used while reversing.
     safety_roi: RectangleRoi = RectangleRoi(-300.0, 300.0, 100.0, 450.0)
     min_observed_points: int = 5
@@ -92,9 +93,16 @@ class LidarParkingConfig:
     gap_cluster_min_points: int = 5
     gap_cluster_min_scans: int = 1
     gap_cluster_min_span_mm: float = 0.0
+    # A parked toy car is about 1 m long. A much longer cluster is normally a
+    # rear wall or guard rail and must never become one side of a parking bay.
+    gap_cluster_max_span_mm: float = 1500.0
     gap_pair_min_points: int = 10
     gap_pair_max_lateral_offset_mm: float = 1.0e9
     gap_pair_min_longitudinal_alignment: float = 0.0
+    # The LiDAR vertex must project between the two inner car surfaces.  This
+    # is the geometric validity condition for the decision triangle and keeps
+    # a farther pair of reflections from replacing the two cars beside us.
+    gap_pair_lidar_projection_margin_mm: float = 120.0
 
     # Official painted bay dimensions. The observed surface gap is larger
     # because LiDAR sees the neighboring vehicles, not the painted boundaries.
@@ -103,13 +111,13 @@ class LidarParkingConfig:
     expected_observed_gap_mm: float = 1375.0
     observed_gap_min_mm: float = 1100.0
     observed_gap_max_mm: float = 1650.0
-    # The mission slot starts on the vehicle-right, although either bordering
-    # car may move into the left half of the vehicle frame while turning.
+    # The mission slot starts on the vehicle-right, but its live centre crosses
+    # x=0 as the vehicle rotates and enters between the bordering cars.
     gap_center_x_min_mm: float = 0.0
     gap_center_y_back_min_mm: float = 200.0
     gap_confirm_scans: int = 2
     gap_candidate_hold_s: float = 0.45
-    gap_single_cluster_track_enabled: bool = True
+    gap_single_cluster_track_enabled: bool = False
     gap_single_cluster_max_edge_jump_mm: float = 700.0
     gap_coast_scans: int = 15
     # Keep displaying the last confirmed slot for the current mission when
@@ -846,9 +854,11 @@ def is_gap_cluster_eligible(
     config: LidarParkingConfig,
 ) -> bool:
     min_points = max(1, config.car_cluster_min_points, config.gap_cluster_min_points)
+    maximum_span = max(0.0, config.gap_cluster_max_span_mm)
     return (
         cluster.point_count >= min_points
         and cluster.scan_count >= max(1, config.gap_cluster_min_scans)
+        and (maximum_span <= 0.0 or cluster.max_span_mm <= maximum_span)
     )
 
 
@@ -957,6 +967,24 @@ def choose_gap(
             first_edge_y = first_center_y + unit_y * first_radius
             second_edge_x = second_center_x - unit_x * second_radius
             second_edge_y = second_center_y - unit_y * second_radius
+            # Let s=0 be the first inner surface and s=width the second.  The
+            # perpendicular projection of the rear LiDAR onto this base must
+            # lie inside it (with a small noise margin).  In 205519 the real
+            # adjacent pair satisfied this while the false pair to the right
+            # had the LiDAR entirely outside its base segment.
+            lidar_projection = (
+                -first_edge_x * unit_x - first_edge_y * unit_y
+            )
+            projection_margin = max(
+                0.0,
+                config.gap_pair_lidar_projection_margin_mm,
+            )
+            if not (
+                -projection_margin
+                <= lidar_projection
+                <= width + projection_margin
+            ):
+                continue
             center_x = (first_edge_x + second_edge_x) / 2.0
             center_y = (first_edge_y + second_edge_y) / 2.0
             if center_x < config.gap_center_x_min_mm:
@@ -1057,6 +1085,9 @@ def infer_dynamic_slot_polygon(
 
     if (
         not observation.gap_found
+        or not observation.gap_pair_observed
+        or not observation.second_car_seen
+        or observation.coasted
         or observation.gap_near_edge_x_right_mm is None
         or observation.gap_near_edge_y_back_mm is None
         or observation.gap_far_edge_x_right_mm is None

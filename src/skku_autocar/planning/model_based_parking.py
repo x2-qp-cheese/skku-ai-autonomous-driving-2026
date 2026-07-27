@@ -1,24 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import atan2, cos, degrees, hypot, sin
+from math import atan, atan2, degrees, hypot
 from typing import Optional, Sequence, Tuple
 
+from ..estimation.lidar_triangulation import (
+    LidarDecisionTriangle,
+    decision_triangle_from_observation,
+)
 from ..estimation.parking_geometry import ParkingGeometry
 from ..estimation.parking_lidar import LidarParkingObservation
 from ..types import ControlCommand
-from .hybrid_parking_path import (
-    HybridAStarParkingPathPlanner,
-    HybridParkingPath,
-    HybridPathConfig,
-    SlotManeuverModel,
-    PathPose,
-    VehicleModel,
-    build_slot_maneuver_model,
-    pure_pursuit_curvature,
-    steering_command_for_curvature,
-    wrap_angle,
-)
+from .hybrid_parking_path import HybridPathConfig, VehicleModel
 from .t_parking_planner import ParkingPlan, ParkingState
 
 
@@ -27,63 +20,102 @@ Point = Tuple[float, float]
 
 @dataclass(frozen=True)
 class ModelBasedParkingConfig:
-    """Closed-loop mission policy.
+    """LiDAR-only reactive triangulation controller parameters."""
 
-    Durations are used only for a mandated stationary hold and fault
-    watchdogs. Every moving transition is based on the live slot pose, planned
-    path, vehicle footprint, or a distance sensor.
-    """
-
-    search_speed: int = 55
-    gap_tracking_speed: int = 42
-    maneuver_forward_speed: int = 58
-    maneuver_reverse_speed: int = -55
-    final_reverse_speed: int = -38
+    search_speed: int = 90
+    gap_tracking_speed: int = 50
+    maneuver_forward_speed: int = 90
+    maneuver_reverse_speed: int = -90
+    final_reverse_speed: int = -60
     exit_speed: int = 50
-    straight_steering_trim: int = -30
+    straight_steering_trim: int = -33
     max_steering_command: int = 150
-    forward_lookahead_mm: float = 430.0
-    reverse_lookahead_mm: float = 340.0
-    final_slow_distance_mm: float = 550.0
-    slot_lock_confirm_scans: int = 3
-    path_failure_limit: int = 5
+
+    lidar_first_car_gate_min_x_mm: float = 350.0
+    lidar_first_car_gate_max_x_mm: float = 1100.0
+    lidar_first_car_gate_max_range_mm: float = 3000.0
+    lidar_first_car_confirm_scans: int = 3
+    lidar_first_car_lost_scans: int = 6
+    lidar_first_car_speed: int = 50
+
+    entry_setup_speed: int = 90
+    entry_setup_steering: int = -150
+    pair_confirm_scans: int = 3
     gear_change_stop_frames: int = 2
+
+    reverse_lookahead_mm: float = 650.0
+    # Signed perpendicular distance of the rear LiDAR from the line joining
+    # the two inner car edges. In 205519 a correctly inserted vehicle put this
+    # line almost exactly through the LiDAR origin.
+    target_sensor_depth_mm: float = 0.0
+    final_slow_distance_mm: float = 550.0
+    final_slow_heading_deg: float = 15.0
+    final_slow_lateral_mm: float = 180.0
+    steering_filter_alpha: float = 0.40
+    steering_max_delta_per_scan: int = 35
+
+    parking_complete_lateral_mm: float = 120.0
+    parking_complete_heading_deg: float = 8.0
+    parking_complete_depth_tolerance_mm: float = 90.0
     parking_complete_confirm_scans: int = 3
-    goal_position_tolerance_mm: float = 115.0
-    goal_heading_tolerance_deg: float = 7.0
-    minimum_inside_ratio: float = 0.96
-    ultrasonic_kp_steering_per_mm: float = 0.18
-    ultrasonic_max_correction: int = 28
-    ultrasonic_balance_enable_inside_ratio: float = 0.45
-    ultrasonic_max_valid_mm: float = 2500.0
-    ultrasonic_stale_after_s: float = 0.8
-    ultrasonic_emergency_mm: float = 100.0
-    emergency_stop_enabled: bool = True
     park_hold_s: float = 3.4
-    auto_exit_enabled: bool = True
-    back_clearance_mm: float = 120.0
-    inferred_neighbor_width_mm: float = 600.0
-    back_wall_depth_mm: float = 500.0
-    exit_lane_offset_mm: float = 700.0
-    exit_lane_advance_mm: float = 1200.0
+    auto_exit_enabled: bool = False
+
     search_timeout_s: float = 60.0
     maneuver_watchdog_s: float = 75.0
-    exit_watchdog_s: float = 30.0
-    path_replan_deviation_mm: float = 260.0
+    ultrasonic_stale_after_s: float = 0.8
 
 
 @dataclass(frozen=True)
-class _SlotRelativePathPose:
-    axis_mm: float
-    depth_mm: float
-    forward_axis: float
-    forward_depth: float
-    gear: int
-    steering_rad: float
+class TriangulationControlDebug:
+    lidar_timestamp: float = 0.0
+    pair_valid: bool = False
+    car1_x_mm: Optional[float] = None
+    car1_y_back_mm: Optional[float] = None
+    car2_x_mm: Optional[float] = None
+    car2_y_back_mm: Optional[float] = None
+    entrance_x_mm: Optional[float] = None
+    entrance_y_back_mm: Optional[float] = None
+    depth_x: Optional[float] = None
+    depth_y_back: Optional[float] = None
+    gap_width_mm: Optional[float] = None
+    decision_angle_deg: Optional[float] = None
+    heading_error_deg: Optional[float] = None
+    lateral_error_mm: Optional[float] = None
+    depth_progress_mm: Optional[float] = None
+    depth_remaining_mm: Optional[float] = None
+    target_x_mm: Optional[float] = None
+    target_y_back_mm: Optional[float] = None
+    curvature_per_mm: Optional[float] = None
+    geometric_steering: Optional[int] = None
+    physical_steering: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class _LiveTriangleGeometry:
+    entrance: Point
+    axis: Point
+    depth: Point
+    lateral_error_mm: float
+    depth_progress_mm: float
+    depth_remaining_mm: float
+    heading_error_deg: float
 
 
 class ModelBasedTParkingPlanner:
-    """LiDAR-relative Hybrid A* plus pure-pursuit T-parking controller."""
+    """Park between two cars using a fresh LiDAR triangle on every scan.
+
+    No camera, ultrasonic value, locked rectangle, ICP pose, frozen path, or
+    elapsed-time driving segment participates in control.  The only moving
+    commands are:
+
+    * straight search until the first car disappears,
+    * forward-left until three fresh two-car triangles are observed,
+    * reverse pure pursuit of the live triangle centreline.
+    """
+
+    ENTRY_ACQUIRE_PAIR = "acquire_live_pair"
+    ENTRY_REVERSE_LIVE = "reverse_live_triangle"
 
     def __init__(
         self,
@@ -93,26 +125,54 @@ class ModelBasedTParkingPlanner:
         *,
         sensor_to_rear_axle_y_back_mm: float = -300.0,
     ) -> None:
+        del path_config
         self.config = config
         self.vehicle = vehicle
-        self.path_planner = HybridAStarParkingPathPlanner(vehicle, path_config)
         self.sensor_to_rear_axle_y_back_mm = float(
             sensor_to_rear_axle_y_back_mm
         )
         self.state = ParkingState.IDLE
         self._state_started_at = 0.0
-        self._slot_confirm_scans = 0
-        self._path_failures = 0
-        self._complete_scans = 0
-        self._active_gear = 0
-        self._pending_gear = 0
+        self._entry_phase = self.ENTRY_ACQUIRE_PAIR
+        self._lidar_reset_requested = False
+        self._last_lidar_timestamp: Optional[float] = None
+        self._first_car_scans = 0
+        self._first_car_seen = False
+        self._first_car_lost_scans = 0
+        self._pair_scans = 0
         self._gear_stop_frames = 0
-        self._last_path = HybridParkingPath()
-        self._slot_path: Tuple[_SlotRelativePathPose, ...] = ()
-        self._slot_path_progress = 0
-        self._slot_path_kind = ""
-        self._slot_path_cost = 0.0
-        self._slot_path_expansions = 0
+        self._complete_scans = 0
+        self._decision_triangle = LidarDecisionTriangle()
+        self._filtered_geometric_steering: Optional[float] = None
+        self._debug = TriangulationControlDebug()
+
+    @property
+    def entry_phase(self) -> str:
+        return self._entry_phase
+
+    @property
+    def decision_triangle(self) -> LidarDecisionTriangle:
+        return self._decision_triangle
+
+    @property
+    def debug_snapshot(self) -> TriangulationControlDebug:
+        return self._debug
+
+    @property
+    def lidar_slot_lock_allowed(self) -> bool:
+        return False
+
+    def accepts_lidar_slot_lock(
+        self,
+        observation: LidarParkingObservation,
+    ) -> bool:
+        del observation
+        return False
+
+    def consume_lidar_reset_request(self) -> bool:
+        requested = self._lidar_reset_requested
+        self._lidar_reset_requested = False
+        return requested
 
     def start(self, now: float) -> bool:
         if self.state not in (
@@ -146,6 +206,15 @@ class ModelBasedTParkingPlanner:
         front_center_ultrasonic_mm: Optional[float] = None,
         front_right_ultrasonic_mm: Optional[float] = None,
     ) -> ParkingPlan:
+        del (
+            geometry,
+            slot_polygon,
+            left_ultrasonic_mm,
+            right_ultrasonic_mm,
+            front_left_ultrasonic_mm,
+            front_center_ultrasonic_mm,
+            front_right_ultrasonic_mm,
+        )
         if not enabled:
             self.reset(now)
             return self._stop("parking_disabled")
@@ -153,639 +222,486 @@ class ModelBasedTParkingPlanner:
             return self._stop("waiting_for_start")
         if self.state == ParkingState.ABORTED:
             return self._stop("parking_aborted")
-        if self.state == ParkingState.EMERGENCY_STOP:
-            return self._stop("emergency_stop_latched")
-        if self.state == ParkingState.EXIT_DONE:
-            return self._stop("exit_pose_reached")
-
-        emergency = self._emergency_reason(
-            lidar,
-            left_ultrasonic_mm,
-            right_ultrasonic_mm,
-            front_left_ultrasonic_mm,
-            front_center_ultrasonic_mm,
-            front_right_ultrasonic_mm,
-        )
-        if emergency is not None:
-            self._enter(ParkingState.EMERGENCY_STOP, now)
-            return self._stop(emergency)
-
         if self.state == ParkingState.PARKED:
-            if self._state_elapsed(now) < self.config.park_hold_s:
-                return self._stop("parked_hold_3_to_5_seconds")
-            if not self.config.auto_exit_enabled:
-                return self._stop("parked_hold_complete_auto_exit_disabled")
-            self._enter(ParkingState.EXIT_RIGHT, now)
-            self._active_gear = 0
-            self._clear_slot_path()
-            return self._stop("parked_hold_complete_plan_exit")
+            return self._stop("parked_lidar_triangle_complete")
 
         if self.state in (ParkingState.SEARCH_CARS, ParkingState.TRACK_GAP):
-            return self._search_plan(lidar, slot_polygon, now)
-
-        if not lidar.valid:
-            return self._stop("waiting_for_fresh_lidar")
-        model = self._slot_model(slot_polygon)
-        if model is None:
-            self._path_failures += 1
-            if self._path_failures >= max(1, self.config.path_failure_limit):
-                return self._abort(now, "locked_slot_pose_lost")
-            return self._stop("waiting_for_locked_slot_pose")
-
-        if self.state == ParkingState.VERIFY_SLOT_BOX:
-            return self._begin_parking_path(model, now)
+            return self._search(lidar, now)
+        if self.state == ParkingState.ENTRY_SETUP:
+            return self._acquire_pair(lidar, now)
         if self.state in (
-            ParkingState.PLAN_REVERSE_PATH,
             ParkingState.FOLLOW_ENTRY_CURVE,
             ParkingState.FOLLOW_SLOT_CENTER,
         ):
-            return self._follow_parking_path(
-                model,
-                geometry,
-                lidar,
-                now,
-                left_ultrasonic_mm,
-                right_ultrasonic_mm,
-            )
-        if self.state in (ParkingState.EXIT_RIGHT, ParkingState.EXIT_STRAIGHT):
-            return self._follow_exit_path(model, now)
-        return self._abort(now, "unsupported_state:%s" % self.state.value)
+            return self._reverse_live(lidar, now)
+        return self._abort(now, "unsupported_lidar_triangle_state")
 
-    def _search_plan(
+    def _search(
         self,
         lidar: LidarParkingObservation,
-        slot_polygon: Optional[Sequence[Point]],
         now: float,
     ) -> ParkingPlan:
         if self._expired(now, self.config.search_timeout_s):
-            return self._abort(now, "slot_search_watchdog")
-        ready = (
-            lidar.valid
-            and lidar.gap_confirmed
-            and slot_polygon is not None
-            and len(slot_polygon) == 4
-        )
-        self._slot_confirm_scans = self._slot_confirm_scans + 1 if ready else 0
-        if self._slot_confirm_scans >= max(
-            1,
-            self.config.slot_lock_confirm_scans,
-        ):
-            self._enter(ParkingState.VERIFY_SLOT_BOX, now)
-            return self._stop("slot_pose_locked")
+            return self._abort(now, "lidar_search_watchdog")
         if not lidar.valid:
-            return self._stop("waiting_for_lidar_scan")
-        if lidar.gap_found:
+            return self._stop(
+                "lidar_not_fresh_hold_search:%s"
+                % (lidar.reason or "invalid_scan")
+            )
+        new_scan = self._new_scan(lidar)
+        edge_x = lidar.first_car_slot_edge_x_right_mm
+        edge_y = lidar.first_car_slot_edge_y_back_mm
+        side_car = (
+            lidar.first_car_confirmed
+            and edge_x is not None
+            and edge_y is not None
+            and self.config.lidar_first_car_gate_min_x_mm
+            <= float(edge_x)
+            <= self.config.lidar_first_car_gate_max_x_mm
+            and hypot(float(edge_x), float(edge_y))
+            <= max(1.0, self.config.lidar_first_car_gate_max_range_mm)
+        )
+
+        if not self._first_car_seen:
+            if new_scan:
+                self._first_car_scans = (
+                    self._first_car_scans + 1 if side_car else 0
+                )
+            if self._first_car_scans >= max(
+                1,
+                self.config.lidar_first_car_confirm_scans,
+            ):
+                self._first_car_seen = True
+            if not self._first_car_seen:
+                self.state = ParkingState.SEARCH_CARS
+                return self._drive(
+                    self.config.search_speed,
+                    self._straight_steering(),
+                    "lidar_search_first_car:%d/%d"
+                    % (
+                        self._first_car_scans,
+                        max(1, self.config.lidar_first_car_confirm_scans),
+                    ),
+                )
+
+        if new_scan:
+            self._first_car_lost_scans = (
+                0 if side_car else self._first_car_lost_scans + 1
+            )
+        if self._first_car_lost_scans < max(
+            1,
+            self.config.lidar_first_car_lost_scans,
+        ):
             self.state = ParkingState.TRACK_GAP
             return self._drive(
-                self.config.gap_tracking_speed,
+                abs(self.config.lidar_first_car_speed),
                 self._straight_steering(),
-                "tracking_slot_pose:%d/%d"
+                "lidar_first_car_seen_wait_open:%d/%d"
                 % (
-                    self._slot_confirm_scans,
-                    max(1, self.config.slot_lock_confirm_scans),
+                    self._first_car_lost_scans,
+                    max(1, self.config.lidar_first_car_lost_scans),
                 ),
             )
-        self.state = ParkingState.SEARCH_CARS
+
+        self._enter(ParkingState.ENTRY_SETUP, now)
+        self._entry_phase = self.ENTRY_ACQUIRE_PAIR
+        self._lidar_reset_requested = True
+        self._pair_scans = 0
+        self._decision_triangle = LidarDecisionTriangle(
+            reason="waiting_for_post_turn_live_pair"
+        )
         return self._drive(
-            self.config.search_speed,
-            self._straight_steering(),
-            "straight_search_for_two_bordering_cars",
+            abs(self.config.entry_setup_speed),
+            self._clamp(self.config.entry_setup_steering),
+            "first_car_lost_start_left_seek_live_pair",
         )
 
-    def _begin_parking_path(
+    def _acquire_pair(
         self,
-        model: SlotManeuverModel,
-        now: float,
-    ) -> ParkingPlan:
-        path = self.path_planner.plan(
-            model.parking_goal,
-            model.obstacles,
-            initial_gear=self._active_gear,
-            allowed_gears=(-1, 1),
-        )
-        self._last_path = path
-        if not path.found:
-            self._path_failures += 1
-            if self._path_failures >= max(1, self.config.path_failure_limit):
-                return self._abort(now, path.reason)
-            return self._stop(
-                "parking_path_retry:%s" % path.reason,
-                world_path=path,
-            )
-        self._path_failures = 0
-        self._freeze_path_in_slot(path, model, "parking")
-        self._enter(ParkingState.FOLLOW_ENTRY_CURVE, now)
-        return self._stop("model_path_armed", world_path=path)
-
-    def _follow_parking_path(
-        self,
-        model: SlotManeuverModel,
-        geometry: ParkingGeometry,
         lidar: LidarParkingObservation,
         now: float,
-        left_ultrasonic_mm: Optional[float],
-        right_ultrasonic_mm: Optional[float],
     ) -> ParkingPlan:
         if self._expired(now, self.config.maneuver_watchdog_s):
-            return self._abort(now, "parking_motion_watchdog")
-        if self._parking_complete(model, geometry):
-            self._complete_scans += 1
-            if self._complete_scans >= max(
-                1,
-                self.config.parking_complete_confirm_scans,
-            ):
-                self._enter(ParkingState.PARKED, now)
-                self._active_gear = 0
-                return self._stop("vehicle_inside_slot_goal_reached")
+            return self._abort(now, "triangulation_maneuver_watchdog")
+        if not lidar.valid:
+            self._pair_scans = 0
             return self._stop(
-                "parking_complete_confirming:%d/%d"
-                % (
-                    self._complete_scans,
-                    max(1, self.config.parking_complete_confirm_scans),
-                )
+                "lidar_not_fresh_hold_pair_acquire:%s"
+                % (lidar.reason or "invalid_scan")
             )
-        self._complete_scans = 0
 
-        if not geometry.found:
-            return self._stop("locked_slot_geometry_not_fresh")
-        if self._active_gear < 0 and lidar.unsafe:
-            self._enter(ParkingState.EMERGENCY_STOP, now)
-            return self._stop("rear_lidar_safety_roi_blocked")
+        triangle = decision_triangle_from_observation(lidar)
+        fresh_pair = self._fresh_pair(lidar, triangle)
+        new_scan = self._new_scan(lidar)
+        if new_scan:
+            self._pair_scans = self._pair_scans + 1 if fresh_pair else 0
+        if triangle.valid:
+            self._decision_triangle = triangle
+            self._update_debug(lidar, triangle, self._live_geometry(lidar, triangle))
 
-        path, deviation = self._path_from_live_slot(model, "parking")
-        if (
-            not path.found
-            or deviation > max(1.0, self.config.path_replan_deviation_mm)
-        ):
-            path = self.path_planner.plan(
-                model.parking_goal,
-                model.obstacles,
-                initial_gear=self._active_gear,
-                allowed_gears=(-1, 1),
-            )
-            if path.found:
-                self._freeze_path_in_slot(path, model, "parking")
-                path, deviation = self._path_from_live_slot(model, "parking")
-        self._last_path = path
-        if not path.found:
-            self._path_failures += 1
-            if self._path_failures >= max(1, self.config.path_failure_limit):
-                return self._abort(now, path.reason)
-            return self._stop(
-                "parking_replan_retry:%s" % path.reason,
-                world_path=path,
-            )
-        self._path_failures = 0
-
-        if (
-            geometry.vehicle_inside_ratio
-            >= self.config.ultrasonic_balance_enable_inside_ratio
-        ):
-            self.state = ParkingState.FOLLOW_SLOT_CENTER
-        else:
-            self.state = ParkingState.FOLLOW_ENTRY_CURVE
-        return self._path_command(
-            path,
-            model,
-            geometry,
-            left_ultrasonic_mm,
-            right_ultrasonic_mm,
-            exiting=False,
-        )
-
-    def _follow_exit_path(
-        self,
-        model: SlotManeuverModel,
-        now: float,
-    ) -> ParkingPlan:
-        if self._expired(now, self.config.exit_watchdog_s):
-            return self._abort(now, "exit_motion_watchdog")
-        if self._goal_reached(model.exit_goal):
-            self._enter(ParkingState.EXIT_DONE, now)
-            self._active_gear = 0
-            return self._stop("slot_exit_pose_reached")
-
-        path, deviation = self._path_from_live_slot(model, "exit")
-        if (
-            not path.found
-            or deviation > max(1.0, self.config.path_replan_deviation_mm)
-        ):
-            path = self.path_planner.plan(
-                model.exit_goal,
-                model.obstacles,
-                initial_gear=1,
-                allowed_gears=(1,),
-            )
-            if path.found:
-                self._freeze_path_in_slot(path, model, "exit")
-                path, deviation = self._path_from_live_slot(model, "exit")
-        self._last_path = path
-        if not path.found:
-            self._path_failures += 1
-            if self._path_failures >= max(1, self.config.path_failure_limit):
-                return self._abort(now, "exit_%s" % path.reason)
-            return self._stop(
-                "exit_path_retry:%s" % path.reason,
-                world_path=path,
-            )
-        self._path_failures = 0
-        self.state = ParkingState.EXIT_STRAIGHT
-        return self._path_command(
-            path,
-            model,
-            ParkingGeometry(),
-            None,
-            None,
-            exiting=True,
-        )
-
-    def _path_command(
-        self,
-        path: HybridParkingPath,
-        model: SlotManeuverModel,
-        geometry: ParkingGeometry,
-        left_ultrasonic_mm: Optional[float],
-        right_ultrasonic_mm: Optional[float],
-        *,
-        exiting: bool,
-    ) -> ParkingPlan:
-        requested_gear = path.first_gear
-        if not requested_gear:
-            return self._stop("path_has_no_motion", world_path=path)
-        gear_change = self._prepare_gear(requested_gear)
-        lookahead_distance = (
-            self.config.forward_lookahead_mm
-            if requested_gear > 0
-            else self.config.reverse_lookahead_mm
-        )
-        target = path.lookahead(lookahead_distance, requested_gear)
-        if target is None:
-            return self._stop("path_lookahead_missing", world_path=path)
-        curvature = pure_pursuit_curvature(target)
-        steering = steering_command_for_curvature(
-            curvature,
-            self.vehicle,
-            self.config.max_steering_command,
-        )
-        if (
-            not exiting
-            and requested_gear < 0
-            and geometry.vehicle_inside_ratio
-            >= self.config.ultrasonic_balance_enable_inside_ratio
-        ):
-            steering += self._ultrasonic_correction(
-                left_ultrasonic_mm,
-                right_ultrasonic_mm,
-            )
-        steering = int(
-            max(
-                -abs(self.config.max_steering_command),
-                min(abs(self.config.max_steering_command), steering),
-            )
-        )
-        if gear_change:
+        if self._pair_scans < max(1, self.config.pair_confirm_scans):
             return self._drive(
-                0,
-                steering,
-                "gear_change_stationary_settle:%+d" % requested_gear,
-                world_path=path,
-            )
-
-        distance = hypot(
-            model.parking_goal.x_right_mm,
-            model.parking_goal.y_forward_mm,
-        )
-        if exiting:
-            speed = abs(self.config.exit_speed)
-            reason = "follow_exit_hybrid_path"
-        elif requested_gear > 0:
-            speed = abs(self.config.maneuver_forward_speed)
-            reason = "follow_parking_setup_path_forward"
-        elif distance <= max(1.0, self.config.final_slow_distance_mm):
-            speed = -abs(self.config.final_reverse_speed)
-            reason = "follow_parking_path_final_reverse"
-        else:
-            speed = -abs(self.config.maneuver_reverse_speed)
-            reason = "follow_parking_path_reverse"
-        return self._drive(
-            speed,
-            steering,
-            "%s goal=%.0fmm head=%+.1fdeg exp=%d"
-            % (
-                reason,
-                distance,
-                degrees(model.parking_goal.heading_rad),
-                path.expansions,
-            ),
-            world_path=path,
-        )
-
-    def _prepare_gear(self, requested_gear: int) -> bool:
-        requested = 1 if requested_gear > 0 else -1
-        if self._active_gear == requested:
-            self._pending_gear = 0
-            self._gear_stop_frames = 0
-            return False
-        if self._pending_gear != requested:
-            self._pending_gear = requested
-            self._gear_stop_frames = 1
-            return True
-        self._gear_stop_frames += 1
-        if self._gear_stop_frames <= max(1, self.config.gear_change_stop_frames):
-            return True
-        self._active_gear = requested
-        self._pending_gear = 0
-        self._gear_stop_frames = 0
-        return False
-
-    def _slot_model(
-        self,
-        slot_polygon: Optional[Sequence[Point]],
-    ) -> Optional[SlotManeuverModel]:
-        if slot_polygon is None:
-            return None
-        return build_slot_maneuver_model(
-            slot_polygon,
-            sensor_to_rear_axle_y_back_mm=(
-                self.sensor_to_rear_axle_y_back_mm
-            ),
-            vehicle=self.vehicle,
-            back_clearance_mm=self.config.back_clearance_mm,
-            inferred_neighbor_width_mm=self.config.inferred_neighbor_width_mm,
-            back_wall_depth_mm=self.config.back_wall_depth_mm,
-            exit_lane_offset_mm=self.config.exit_lane_offset_mm,
-            exit_lane_advance_mm=self.config.exit_lane_advance_mm,
-        )
-
-    def _freeze_path_in_slot(
-        self,
-        path: HybridParkingPath,
-        model: SlotManeuverModel,
-        kind: str,
-    ) -> None:
-        relative = []
-        axis = model.slot_axis
-        depth = model.depth_direction
-        entrance = model.entrance_center
-        for pose in path.poses:
-            delta_x = pose.x_right_mm - entrance[0]
-            delta_y = pose.y_forward_mm - entrance[1]
-            forward = (sin(pose.heading_rad), cos(pose.heading_rad))
-            relative.append(
-                _SlotRelativePathPose(
-                    axis_mm=delta_x * axis[0] + delta_y * axis[1],
-                    depth_mm=delta_x * depth[0] + delta_y * depth[1],
-                    forward_axis=forward[0] * axis[0] + forward[1] * axis[1],
-                    forward_depth=(
-                        forward[0] * depth[0] + forward[1] * depth[1]
-                    ),
-                    gear=pose.gear,
-                    steering_rad=pose.steering_rad,
-                )
-            )
-        self._slot_path = tuple(relative)
-        self._slot_path_progress = 0
-        self._slot_path_kind = kind
-        self._slot_path_cost = path.cost
-        self._slot_path_expansions = path.expansions
-
-    def _path_from_live_slot(
-        self,
-        model: SlotManeuverModel,
-        kind: str,
-    ) -> Tuple[HybridParkingPath, float]:
-        if self._slot_path_kind != kind or not self._slot_path:
-            return HybridParkingPath(reason="no_frozen_slot_path"), float("inf")
-        axis = model.slot_axis
-        depth = model.depth_direction
-        entrance = model.entrance_center
-        live = []
-        for pose in self._slot_path:
-            x = (
-                entrance[0]
-                + axis[0] * pose.axis_mm
-                + depth[0] * pose.depth_mm
-            )
-            y = (
-                entrance[1]
-                + axis[1] * pose.axis_mm
-                + depth[1] * pose.depth_mm
-            )
-            forward_x = (
-                axis[0] * pose.forward_axis
-                + depth[0] * pose.forward_depth
-            )
-            forward_y = (
-                axis[1] * pose.forward_axis
-                + depth[1] * pose.forward_depth
-            )
-            live.append(
-                PathPose(
-                    x_right_mm=x,
-                    y_forward_mm=y,
-                    heading_rad=atan2(forward_x, forward_y),
-                    gear=pose.gear,
-                    steering_rad=pose.steering_rad,
-                )
-            )
-
-        start = max(0, self._slot_path_progress - 2)
-        stop = min(len(live), self._slot_path_progress + 14)
-        nearest = min(
-            range(start, stop),
-            key=lambda index: hypot(
-                live[index].x_right_mm,
-                live[index].y_forward_mm,
-            ),
-        )
-        self._slot_path_progress = max(self._slot_path_progress, nearest)
-        deviation = hypot(
-            live[self._slot_path_progress].x_right_mm,
-            live[self._slot_path_progress].y_forward_mm,
-        )
-        remaining = tuple(live[self._slot_path_progress + 1 :])
-        goal = (
-            model.parking_goal if kind == "parking" else model.exit_goal
-        )
-        if not remaining:
-            return (
-                HybridParkingPath(
-                    goal=goal,
-                    reason="frozen_slot_path_consumed",
+                abs(self.config.entry_setup_speed),
+                self._clamp(self.config.entry_setup_steering),
+                "left_seek_two_car_triangle:%d/%d %s"
+                % (
+                    self._pair_scans,
+                    max(1, self.config.pair_confirm_scans),
+                    triangle.reason,
                 ),
-                deviation,
             )
-        current = PathPose(0.0, 0.0, 0.0)
-        return (
-            HybridParkingPath(
-                found=True,
-                poses=(current,) + remaining,
-                goal=goal,
-                cost=self._slot_path_cost,
-                expansions=self._slot_path_expansions,
-                reason="frozen_slot_path_tracked",
-            ),
-            deviation,
-        )
 
-    def _parking_complete(
-        self,
-        model: SlotManeuverModel,
-        geometry: ParkingGeometry,
-    ) -> bool:
-        return (
-            self._goal_reached(model.parking_goal)
-            and geometry.vehicle_inside_ratio >= self.config.minimum_inside_ratio
-            and geometry.vehicle_fully_inside
-        )
+        self._entry_phase = self.ENTRY_REVERSE_LIVE
+        self._enter(ParkingState.FOLLOW_ENTRY_CURVE, now)
+        self._gear_stop_frames = max(1, self.config.gear_change_stop_frames)
+        return self._reverse_live(lidar, now)
 
-    def _goal_reached(self, goal: object) -> bool:
-        position = hypot(
-            float(getattr(goal, "x_right_mm")),
-            float(getattr(goal, "y_forward_mm")),
-        )
-        heading = abs(
-            degrees(
-                wrap_angle(float(getattr(goal, "heading_rad")))
-            )
-        )
-        return (
-            position <= self.config.goal_position_tolerance_mm
-            and heading <= self.config.goal_heading_tolerance_deg
-        )
-
-    def _emergency_reason(
+    def _reverse_live(
         self,
         lidar: LidarParkingObservation,
-        left_mm: Optional[float],
-        right_mm: Optional[float],
-        front_left_mm: Optional[float],
-        front_center_mm: Optional[float],
-        front_right_mm: Optional[float],
-    ) -> Optional[str]:
-        if not self.config.emergency_stop_enabled:
-            return None
-        if self._active_gear >= 0 or self.state in (
-            ParkingState.SEARCH_CARS,
-            ParkingState.TRACK_GAP,
-            ParkingState.EXIT_RIGHT,
-            ParkingState.EXIT_STRAIGHT,
-        ):
-            if any(
-                self._ultrasonic_emergency(value)
-                for value in (
-                    front_left_mm,
-                    front_center_mm,
-                    front_right_mm,
-                )
-            ):
-                return "front_ultrasonic_emergency"
-        if any(
-            self._ultrasonic_emergency(value)
-            for value in (left_mm, right_mm)
-        ):
-            return "side_ultrasonic_emergency"
-        if self._active_gear < 0 and lidar.valid and lidar.unsafe:
-            return "rear_lidar_emergency"
-        return None
+        now: float,
+    ) -> ParkingPlan:
+        if self._expired(now, self.config.maneuver_watchdog_s):
+            return self._abort(now, "triangulation_maneuver_watchdog")
+        if not lidar.valid:
+            return self._stop(
+                "lidar_not_fresh_hold_reverse:%s"
+                % (lidar.reason or "invalid_scan")
+            )
 
-    def _ultrasonic_correction(
+        triangle = decision_triangle_from_observation(lidar)
+        if not self._fresh_pair(lidar, triangle):
+            self._pair_scans = 0
+            self._filtered_geometric_steering = None
+            self._update_debug(lidar, triangle, None)
+            return self._stop(
+                "live_two_car_pair_lost_hold:%s"
+                % (lidar.reason or triangle.reason)
+            )
+
+        self._decision_triangle = triangle
+        live = self._live_geometry(lidar, triangle)
+        if live is None:
+            return self._stop("live_triangle_geometry_invalid")
+
+        new_scan = self._new_scan(lidar)
+        depth_ready = (
+            live.depth_remaining_mm
+            <= max(0.0, self.config.parking_complete_depth_tolerance_mm)
+        )
+        aligned = (
+            abs(live.lateral_error_mm)
+            <= max(0.0, self.config.parking_complete_lateral_mm)
+            and abs(live.heading_error_deg)
+            <= max(0.0, self.config.parking_complete_heading_deg)
+        )
+        if new_scan:
+            self._complete_scans = (
+                self._complete_scans + 1
+                if depth_ready and aligned
+                else 0
+            )
+        if self._complete_scans >= max(
+            1,
+            self.config.parking_complete_confirm_scans,
+        ):
+            self._enter(ParkingState.PARKED, now)
+            self._update_debug(lidar, triangle, live)
+            return self._stop("live_triangle_goal_reached")
+        target, curvature = self._live_target(live)
+        geometric = self._steering_for_curvature(curvature, new_scan)
+        physical = self._physical_steering_command(geometric)
+        self._update_debug(
+            lidar,
+            triangle,
+            live,
+            target=target,
+            curvature=curvature,
+            geometric_steering=geometric,
+            physical_steering=physical,
+        )
+
+        if self._gear_stop_frames > 0:
+            self._gear_stop_frames -= 1
+            return self._stop(
+                "gear_change_presteer_live_triangle:%d"
+                % self._gear_stop_frames,
+                steering=physical,
+            )
+
+        slow = (
+            live.depth_remaining_mm
+            <= max(0.0, self.config.final_slow_distance_mm)
+            or abs(live.heading_error_deg)
+            <= max(0.0, self.config.final_slow_heading_deg)
+            and abs(live.lateral_error_mm)
+            <= max(0.0, self.config.final_slow_lateral_mm)
+        )
+        speed = (
+            -abs(self.config.final_reverse_speed)
+            if slow
+            else -abs(self.config.maneuver_reverse_speed)
+        )
+        self.state = (
+            ParkingState.FOLLOW_SLOT_CENTER
+            if slow
+            else ParkingState.FOLLOW_ENTRY_CURVE
+        )
+        return self._drive(
+            speed,
+            physical,
+            (
+                "live_triangle_reverse "
+                "head=%+.1f lat=%+.0f depth=%.0f remain=%.0f"
+            )
+            % (
+                live.heading_error_deg,
+                live.lateral_error_mm,
+                live.depth_progress_mm,
+                live.depth_remaining_mm,
+            ),
+        )
+
+    def _fresh_pair(
         self,
-        left_mm: Optional[float],
-        right_mm: Optional[float],
-    ) -> int:
-        if not self._usable_ultrasonic(left_mm) or not self._usable_ultrasonic(
-            right_mm
+        lidar: LidarParkingObservation,
+        triangle: LidarDecisionTriangle,
+    ) -> bool:
+        return (
+            lidar.valid
+            and lidar.gap_pair_observed
+            and lidar.second_car_seen
+            and not lidar.coasted
+            and triangle.valid
+        )
+
+    def _live_geometry(
+        self,
+        lidar: LidarParkingObservation,
+        triangle: LidarDecisionTriangle,
+    ) -> Optional[_LiveTriangleGeometry]:
+        if (
+            not triangle.valid
+            or lidar.slot_depth_x_right is None
+            or lidar.slot_depth_y_back is None
         ):
-            return 0
-        correction = self.config.ultrasonic_kp_steering_per_mm * (
-            float(right_mm) - float(left_mm)
+            return None
+        axis_x = triangle.car2_edge[0] - triangle.car1_edge[0]
+        axis_y = triangle.car2_edge[1] - triangle.car1_edge[1]
+        axis_length = hypot(axis_x, axis_y)
+        depth_x = float(lidar.slot_depth_x_right)
+        depth_y = float(lidar.slot_depth_y_back)
+        depth_length = hypot(depth_x, depth_y)
+        if axis_length <= 1.0 or depth_length <= 1e-6:
+            return None
+        axis = (axis_x / axis_length, axis_y / axis_length)
+        depth = (depth_x / depth_length, depth_y / depth_length)
+        entrance = (
+            (triangle.car1_edge[0] + triangle.car2_edge[0]) / 2.0,
+            (triangle.car1_edge[1] + triangle.car2_edge[1]) / 2.0,
         )
-        limit = abs(self.config.ultrasonic_max_correction)
-        return int(round(max(-limit, min(limit, correction))))
-
-    def _ultrasonic_emergency(self, value_mm: Optional[float]) -> bool:
-        return (
-            self._usable_ultrasonic(value_mm)
-            and float(value_mm) <= self.config.ultrasonic_emergency_mm
+        from_entrance = (-entrance[0], -entrance[1])
+        lateral = (
+            from_entrance[0] * axis[0]
+            + from_entrance[1] * axis[1]
+        )
+        progress = (
+            from_entrance[0] * depth[0]
+            + from_entrance[1] * depth[1]
+        )
+        return _LiveTriangleGeometry(
+            entrance=entrance,
+            axis=axis,
+            depth=depth,
+            lateral_error_mm=lateral,
+            depth_progress_mm=progress,
+            depth_remaining_mm=(
+                self.config.target_sensor_depth_mm - progress
+            ),
+            heading_error_deg=degrees(atan2(depth[0], depth[1])),
         )
 
-    def _usable_ultrasonic(self, value_mm: Optional[float]) -> bool:
-        return (
-            value_mm is not None
-            and 0.0 < float(value_mm) <= self.config.ultrasonic_max_valid_mm
+    def _live_target(
+        self,
+        live: _LiveTriangleGeometry,
+    ) -> Tuple[Point, float]:
+        rear_axle = (0.0, self.sensor_to_rear_axle_y_back_mm)
+        rear_progress = (
+            live.depth_progress_mm
+            + rear_axle[0] * live.depth[0]
+            + rear_axle[1] * live.depth[1]
+        )
+        target_rear_depth = (
+            self.config.target_sensor_depth_mm
+            + self.sensor_to_rear_axle_y_back_mm
+        )
+        lookahead_depth = min(
+            target_rear_depth,
+            rear_progress + max(100.0, self.config.reverse_lookahead_mm),
+        )
+        target = (
+            live.entrance[0] + live.depth[0] * lookahead_depth,
+            live.entrance[1] + live.depth[1] * lookahead_depth,
+        )
+        relative_x = target[0] - rear_axle[0]
+        relative_y_back = target[1] - rear_axle[1]
+        distance_squared = (
+            relative_x * relative_x
+            + relative_y_back * relative_y_back
+        )
+        curvature = (
+            0.0
+            if distance_squared <= 1.0
+            else 2.0 * relative_x / distance_squared
+        )
+        return target, curvature
+
+    def _steering_for_curvature(
+        self,
+        curvature_per_mm: float,
+        new_scan: bool,
+    ) -> int:
+        maximum = max(1, abs(self.config.max_steering_command))
+        maximum_angle = max(0.1, abs(self.vehicle.max_steering_angle_deg))
+        angle_deg = degrees(
+            atan(self.vehicle.wheelbase_mm * curvature_per_mm)
+        )
+        raw = max(-maximum, min(maximum, maximum * angle_deg / maximum_angle))
+        previous = self._filtered_geometric_steering
+        if previous is None:
+            filtered = raw
+        elif new_scan:
+            alpha = max(0.0, min(1.0, self.config.steering_filter_alpha))
+            filtered = previous + alpha * (raw - previous)
+            delta = max(1, abs(self.config.steering_max_delta_per_scan))
+            filtered = max(previous - delta, min(previous + delta, filtered))
+        else:
+            filtered = previous
+        self._filtered_geometric_steering = filtered
+        return int(round(filtered))
+
+    def _new_scan(self, lidar: LidarParkingObservation) -> bool:
+        if (
+            self._last_lidar_timestamp is None
+            or lidar.timestamp > self._last_lidar_timestamp + 1e-6
+        ):
+            self._last_lidar_timestamp = lidar.timestamp
+            return True
+        return False
+
+    def _update_debug(
+        self,
+        lidar: LidarParkingObservation,
+        triangle: LidarDecisionTriangle,
+        live: Optional[_LiveTriangleGeometry],
+        *,
+        target: Optional[Point] = None,
+        curvature: Optional[float] = None,
+        geometric_steering: Optional[int] = None,
+        physical_steering: Optional[int] = None,
+    ) -> None:
+        self._debug = TriangulationControlDebug(
+            lidar_timestamp=lidar.timestamp,
+            pair_valid=triangle.valid and live is not None,
+            car1_x_mm=triangle.car1_edge[0] if triangle.valid else None,
+            car1_y_back_mm=triangle.car1_edge[1] if triangle.valid else None,
+            car2_x_mm=triangle.car2_edge[0] if triangle.valid else None,
+            car2_y_back_mm=triangle.car2_edge[1] if triangle.valid else None,
+            entrance_x_mm=live.entrance[0] if live is not None else None,
+            entrance_y_back_mm=live.entrance[1] if live is not None else None,
+            depth_x=live.depth[0] if live is not None else None,
+            depth_y_back=live.depth[1] if live is not None else None,
+            gap_width_mm=triangle.car_gap_mm if triangle.valid else None,
+            decision_angle_deg=(
+                triangle.decision_angle_deg if triangle.valid else None
+            ),
+            heading_error_deg=(
+                live.heading_error_deg if live is not None else None
+            ),
+            lateral_error_mm=(
+                live.lateral_error_mm if live is not None else None
+            ),
+            depth_progress_mm=(
+                live.depth_progress_mm if live is not None else None
+            ),
+            depth_remaining_mm=(
+                live.depth_remaining_mm if live is not None else None
+            ),
+            target_x_mm=target[0] if target is not None else None,
+            target_y_back_mm=target[1] if target is not None else None,
+            curvature_per_mm=curvature,
+            geometric_steering=geometric_steering,
+            physical_steering=physical_steering,
         )
 
     def _straight_steering(self) -> int:
-        limit = abs(self.config.max_steering_command)
-        return int(max(-limit, min(limit, self.config.straight_steering_trim)))
+        return self._clamp(self.config.straight_steering_trim)
 
-    def _enter(self, state: ParkingState, now: float) -> None:
-        self.state = state
-        self._state_started_at = now
-        if state not in (
-            ParkingState.FOLLOW_ENTRY_CURVE,
-            ParkingState.FOLLOW_SLOT_CENTER,
-        ):
-            self._complete_scans = 0
+    def _physical_steering_command(self, geometric_command: int) -> int:
+        maximum = max(1, abs(self.config.max_steering_command))
+        geometric = max(-maximum, min(maximum, int(geometric_command)))
+        neutral = max(
+            -maximum,
+            min(maximum, int(self.config.straight_steering_trim)),
+        )
+        if geometric >= 0:
+            command = neutral + (maximum - neutral) * geometric / maximum
+        else:
+            command = neutral + (maximum + neutral) * geometric / maximum
+        return self._clamp(int(round(command)))
 
-    def _state_elapsed(self, now: float) -> float:
-        return max(0.0, now - self._state_started_at)
-
-    def _expired(self, now: float, watchdog_s: float) -> bool:
-        return watchdog_s > 0.0 and self._state_elapsed(now) >= watchdog_s
-
-    def _reset_counters(self) -> None:
-        self._slot_confirm_scans = 0
-        self._path_failures = 0
-        self._complete_scans = 0
-        self._active_gear = 0
-        self._pending_gear = 0
-        self._gear_stop_frames = 0
-        self._last_path = HybridParkingPath()
-        self._clear_slot_path()
-
-    def _clear_slot_path(self) -> None:
-        self._slot_path = ()
-        self._slot_path_progress = 0
-        self._slot_path_kind = ""
-        self._slot_path_cost = 0.0
-        self._slot_path_expansions = 0
-
-    def _abort(self, now: float, reason: str) -> ParkingPlan:
-        self._enter(ParkingState.ABORTED, now)
-        self._active_gear = 0
-        return self._stop(reason)
+    def _drive(self, speed: int, steering: int, reason: str) -> ParkingPlan:
+        command = ControlCommand(
+            speed=int(speed),
+            steering=self._clamp(steering),
+            brake=False,
+            reason=reason,
+        )
+        return ParkingPlan(self.state, command, reason)
 
     def _stop(
         self,
         reason: str,
         *,
-        world_path: Optional[HybridParkingPath] = None,
+        steering: Optional[int] = None,
     ) -> ParkingPlan:
-        return ParkingPlan(
-            state=self.state,
-            command=ControlCommand.stop(reason),
-            reason=reason,
-            world_path=world_path,
-        )
-
-    def _drive(
-        self,
-        speed: int,
-        steering: int,
-        reason: str,
-        *,
-        world_path: Optional[HybridParkingPath] = None,
-    ) -> ParkingPlan:
-        return ParkingPlan(
-            state=self.state,
-            command=ControlCommand(
-                speed=int(speed),
-                steering=int(steering),
-                brake=False,
-                reason=reason,
+        command = ControlCommand(
+            speed=0,
+            steering=(
+                self._straight_steering()
+                if steering is None
+                else self._clamp(steering)
             ),
+            brake=True,
             reason=reason,
-            world_path=world_path,
         )
+        return ParkingPlan(self.state, command, reason)
+
+    def _abort(self, now: float, reason: str) -> ParkingPlan:
+        self._enter(ParkingState.ABORTED, now)
+        return self._stop(reason)
+
+    def _clamp(self, value: int) -> int:
+        maximum = abs(self.config.max_steering_command)
+        return int(max(-maximum, min(maximum, int(value))))
+
+    def _enter(self, state: ParkingState, now: float) -> None:
+        self.state = state
+        self._state_started_at = now
+
+    def _expired(self, now: float, timeout_s: float) -> bool:
+        return timeout_s > 0.0 and now - self._state_started_at >= timeout_s
+
+    def _reset_counters(self) -> None:
+        self._entry_phase = self.ENTRY_ACQUIRE_PAIR
+        self._lidar_reset_requested = False
+        self._last_lidar_timestamp = None
+        self._first_car_scans = 0
+        self._first_car_seen = False
+        self._first_car_lost_scans = 0
+        self._pair_scans = 0
+        self._gear_stop_frames = 0
+        self._complete_scans = 0
+        self._decision_triangle = LidarDecisionTriangle()
+        self._filtered_geometric_steering = None
+        self._debug = TriangulationControlDebug()
