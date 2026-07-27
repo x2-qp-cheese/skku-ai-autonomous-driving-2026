@@ -22,25 +22,30 @@ Point = Tuple[float, float]
 class ModelBasedParkingConfig:
     """LiDAR-only reactive triangulation controller parameters."""
 
-    search_speed: int = 90
+    search_speed: int = 100
     gap_tracking_speed: int = 50
     maneuver_forward_speed: int = 90
     maneuver_reverse_speed: int = -90
     final_reverse_speed: int = -60
     exit_speed: int = 50
-    straight_steering_trim: int = -33
+    straight_steering_trim: int = 0
     max_steering_command: int = 150
 
     lidar_first_car_gate_min_x_mm: float = 350.0
-    lidar_first_car_gate_max_x_mm: float = 1100.0
+    lidar_first_car_gate_max_x_mm: float = 1900.0
     lidar_first_car_gate_max_range_mm: float = 3000.0
     lidar_first_car_confirm_scans: int = 3
     lidar_first_car_lost_scans: int = 6
-    lidar_first_car_speed: int = 50
+    lidar_first_car_speed: int = 100
+    right_ultrasonic_first_car_max_mm: float = 2500.0
+    right_ultrasonic_first_car_confirm_scans: int = 1
+    right_ultrasonic_open_confirm_scans: int = 1
 
-    entry_setup_speed: int = 90
+    entry_setup_speed: int = 50
     entry_setup_steering: int = -150
+    entry_setup_duration_s: float = 7.0
     pair_confirm_scans: int = 3
+    reverse_pair_coast_scans: int = 2
     gear_change_stop_frames: int = 2
 
     reverse_lookahead_mm: float = 650.0
@@ -115,6 +120,7 @@ class ModelBasedTParkingPlanner:
     """
 
     ENTRY_ACQUIRE_PAIR = "acquire_live_pair"
+    ENTRY_TIMED_LEFT = "timed_left_setup"
     ENTRY_REVERSE_LIVE = "reverse_live_triangle"
 
     def __init__(
@@ -139,7 +145,12 @@ class ModelBasedTParkingPlanner:
         self._first_car_scans = 0
         self._first_car_seen = False
         self._first_car_lost_scans = 0
+        self._ultrasonic_close_scans = 0
+        self._ultrasonic_none_scans = 0
+        self._last_ultrasonic_timestamp: Optional[float] = None
         self._pair_scans = 0
+        self._pair_candidate_seen = False
+        self._reverse_pair_coast_scans = 0
         self._gear_stop_frames = 0
         self._complete_scans = 0
         self._decision_triangle = LidarDecisionTriangle()
@@ -205,12 +216,13 @@ class ModelBasedTParkingPlanner:
         front_left_ultrasonic_mm: Optional[float] = None,
         front_center_ultrasonic_mm: Optional[float] = None,
         front_right_ultrasonic_mm: Optional[float] = None,
+        right_ultrasonic_reported: bool = False,
+        right_ultrasonic_timestamp: Optional[float] = None,
     ) -> ParkingPlan:
         del (
             geometry,
             slot_polygon,
             left_ultrasonic_mm,
-            right_ultrasonic_mm,
             front_left_ultrasonic_mm,
             front_center_ultrasonic_mm,
             front_right_ultrasonic_mm,
@@ -226,8 +238,16 @@ class ModelBasedTParkingPlanner:
             return self._stop("parked_lidar_triangle_complete")
 
         if self.state in (ParkingState.SEARCH_CARS, ParkingState.TRACK_GAP):
-            return self._search(lidar, now)
+            return self._search(
+                lidar,
+                now,
+                right_ultrasonic_mm,
+                right_ultrasonic_reported,
+                right_ultrasonic_timestamp,
+            )
         if self.state == ParkingState.ENTRY_SETUP:
+            if self._entry_phase == self.ENTRY_TIMED_LEFT:
+                return self._timed_left_setup(now)
             return self._acquire_pair(lidar, now)
         if self.state in (
             ParkingState.FOLLOW_ENTRY_CURVE,
@@ -240,81 +260,97 @@ class ModelBasedTParkingPlanner:
         self,
         lidar: LidarParkingObservation,
         now: float,
+        right_ultrasonic_mm: Optional[float],
+        right_ultrasonic_reported: bool,
+        right_ultrasonic_timestamp: Optional[float],
     ) -> ParkingPlan:
         if self._expired(now, self.config.search_timeout_s):
             return self._abort(now, "lidar_search_watchdog")
-        if not lidar.valid:
-            return self._stop(
-                "lidar_not_fresh_hold_search:%s"
-                % (lidar.reason or "invalid_scan")
-            )
-        new_scan = self._new_scan(lidar)
-        edge_x = lidar.first_car_slot_edge_x_right_mm
-        edge_y = lidar.first_car_slot_edge_y_back_mm
-        side_car = (
-            lidar.first_car_confirmed
-            and edge_x is not None
-            and edge_y is not None
-            and self.config.lidar_first_car_gate_min_x_mm
-            <= float(edge_x)
-            <= self.config.lidar_first_car_gate_max_x_mm
-            and hypot(float(edge_x), float(edge_y))
-            <= max(1.0, self.config.lidar_first_car_gate_max_range_mm)
+        del lidar
+        new_ultrasonic = (
+            right_ultrasonic_reported
+            and right_ultrasonic_timestamp is not None
+            and right_ultrasonic_timestamp
+            != self._last_ultrasonic_timestamp
         )
+        if new_ultrasonic:
+            self._last_ultrasonic_timestamp = right_ultrasonic_timestamp
 
         if not self._first_car_seen:
-            if new_scan:
-                self._first_car_scans = (
-                    self._first_car_scans + 1 if side_car else 0
+            if new_ultrasonic:
+                # Any valid SR echo means the right-side sensor is alongside
+                # the first car.  215034 measured that car at 1186-1485 mm;
+                # a fixed 1100 mm ceiling incorrectly rejected every sample.
+                close = right_ultrasonic_mm is not None
+                self._ultrasonic_close_scans = (
+                    self._ultrasonic_close_scans + 1 if close else 0
                 )
-            if self._first_car_scans >= max(
+            if self._ultrasonic_close_scans >= max(
                 1,
-                self.config.lidar_first_car_confirm_scans,
+                self.config.right_ultrasonic_first_car_confirm_scans,
             ):
                 self._first_car_seen = True
+                self._ultrasonic_none_scans = 0
             if not self._first_car_seen:
                 self.state = ParkingState.SEARCH_CARS
                 return self._drive(
                     self.config.search_speed,
                     self._straight_steering(),
-                    "lidar_search_first_car:%d/%d"
+                    "ultrasonic_search_first_car SR=%s"
                     % (
-                        self._first_car_scans,
-                        max(1, self.config.lidar_first_car_confirm_scans),
+                        "None"
+                        if right_ultrasonic_mm is None
+                        else "%.0fmm" % right_ultrasonic_mm,
                     ),
                 )
 
-        if new_scan:
-            self._first_car_lost_scans = (
-                0 if side_car else self._first_car_lost_scans + 1
+        if new_ultrasonic:
+            self._ultrasonic_none_scans = (
+                self._ultrasonic_none_scans + 1
+                if right_ultrasonic_mm is None
+                else 0
             )
-        if self._first_car_lost_scans < max(
+        if self._ultrasonic_none_scans < max(
             1,
-            self.config.lidar_first_car_lost_scans,
+            self.config.right_ultrasonic_open_confirm_scans,
         ):
             self.state = ParkingState.TRACK_GAP
             return self._drive(
                 abs(self.config.lidar_first_car_speed),
                 self._straight_steering(),
-                "lidar_first_car_seen_wait_open:%d/%d"
+                "ultrasonic_first_car_seen_wait_none SR=%s"
                 % (
-                    self._first_car_lost_scans,
-                    max(1, self.config.lidar_first_car_lost_scans),
+                    "None"
+                    if right_ultrasonic_mm is None
+                    else "%.0fmm" % right_ultrasonic_mm,
                 ),
             )
 
         self._enter(ParkingState.ENTRY_SETUP, now)
-        self._entry_phase = self.ENTRY_ACQUIRE_PAIR
-        self._lidar_reset_requested = True
-        self._pair_scans = 0
-        self._decision_triangle = LidarDecisionTriangle(
-            reason="waiting_for_post_turn_live_pair"
-        )
+        self._entry_phase = self.ENTRY_TIMED_LEFT
         return self._drive(
             abs(self.config.entry_setup_speed),
             self._clamp(self.config.entry_setup_steering),
-            "first_car_lost_start_left_seek_live_pair",
+            "ultrasonic_none_start_timed_left",
         )
+
+    def _timed_left_setup(self, now: float) -> ParkingPlan:
+        elapsed = max(0.0, now - self._state_started_at)
+        if elapsed < max(0.0, self.config.entry_setup_duration_s):
+            return self._drive(
+                abs(self.config.entry_setup_speed),
+                self._clamp(self.config.entry_setup_steering),
+                "timed_left_setup:%.2f/%.2fs"
+                % (elapsed, self.config.entry_setup_duration_s),
+            )
+        self._entry_phase = self.ENTRY_ACQUIRE_PAIR
+        self._lidar_reset_requested = True
+        self._pair_scans = 0
+        self._pair_candidate_seen = False
+        self._decision_triangle = LidarDecisionTriangle(
+            reason="waiting_for_post_timed_turn_live_pair"
+        )
+        return self._stop("timed_left_complete_reset_lidar")
 
     def _acquire_pair(
         self,
@@ -336,14 +372,13 @@ class ModelBasedTParkingPlanner:
         if new_scan:
             self._pair_scans = self._pair_scans + 1 if fresh_pair else 0
         if triangle.valid:
+            self._pair_candidate_seen = True
             self._decision_triangle = triangle
             self._update_debug(lidar, triangle, self._live_geometry(lidar, triangle))
 
         if self._pair_scans < max(1, self.config.pair_confirm_scans):
-            return self._drive(
-                abs(self.config.entry_setup_speed),
-                self._clamp(self.config.entry_setup_steering),
-                "left_seek_two_car_triangle:%d/%d %s"
+            return self._stop(
+                "stationary_post_turn_triangle:%d/%d %s"
                 % (
                     self._pair_scans,
                     max(1, self.config.pair_confirm_scans),
@@ -370,7 +405,24 @@ class ModelBasedTParkingPlanner:
             )
 
         triangle = decision_triangle_from_observation(lidar)
-        if not self._fresh_pair(lidar, triangle):
+        fresh_pair = self._fresh_pair(lidar, triangle)
+        new_scan = self._new_scan(lidar)
+        coasting_pair = False
+        if fresh_pair:
+            self._reverse_pair_coast_scans = 0
+            self._decision_triangle = triangle
+        elif (
+            lidar.valid
+            and lidar.coasted
+            and self._decision_triangle.valid
+            and self._reverse_pair_coast_scans
+            < max(0, self.config.reverse_pair_coast_scans)
+        ):
+            if new_scan:
+                self._reverse_pair_coast_scans += 1
+            triangle = self._decision_triangle
+            coasting_pair = True
+        else:
             self._pair_scans = 0
             self._filtered_geometric_steering = None
             self._update_debug(lidar, triangle, None)
@@ -379,12 +431,10 @@ class ModelBasedTParkingPlanner:
                 % (lidar.reason or triangle.reason)
             )
 
-        self._decision_triangle = triangle
         live = self._live_geometry(lidar, triangle)
         if live is None:
             return self._stop("live_triangle_geometry_invalid")
 
-        new_scan = self._new_scan(lidar)
         depth_ready = (
             live.depth_remaining_mm
             <= max(0.0, self.config.parking_complete_depth_tolerance_mm)
@@ -447,12 +497,18 @@ class ModelBasedTParkingPlanner:
             if slow
             else ParkingState.FOLLOW_ENTRY_CURVE
         )
+        reason_prefix = (
+            "live_triangle_reverse_coast=%d "
+            % self._reverse_pair_coast_scans
+            if coasting_pair
+            else "live_triangle_reverse "
+        )
         return self._drive(
             speed,
             physical,
             (
-                "live_triangle_reverse "
-                "head=%+.1f lat=%+.0f depth=%.0f remain=%.0f"
+                reason_prefix
+                + "head=%+.1f lat=%+.0f depth=%.0f remain=%.0f"
             )
             % (
                 live.heading_error_deg,
@@ -699,7 +755,12 @@ class ModelBasedTParkingPlanner:
         self._first_car_scans = 0
         self._first_car_seen = False
         self._first_car_lost_scans = 0
+        self._ultrasonic_close_scans = 0
+        self._ultrasonic_none_scans = 0
+        self._last_ultrasonic_timestamp = None
         self._pair_scans = 0
+        self._pair_candidate_seen = False
+        self._reverse_pair_coast_scans = 0
         self._gear_stop_frames = 0
         self._complete_scans = 0
         self._decision_triangle = LidarDecisionTriangle()

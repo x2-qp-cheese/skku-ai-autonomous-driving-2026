@@ -279,32 +279,69 @@ class RplidarScanner:
         self._device = None
 
     def _run(self) -> None:
-        try:
-            from rplidar import RPLidar
+        from rplidar import RPLidar
 
-            device = RPLidar(self.port)
-            self._device = device
-            for raw_scan in device.iter_scans(max_buf_meas=self.max_buf_meas):
-                if self._stop_event.is_set():
-                    break
-                points = tuple(
-                    LidarPoint(int(point[0]), float(point[1]), float(point[2]))
-                    for point in raw_scan
-                    if len(point) >= 3
-                )
-                scan = LidarScan(time.time(), points)
+        reset_on_connect = False
+        while not self._stop_event.is_set():
+            device = None
+            try:
+                device = RPLidar(self.port)
+                self._device = device
+
+                # A previous process or an unplug/replug can leave measurement
+                # bytes in the serial input buffer.  If those bytes are read
+                # as the next command descriptor, rplidar raises
+                # "Incorrect descriptor starting bytes" and no scan is ever
+                # produced.  Put the sensor in a known idle state before each
+                # scan session and reset it after a failed session.
+                try:
+                    device.stop()
+                except Exception:
+                    device.clean_input()
+                if reset_on_connect:
+                    device.reset()
+                device.clean_input()
+
+                for raw_scan in device.iter_scans(
+                    max_buf_meas=self.max_buf_meas
+                ):
+                    if self._stop_event.is_set():
+                        break
+                    points = tuple(
+                        LidarPoint(
+                            int(point[0]),
+                            float(point[1]),
+                            float(point[2]),
+                        )
+                        for point in raw_scan
+                        if len(point) >= 3
+                    )
+                    scan = LidarScan(time.time(), points)
+                    with self._lock:
+                        self._latest = scan
+                        self._error = None
+                    reset_on_connect = False
+                if not self._stop_event.is_set():
+                    raise RuntimeError("RPLidar scan stream ended")
+            except Exception as exc:
                 with self._lock:
-                    self._latest = scan
-                    self._error = None
-        except Exception as exc:
-            with self._lock:
-                self._error = exc
-        finally:
-            device = self._device
-            if device is not None:
-                for method_name in ("stop", "stop_motor", "disconnect"):
-                    try:
-                        getattr(device, method_name)()
-                    except Exception:
-                        pass
-            self._device = None
+                    self._latest = None
+                    self._error = exc
+                reset_on_connect = True
+            finally:
+                if device is not None:
+                    for method_name in (
+                        "stop",
+                        "stop_motor",
+                        "disconnect",
+                    ):
+                        try:
+                            getattr(device, method_name)()
+                        except Exception:
+                            pass
+                if self._device is device:
+                    self._device = None
+
+            # Retry automatically instead of permanently killing the reader
+            # thread after one malformed serial descriptor.
+            self._stop_event.wait(0.5)

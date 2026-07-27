@@ -29,6 +29,7 @@ class ParkingYoloConfig:
 class ParkingRuntimeConfig:
     auto_start: bool = False
     camera_enabled: bool = True
+    camera_debug_only: bool = False
     front_camera_enabled: bool = False
     command_rate_hz: float = 20.0
     lidar_video_offset_s: float = 0.0

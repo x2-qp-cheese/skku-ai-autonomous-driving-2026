@@ -93,9 +93,11 @@ class LidarParkingConfig:
     gap_cluster_min_points: int = 5
     gap_cluster_min_scans: int = 1
     gap_cluster_min_span_mm: float = 0.0
-    # A parked toy car is about 1 m long. A much longer cluster is normally a
-    # rear wall or guard rail and must never become one side of a parking bay.
-    gap_cluster_max_span_mm: float = 1500.0
+    # During the setup turn, two scans can join a long visible vehicle side
+    # into an 1.8-2.0 m cluster. 211228 showed that a 1.5 m ceiling rejected
+    # both real bordering cars, so retain these surfaces and let the measured
+    # inner-gap width and LiDAR triangle reject walls.
+    gap_cluster_max_span_mm: float = 2200.0
     gap_pair_min_points: int = 10
     gap_pair_max_lateral_offset_mm: float = 1.0e9
     gap_pair_min_longitudinal_alignment: float = 0.0
@@ -136,6 +138,8 @@ class LidarParkingConfig:
     # of the provisional rear axle (-300 mm).
     first_car_confirm_scans: int = 3
     first_car_min_x_right_mm: float = 450.0
+    first_car_y_back_min_mm: float = -1500.0
+    first_car_y_back_max_mm: float = 500.0
     # A lone weak cluster must not be enough to start the parking maneuver.
     # People and cable reflections often produce one or two LiDAR points on the
     # right; require a denser, physically wider cluster before it is treated as
@@ -839,6 +843,16 @@ def first_car_cluster_eligible(
     config: LidarParkingConfig,
 ) -> bool:
     if cluster.center_x_right_mm < config.first_car_min_x_right_mm:
+        return False
+    # The first bordering vehicle must approach from the front-right and pass
+    # beside the ego vehicle.  Distant rear reflections (the wall/fixtures at
+    # y_back ~= +2.0 m in 213328/213401) are not evidence that the first car
+    # has been reached.
+    if not (
+        config.first_car_y_back_min_mm
+        <= cluster.center_y_back_mm
+        <= config.first_car_y_back_max_mm
+    ):
         return False
     if cluster.point_count < max(1, config.first_car_cluster_min_points):
         return False

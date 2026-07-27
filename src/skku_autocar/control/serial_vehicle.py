@@ -36,23 +36,45 @@ class UltrasonicReadings:
 
 
 def parse_ultrasonic_line(line: str) -> Optional[UltrasonicReadings]:
-    if not line.startswith("US "):
-        return None
-    values = {
-        key: _valid_ultrasonic_mm(float(value))
-        for key, value in re.findall(
-            r"\b(FC|FR|FL|SR|SL|F)=(-?\d+(?:\.\d+)?)",
-            line,
-        )
+    # Python vehicle_controller format: values are millimetres.
+    mm_matches = re.findall(
+        r"\b(FC|FR|FL|SR|SL|F)=(-?\d+(?:\.\d+)?)",
+        line,
+        flags=re.IGNORECASE,
+    )
+    mm_values = {
+        key.upper(): _valid_ultrasonic_mm(float(value))
+        for key, value in mm_matches
     }
-    if not values:
+
+    # The parking Arduino sketch reports its debug values as centimetres:
+    #   state=... usL=84.5 usR=184.9 ...
+    # Accept this actual on-vehicle format as well as LEFT/RIGHT aliases.
+    cm_matches = re.findall(
+        r"\b(usR|usL|RIGHT|LEFT)=(-?\d+(?:\.\d+)?)",
+        line,
+        flags=re.IGNORECASE,
+    )
+    cm_values = {
+        key.upper(): _valid_ultrasonic_mm(float(value) * 10.0)
+        for key, value in cm_matches
+    }
+    if not mm_values and not cm_values:
         return None
     return UltrasonicReadings(
-        front_right_mm=values.get("FR"),
-        front_center_mm=values.get("FC", values.get("F")),
-        front_left_mm=values.get("FL"),
-        side_right_mm=values.get("SR"),
-        side_left_mm=values.get("SL"),
+        front_right_mm=mm_values.get("FR"),
+        front_center_mm=mm_values.get("FC", mm_values.get("F")),
+        front_left_mm=mm_values.get("FL"),
+        side_right_mm=(
+            mm_values.get("SR")
+            if "SR" in mm_values
+            else cm_values.get("USR", cm_values.get("RIGHT"))
+        ),
+        side_left_mm=(
+            mm_values.get("SL")
+            if "SL" in mm_values
+            else cm_values.get("USL", cm_values.get("LEFT"))
+        ),
     )
 
 

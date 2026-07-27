@@ -16,6 +16,8 @@ from typing import Any, Optional, Tuple
 from ..control.serial_vehicle import (
     SerialVehicleClient,
     SerialVehicleConfig,
+    UltrasonicReadings,
+    parse_ultrasonic_line,
 )
 from ..estimation.lidar_slot_geometry import LidarSlotGeometryProjector
 from ..estimation.parking_geometry import ParkingGeometry, ParkingGeometryEstimator
@@ -288,6 +290,10 @@ def run_prepared(args: argparse.Namespace) -> int:
     )
     is_video = camera_enabled and not source.isdigit() and not is_auto_camera_source(source)
     is_replay = is_video or (not camera_enabled and args.lidar_csv is not None)
+    if args.serial is None:
+        # Live parking is the primary entry point: enable the Arduino motor
+        # output by default. Recorded video/CSV replay remains motor-safe.
+        args.serial = not is_replay
     front_camera_enabled = (
         config.runtime.front_camera_enabled
         and camera_enabled
@@ -300,7 +306,7 @@ def run_prepared(args: argparse.Namespace) -> int:
     model_path = resolve_path(args.model or config.yolo.model_path)
 
     segmenter = None
-    if camera_enabled:
+    if camera_enabled and not config.runtime.camera_debug_only:
         segmenter = YoloLaneSegmenter(
             YoloLaneConfig(
                 model_path=model_path,
@@ -393,6 +399,8 @@ def run_prepared(args: argparse.Namespace) -> int:
     fps = 0.0
     frame_index = args.start_frame
     last_state = planner.state
+    ultrasonic_readings = UltrasonicReadings()
+    ultrasonic_received_at: Optional[float] = None
 
     if args.auto_start or (config.runtime.auto_start and not args.manual_start):
         planner.start(video_elapsed_s(cv2, cap, frame_index, run_started_at, is_video))
@@ -406,6 +414,10 @@ def run_prepared(args: argparse.Namespace) -> int:
             front_camera_enabled,
             model_path,
             segmenter.device,
+        )
+    elif camera_enabled:
+        LOG.info(
+            "rear camera debug display enabled; camera control and YOLO disabled"
         )
     else:
         LOG.info("camera=disabled; LiDAR-only parking runtime")
@@ -492,9 +504,11 @@ def run_prepared(args: argparse.Namespace) -> int:
                         "FRONT CAMERA READ FAILED",
                     )
             if vehicle is not None:
-                # Drain serial status without enabling or consuming ultrasonic
-                # measurements in the LiDAR-only parking controller.
-                vehicle.read_lines()
+                for line in vehicle.read_lines():
+                    report = parse_ultrasonic_line(line)
+                    if report is not None:
+                        ultrasonic_readings = report
+                        ultrasonic_received_at = monotonic_now
             dt = max(1e-6, monotonic_now - last_frame_at)
             fps = 0.9 * fps + 0.1 / dt if fps else 1.0 / dt
             last_frame_at = monotonic_now
@@ -510,7 +524,13 @@ def run_prepared(args: argparse.Namespace) -> int:
             else:
                 parking_masks = []
                 bev_masks = []
-                camera_geometry = ParkingGeometry(reason="camera_disabled")
+                camera_geometry = ParkingGeometry(
+                    reason=(
+                        "camera_debug_only"
+                        if camera_enabled
+                        else "camera_disabled"
+                    )
+                )
 
             lidar_observation, lidar_scan = current_lidar_observation(
                 lidar_estimator,
@@ -525,22 +545,49 @@ def run_prepared(args: argparse.Namespace) -> int:
             # Debug projection only. The controller consumes the fresh
             # two-car LiDAR triangle directly; no slot pose is locked.
             geometry = lidar_geometry_projector.project(lidar_observation)
-            left_ultrasonic_mm = None
-            right_ultrasonic_mm = None
-            front_left_ultrasonic_mm = None
-            front_center_ultrasonic_mm = None
-            front_right_ultrasonic_mm = None
+            ultrasonic_fresh = (
+                ultrasonic_received_at is not None
+                and monotonic_now - ultrasonic_received_at
+                <= config.model_planner.ultrasonic_stale_after_s
+            )
+            left_ultrasonic_mm = (
+                ultrasonic_readings.side_left_mm
+                if ultrasonic_fresh
+                else None
+            )
+            right_ultrasonic_mm = (
+                ultrasonic_readings.side_right_mm
+                if ultrasonic_fresh
+                else None
+            )
+            front_left_ultrasonic_mm = (
+                ultrasonic_readings.front_left_mm
+                if ultrasonic_fresh
+                else None
+            )
+            front_center_ultrasonic_mm = (
+                ultrasonic_readings.front_center_mm
+                if ultrasonic_fresh
+                else None
+            )
+            front_right_ultrasonic_mm = (
+                ultrasonic_readings.front_right_mm
+                if ultrasonic_fresh
+                else None
+            )
             plan = planner.update(
                 geometry,
                 lidar_observation,
                 None,
                 elapsed,
                 enabled=True,
-                left_ultrasonic_mm=None,
-                right_ultrasonic_mm=None,
-                front_left_ultrasonic_mm=None,
-                front_center_ultrasonic_mm=None,
-                front_right_ultrasonic_mm=None,
+                left_ultrasonic_mm=left_ultrasonic_mm,
+                right_ultrasonic_mm=right_ultrasonic_mm,
+                front_left_ultrasonic_mm=front_left_ultrasonic_mm,
+                front_center_ultrasonic_mm=front_center_ultrasonic_mm,
+                front_right_ultrasonic_mm=front_right_ultrasonic_mm,
+                right_ultrasonic_reported=ultrasonic_fresh,
+                right_ultrasonic_timestamp=ultrasonic_received_at,
             )
             triangulation_recorder.write(
                 elapsed,
@@ -570,7 +617,12 @@ def run_prepared(args: argparse.Namespace) -> int:
                 and monotonic_now - last_command_at
                 >= 1.0 / max(1.0, config.runtime.command_rate_hz)
             ):
-                vehicle.send(plan.command)
+                serial_lines = vehicle.send(plan.command)
+                for line in serial_lines:
+                    report = parse_ultrasonic_line(line)
+                    if report is not None:
+                        ultrasonic_readings = report
+                        ultrasonic_received_at = monotonic_now
                 last_command_at = monotonic_now
 
             display, bev_display = draw_debug(
@@ -1871,7 +1923,14 @@ def open_vehicle(args: argparse.Namespace, config: ParkingAppConfig) -> SerialVe
         max_steering=abs(config.model_planner.max_steering_command),
     )
     client.connect()
-    LOG.info("serial connected: %s", client.port)
+    # The uploaded vehicle_controller firmware keeps ultrasonic streaming OFF
+    # after reset. Without USON it only replies "OK DRIVE/STOP", so SR remains
+    # None forever and the parking trigger can never fire.
+    client.write_line("USON")
+    LOG.info(
+        "serial connected: %s; ultrasonic streaming enabled",
+        client.port,
+    )
     return client
 
 
@@ -2392,7 +2451,20 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument("--lidar-port", default=None, help="live RPLidar serial port")
     parser.add_argument("--lidar-offset", type=float, default=0.0, help="seconds added to video time for CSV lookup")
     parser.add_argument("--allow-no-lidar", action="store_true", help="explicit unsafe test bypass; preview only")
-    parser.add_argument("--serial", action="store_true", help="enable Arduino output (disabled by default)")
+    serial_group = parser.add_mutually_exclusive_group()
+    serial_group.add_argument(
+        "--serial",
+        dest="serial",
+        action="store_true",
+        help="enable Arduino output (default for live camera/LiDAR)",
+    )
+    serial_group.add_argument(
+        "--no-serial",
+        dest="serial",
+        action="store_false",
+        help="disable Arduino output for a live dry run",
+    )
+    parser.set_defaults(serial=None)
     parser.add_argument("--serial-port", default=None)
     parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument("--frame-stride", type=int, default=1, help="video replay only: infer every Nth frame")
