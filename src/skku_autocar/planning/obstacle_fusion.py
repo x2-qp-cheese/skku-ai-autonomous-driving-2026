@@ -27,7 +27,10 @@ class ObstacleFusionConfig:
     frame_path_half_width_scale: float = 0.42
     frame_min_path_half_width_px: float = 12.0
     min_path_overlap_ratio: float = 0.15
+    min_current_path_overlap_ratio: float = 0.15
+    min_physical_lane_overlap_ratio: float = 0.0
     max_current_path_distance_ratio: float = 0.58
+    frame_boundary_margin_px: float = 4.0
     path_assignment_margin_px: float = 8.0
     path_assignment_overlap_margin: float = 0.10
     contact_band_ratio: float = 0.25
@@ -73,9 +76,28 @@ class FramePathGeometry:
 
     lane1: Tuple[Tuple[float, float], ...] = ()
     lane2: Tuple[Tuple[float, float], ...] = ()
+    lane2_left_boundary: Tuple[Tuple[float, float], ...] = ()
+    lane2_right_boundary: Tuple[Tuple[float, float], ...] = ()
 
     def line(self, lane_index: int) -> Tuple[Tuple[float, float], ...]:
         return self.lane1 if lane_index == 1 else self.lane2
+
+    def physical_bounds(
+        self,
+        lane_index: int,
+    ) -> Optional[
+        Tuple[
+            Tuple[Tuple[float, float], ...],
+            Tuple[Tuple[float, float], ...],
+        ]
+    ]:
+        if (
+            lane_index == 2
+            and len(self.lane2_left_boundary) >= 2
+            and len(self.lane2_right_boundary) >= 2
+        ):
+            return self.lane2_left_boundary, self.lane2_right_boundary
+        return None
 
 
 @dataclass(frozen=True)
@@ -95,6 +117,7 @@ class ObstacleFusionObservation:
     path_lane: int = 2
     closest_y_ratio: float = 0.0
     frame_y_ratio: float = 0.0
+    physical_lane_overlap: float = 0.0
     obstacle_count: int = 0
     visual_frames: int = 0
     front_mm: Optional[int] = None
@@ -115,6 +138,7 @@ class PathOccupancy:
     target_distance_px: float = 0.0
     current_distance_ratio: float = 0.0
     target_distance_ratio: float = 0.0
+    physical_lane_overlap: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -123,6 +147,7 @@ class PathAssessment:
     target_blocked: bool = False
     range_fallback_candidate: bool = False
     closest_y_ratio: float = 0.0
+    physical_lane_overlap: float = 0.0
     obstacle_count: int = 0
 
 
@@ -265,6 +290,7 @@ class ObstacleFusionPlanner:
                 path_lane=path_lane,
                 closest_y_ratio=bev_assessment.closest_y_ratio,
                 frame_y_ratio=frame_assessment.closest_y_ratio,
+                physical_lane_overlap=frame_assessment.physical_lane_overlap,
                 obstacle_count=obstacle_count,
                 front_mm=front_mm,
                 front_sensor_count=front_count,
@@ -332,6 +358,7 @@ class ObstacleFusionPlanner:
             path_lane=path_lane,
             closest_y_ratio=bev_assessment.closest_y_ratio,
             frame_y_ratio=frame_assessment.closest_y_ratio,
+            physical_lane_overlap=frame_assessment.physical_lane_overlap,
             obstacle_count=obstacle_count,
             visual_frames=self._visual_frames,
             front_mm=front_mm,
@@ -453,12 +480,13 @@ class ObstacleFusionPlanner:
             if obs.planned_target_lane is None
             else "L%d" % obs.planned_target_lane
         )
-        return "L%d %s plan=%s by=%.2f fy=%.2f conf=%.2f front=%s q=%d r=%d ttc=%s side=%s" % (
+        return "L%d %s plan=%s by=%.2f fy=%.2f in=%.2f conf=%.2f front=%s q=%d r=%d ttc=%s side=%s" % (
             obs.path_lane,
             state,
             plan,
             obs.closest_y_ratio,
             obs.frame_y_ratio,
+            obs.physical_lane_overlap,
             obs.visual_confidence,
             front,
             obs.front_sensor_count,
@@ -678,6 +706,7 @@ class ObstacleFusionPlanner:
         target_line = frame_paths.line(1 if path_lane == 2 else 2)
         if len(current_line) < 2 or len(target_line) < 2:
             return PathAssessment()
+        physical_bounds = frame_paths.physical_bounds(path_lane)
 
         measurements = []
         for mask in obstacle_masks:
@@ -715,11 +744,36 @@ class ObstacleFusionPlanner:
                 max(1.0, self.config.frame_min_path_half_width_px),
                 lane_spacing * max(0.0, self.config.frame_path_half_width_scale),
             )
+            inside_physical_lane = np.ones(len(contact_xs), dtype=bool)
+            if physical_bounds is not None:
+                left_boundary, right_boundary = physical_bounds
+                left_x = self._center_x_at(
+                    contact_ys,
+                    left_boundary,
+                    float(binary.shape[1]) / 2.0,
+                )
+                right_x = self._center_x_at(
+                    contact_ys,
+                    right_boundary,
+                    float(binary.shape[1]) / 2.0,
+                )
+                margin = max(
+                    0.0,
+                    float(self.config.frame_boundary_margin_px),
+                )
+                lower = np.minimum(left_x, right_x) - margin
+                upper = np.maximum(left_x, right_x) + margin
+                inside_physical_lane = (
+                    (contact_xs >= lower)
+                    & (contact_xs <= upper)
+                )
             measurements.append(
                 PathOccupancy(
                     bottom_y_ratio=max_y / float(max(1, binary.shape[0] - 1)),
                     current_overlap=float(
-                        np.mean(np.abs(contact_xs - current_x) <= half_width)
+                        np.mean(
+                            np.abs(contact_xs - current_x) <= half_width
+                        )
                     ),
                     target_overlap=float(
                         np.mean(np.abs(contact_xs - target_x) <= half_width)
@@ -731,6 +785,9 @@ class ObstacleFusionPlanner:
                     ),
                     target_distance_ratio=float(
                         np.mean(target_distance / safe_lane_spacing)
+                    ),
+                    physical_lane_overlap=float(
+                        np.mean(inside_physical_lane)
                     ),
                 )
             )
@@ -842,9 +899,23 @@ class ObstacleFusionPlanner:
         target_y_threshold: float,
     ) -> PathAssessment:
         overlap_min = max(0.0, min(1.0, self.config.min_path_overlap_ratio))
+        current_overlap_min = max(
+            overlap_min,
+            max(
+                0.0,
+                min(1.0, self.config.min_current_path_overlap_ratio),
+            ),
+        )
         max_current_distance = max(
             0.0,
             float(self.config.max_current_path_distance_ratio),
+        )
+        min_physical_overlap = max(
+            0.0,
+            min(
+                1.0,
+                float(self.config.min_physical_lane_overlap_ratio),
+            ),
         )
         assignment_margin_px = max(
             0.0,
@@ -858,10 +929,14 @@ class ObstacleFusionPlanner:
         def inside_current_path(item: PathOccupancy) -> bool:
             return item.current_distance_ratio <= max_current_distance
 
+        def inside_physical_lane(item: PathOccupancy) -> bool:
+            return item.physical_lane_overlap >= min_physical_overlap
+
         def current_preferred(item: PathOccupancy) -> bool:
             return (
-                item.current_overlap >= overlap_min
+                item.current_overlap >= current_overlap_min
                 and inside_current_path(item)
+                and inside_physical_lane(item)
                 and not target_preferred(item)
                 and item.current_distance_px
                 <= item.target_distance_px + assignment_margin_px
@@ -882,8 +957,9 @@ class ObstacleFusionPlanner:
             item
             for item in measurements
             if item.bottom_y_ratio >= current_y_threshold
-            and item.current_overlap >= overlap_min
+            and item.current_overlap >= current_overlap_min
             and inside_current_path(item)
+            and inside_physical_lane(item)
             and current_preferred(item)
         ]
         target = [
@@ -902,6 +978,7 @@ class ObstacleFusionPlanner:
         range_fallback = any(
             item.bottom_y_ratio >= current_y_threshold
             and inside_current_path(item)
+            and inside_physical_lane(item)
             and item.current_distance_px
             <= item.target_distance_px + assignment_margin_px
             and not target_preferred(item)
@@ -913,6 +990,14 @@ class ObstacleFusionPlanner:
             range_fallback_candidate=range_fallback,
             closest_y_ratio=max(
                 (item.bottom_y_ratio for item in current),
+                default=0.0,
+            ),
+            physical_lane_overlap=max(
+                (
+                    item.physical_lane_overlap
+                    for item in measurements
+                    if item.bottom_y_ratio >= current_y_threshold
+                ),
                 default=0.0,
             ),
             obstacle_count=len(measurements),

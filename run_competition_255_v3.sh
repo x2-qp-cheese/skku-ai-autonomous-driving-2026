@@ -31,6 +31,9 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-heading-lead-gain 180 \
   --path-heading-lead-span 0.15 \
   --path-heading-lead-max-steering 36 \
+  --path-integral-gain 45 \
+  --path-integral-limit 0.25 \
+  --path-integral-decay 0.65 \
   --bev-lookahead 0.32 \
   --bev-center-smooth 0.32 \
   --bev-heading-smooth 1.0 \
@@ -55,6 +58,11 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --obstacle-min-front-sensors 2 \
   --obstacle-range-confirm-frames 1 \
   --obstacle-visual-confirm-frames 2 \
+  --obstacle-current-path-min-overlap 0.40 \
+  --obstacle-physical-lane-min-overlap 0.65 \
+  --obstacle-current-path-max-distance-ratio 0.48 \
+  --obstacle-frame-boundary-margin-px 3 \
+  --obstacle-range-visual-fallback off \
   --lane-change-target-width-px 150 \
   --lane-change-steering-override off \
   --lane-change-steering-min 0 \
@@ -67,5 +75,9 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --lane-change-stable-near-error 0.35 \
   --lane-change-stable-frames 3 \
   --light-stop-during-lane-change on \
+  --light-confirm-frames 2 \
+  --light-red-confirm-frames 2 \
+  --light-min-color-pixels 300 \
+  --light-max-mask-area-ratio 0.06 \
   --obstacle-emergency-stop off \
   "$@"

@@ -20,6 +20,7 @@ from skku_autocar.planning.obstacle_fusion import (
 )
 from skku_autocar.runtime.obstacle_mode import (
     ObstacleDriveMode,
+    _frame_boundary_from_masks,
     build_lane_change_config,
     build_obstacle_fusion_config,
     lane_change_geometry_reliable,
@@ -108,6 +109,25 @@ def planner(**overrides):
 
 
 class ObstacleFusionPlannerTest(unittest.TestCase):
+    def test_frame_boundary_prefers_raw_side_mask_nearest_bev_reference(self):
+        left = np.zeros(SHAPE, dtype=np.uint8)
+        right = np.zeros(SHAPE, dtype=np.uint8)
+        left[20:90, 25:29] = 255
+        right[20:90, 145:149] = 255
+        reference = tuple((150.0, float(y)) for y in range(30, 100, 5))
+
+        boundary = _frame_boundary_from_masks(
+            (left, right),
+            reference,
+            merge_instances=False,
+        )
+
+        self.assertGreater(len(boundary), 10)
+        self.assertAlmostEqual(
+            float(np.median([point[0] for point in boundary])),
+            146.5,
+        )
+
     def test_current_obstacle_touching_target_projection_does_not_block_target(self):
         fusion = planner()
         assessment = fusion._assess_measurements(
@@ -257,6 +277,82 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertFalse(fusion.observation.visual_detected)
         self.assertFalse(fusion.observation.fused_hazard)
         self.assertEqual(change.state, "lane2")
+
+    def test_frame_obstacle_outside_physical_boundary_is_not_current_lane(self):
+        fusion = planner(
+            visual_confirm_frames=1,
+            min_current_path_overlap_ratio=0.35,
+            min_physical_lane_overlap_ratio=0.65,
+        )
+        change = controller()
+        frame_paths = FramePathGeometry(
+            lane1=tuple((110.0, float(y)) for y in range(0, 100, 5)),
+            lane2=tuple((170.0, float(y)) for y in range(0, 100, 5)),
+            lane2_left_boundary=tuple(
+                (100.0, float(y)) for y in range(0, 100, 5)
+            ),
+            lane2_right_boundary=tuple(
+                (150.0, float(y)) for y in range(0, 100, 5)
+            ),
+        )
+        outside = obstacle_mask(160, 181, 45, 70)
+
+        event = fusion.update(
+            [],
+            SHAPE,
+            CENTERLINE,
+            lane(),
+            change,
+            ultrasound(fc=700, fr=720, fl=740),
+            1.0,
+            True,
+            frame_obstacle_masks=[outside],
+            frame_paths=frame_paths,
+            obstacle_confidence=0.98,
+        )
+
+        self.assertIsNone(event)
+        self.assertFalse(fusion.observation.visual_detected)
+        self.assertFalse(fusion.observation.fused_hazard)
+        self.assertEqual(change.state, "lane2")
+
+    def test_frame_obstacle_inside_physical_boundary_remains_actionable(self):
+        fusion = planner(
+            visual_confirm_frames=1,
+            min_current_path_overlap_ratio=0.35,
+            min_physical_lane_overlap_ratio=0.65,
+        )
+        change = controller()
+        frame_paths = FramePathGeometry(
+            lane1=tuple((80.0, float(y)) for y in range(0, 100, 5)),
+            lane2=tuple((140.0, float(y)) for y in range(0, 100, 5)),
+            lane2_left_boundary=tuple(
+                (110.0, float(y)) for y in range(0, 100, 5)
+            ),
+            lane2_right_boundary=tuple(
+                (170.0, float(y)) for y in range(0, 100, 5)
+            ),
+        )
+        inside = obstacle_mask(130, 151, 45, 70)
+
+        event = fusion.update(
+            [],
+            SHAPE,
+            CENTERLINE,
+            lane(),
+            change,
+            ultrasound(fc=700, fr=720, fl=740),
+            1.0,
+            True,
+            frame_obstacle_masks=[inside],
+            frame_paths=frame_paths,
+            obstacle_confidence=0.98,
+        )
+
+        self.assertIn("lane2 -> lane1", event)
+        self.assertTrue(fusion.observation.visual_detected)
+        self.assertTrue(fusion.observation.fused_hazard)
+        self.assertEqual(change.state, "armed")
 
     def test_range_backed_visual_fallback_ignores_target_lane_obstacle(self):
         fusion = planner(
@@ -1044,6 +1140,10 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
                 "off",
                 "--obstacle-range-visual-confidence",
                 "0.92",
+                "--obstacle-current-path-min-overlap",
+                "0.41",
+                "--obstacle-physical-lane-min-overlap",
+                "0.67",
                 "--obstacle-current-path-max-distance-ratio",
                 "0.54",
                 "--obstacle-trigger-mm",
@@ -1082,6 +1182,8 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertAlmostEqual(config.visual_action_confidence, 0.78)
         self.assertFalse(config.range_visual_fallback_enabled)
         self.assertAlmostEqual(config.range_visual_fallback_confidence, 0.92)
+        self.assertAlmostEqual(config.min_current_path_overlap_ratio, 0.41)
+        self.assertAlmostEqual(config.min_physical_lane_overlap_ratio, 0.67)
         self.assertAlmostEqual(config.max_current_path_distance_ratio, 0.54)
         self.assertEqual(config.ultrasonic_trigger_mm, 900.0)
         self.assertEqual(config.min_front_sensors, 2)

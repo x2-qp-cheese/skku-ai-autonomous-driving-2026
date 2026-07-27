@@ -180,6 +180,18 @@ class ObstacleDriveMode:
             self._corridor_estimator.last_centerline_bev,
             self._planner.config.lane_width_px,
             frame_shape[:2],
+            lane2_left_boundary=getattr(
+                self._corridor_estimator,
+                "last_center_line_bev",
+                (),
+            ),
+            lane2_right_boundary=getattr(
+                self._corridor_estimator,
+                "last_right_line_bev",
+                (),
+            ),
+            frame_center_masks=class_masks.center,
+            frame_side_masks=class_masks.side,
         )
         event = self._planner.update(
             planning_masks,
@@ -330,12 +342,14 @@ class ObstacleDriveMode:
         )
         LOG.info(
             "obstacle vision bev_y=%.2f/%.2f frame_y=%.2f/%.2f action_conf=%.2f "
-            "confirm=%d front_quorum=%d side=%.0fmm",
+            "overlap=%.2f physical=%.2f confirm=%d front_quorum=%d side=%.0fmm",
             args.obstacle_visual_trigger_y,
             args.obstacle_target_block_y,
             args.obstacle_frame_visual_trigger_y,
             args.obstacle_frame_target_block_y,
             args.obstacle_action_confidence,
+            args.obstacle_current_path_min_overlap,
+            args.obstacle_physical_lane_min_overlap,
             args.obstacle_visual_confirm_frames,
             args.obstacle_min_front_sensors,
             args.obstacle_side_clearance_mm,
@@ -418,6 +432,10 @@ def build_obstacle_frame_paths(
     base_centerline: list,
     lane_width_px: float,
     frame_hw: tuple,
+    lane2_left_boundary: tuple = (),
+    lane2_right_boundary: tuple = (),
+    frame_center_masks: tuple = (),
+    frame_side_masks: tuple = (),
 ) -> Optional[FramePathGeometry]:
     if len(base_centerline) < 2:
         return None
@@ -426,10 +444,95 @@ def build_obstacle_frame_paths(
     lane1_bev = [(float(x) - width, float(y)) for x, y in base_centerline]
     lane1_frame = transformer.bev_to_frame(lane1_bev, frame_hw)
     lane2_frame = transformer.bev_to_frame(lane2_bev, frame_hw)
+    left_frame = (
+        transformer.bev_to_frame(lane2_left_boundary, frame_hw)
+        if len(lane2_left_boundary) >= 2
+        else ()
+    )
+    right_frame = (
+        transformer.bev_to_frame(lane2_right_boundary, frame_hw)
+        if len(lane2_right_boundary) >= 2
+        else ()
+    )
+    # Raw lane masks extend above the BEV source trapezoid. They prevent a far,
+    # off-track object from being classified against a projected boundary that
+    # has clamped to its first valid BEV point.
+    direct_left = _frame_boundary_from_masks(
+        frame_center_masks,
+        left_frame,
+        merge_instances=True,
+    )
+    direct_right = _frame_boundary_from_masks(
+        frame_side_masks,
+        right_frame,
+        merge_instances=False,
+    )
+    if len(direct_left) >= 2:
+        left_frame = direct_left
+    if len(direct_right) >= 2:
+        right_frame = direct_right
     return FramePathGeometry(
         lane1=tuple((float(x), float(y)) for x, y in lane1_frame),
         lane2=tuple((float(x), float(y)) for x, y in lane2_frame),
+        lane2_left_boundary=tuple(
+            (float(x), float(y))
+            for x, y in left_frame
+        ),
+        lane2_right_boundary=tuple(
+            (float(x), float(y))
+            for x, y in right_frame
+        ),
     )
+
+
+def _frame_boundary_from_masks(
+    masks: tuple,
+    reference_line: Sequence[Tuple[float, float]],
+    merge_instances: bool,
+) -> Tuple[Tuple[float, float], ...]:
+    import numpy as np
+
+    candidates = []
+    for mask in masks:
+        binary = np.asarray(mask) > 0
+        if binary.ndim != 2 or not binary.any():
+            continue
+        ys = np.nonzero(binary.any(axis=1))[0]
+        points = []
+        for y in ys[::3]:
+            xs = np.nonzero(binary[int(y)])[0]
+            if len(xs):
+                points.append((float(np.median(xs)), float(y)))
+        if len(points) >= 2:
+            candidates.append(tuple(points))
+    if not candidates:
+        return ()
+    if merge_instances:
+        return tuple(
+            sorted(
+                (point for line in candidates for point in line),
+                key=lambda point: point[1],
+            )
+        )
+    if len(candidates) == 1 or len(reference_line) < 2:
+        return max(candidates, key=len)
+
+    reference = sorted(reference_line, key=lambda point: point[1])
+    reference_y = np.asarray([point[1] for point in reference], dtype=float)
+    reference_x = np.asarray([point[0] for point in reference], dtype=float)
+
+    def distance(line: Tuple[Tuple[float, float], ...]) -> float:
+        points = np.asarray(line, dtype=float)
+        overlap = (
+            (points[:, 1] >= reference_y[0])
+            & (points[:, 1] <= reference_y[-1])
+        )
+        if overlap.any():
+            points = points[overlap]
+        expected_x = np.interp(points[:, 1], reference_y, reference_x)
+        return float(np.median(np.abs(points[:, 0] - expected_x)))
+
+    return min(candidates, key=distance)
 
 
 def build_obstacle_fusion_config(args: argparse.Namespace) -> ObstacleFusionConfig:
@@ -446,7 +549,10 @@ def build_obstacle_fusion_config(args: argparse.Namespace) -> ObstacleFusionConf
         path_half_width_px=args.obstacle_path_half_width_px,
         frame_path_half_width_scale=args.obstacle_frame_path_width_scale,
         min_path_overlap_ratio=args.obstacle_min_overlap,
+        min_current_path_overlap_ratio=args.obstacle_current_path_min_overlap,
+        min_physical_lane_overlap_ratio=args.obstacle_physical_lane_min_overlap,
         max_current_path_distance_ratio=args.obstacle_current_path_max_distance_ratio,
+        frame_boundary_margin_px=args.obstacle_frame_boundary_margin_px,
         contact_band_ratio=args.obstacle_contact_band,
         visual_action_confidence=args.obstacle_action_confidence,
         range_visual_fallback_enabled=args.obstacle_range_visual_fallback == "on",
@@ -591,7 +697,22 @@ def add_obstacle_arguments(parser: argparse.ArgumentParser) -> None:
         ("--obstacle-path-half-width-px", float, ObstacleFusionConfig.path_half_width_px),
         ("--obstacle-frame-path-width-scale", float, ObstacleFusionConfig.frame_path_half_width_scale),
         ("--obstacle-min-overlap", float, ObstacleFusionConfig.min_path_overlap_ratio),
+        (
+            "--obstacle-current-path-min-overlap",
+            float,
+            ObstacleFusionConfig.min_current_path_overlap_ratio,
+        ),
+        (
+            "--obstacle-physical-lane-min-overlap",
+            float,
+            ObstacleFusionConfig.min_physical_lane_overlap_ratio,
+        ),
         ("--obstacle-current-path-max-distance-ratio", float, ObstacleFusionConfig.max_current_path_distance_ratio),
+        (
+            "--obstacle-frame-boundary-margin-px",
+            float,
+            ObstacleFusionConfig.frame_boundary_margin_px,
+        ),
         ("--obstacle-contact-band", float, ObstacleFusionConfig.contact_band_ratio),
         ("--obstacle-action-confidence", float, ObstacleFusionConfig.visual_action_confidence),
         ("--obstacle-range-visual-confidence", float, ObstacleFusionConfig.range_visual_fallback_confidence),

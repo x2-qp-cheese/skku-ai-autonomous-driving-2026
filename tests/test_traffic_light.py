@@ -213,6 +213,24 @@ class TrafficLightControllerTest(unittest.TestCase):
         self.assertEqual(observation.candidate, "unknown")
         self.assertEqual(observation.state, "red")
 
+    def test_oversized_red_light_mask_is_rejected(self):
+        controller = TrafficLightController(
+            TrafficLightConfig(
+                confirm_frames=1,
+                min_color_pixels=5,
+                max_mask_area_ratio=0.25,
+            )
+        )
+        frame = np.zeros((40, 40, 3), dtype=np.uint8)
+        frame[:, :] = (0, 0, 255)
+        oversized = np.full((40, 40), 255, dtype=np.uint8)
+
+        observation = controller.update(frame, (oversized,))
+
+        self.assertFalse(observation.detected)
+        self.assertEqual(observation.candidate, "unknown")
+        self.assertEqual(observation.state, "unknown")
+
 
 if __name__ == "__main__":
     unittest.main()

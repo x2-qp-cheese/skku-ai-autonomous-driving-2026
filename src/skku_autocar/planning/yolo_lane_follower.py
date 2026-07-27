@@ -56,6 +56,11 @@ class YoloLaneFollowerConfig:
     path_heading_lead_gain: float = 180.0
     path_heading_lead_span: float = 0.15
     path_heading_lead_max_steering: float = 36.0
+    # A bounded integral term removes persistent mechanical/camera centering
+    # bias, but only while two physical boundaries describe a stable straight.
+    path_integral_gain: float = 45.0
+    path_integral_limit: float = 0.25
+    path_integral_decay: float = 0.65
 
     # Pure-pursuit steering: instead of summing a lateral-error PID and a heading
     # PID, steer the wheel directly toward the BEV centerline's lookahead point
@@ -82,6 +87,7 @@ class YoloLaneFollower:
         self._lane_lost_frames = 0
         self._path_state = "straight"
         self._path_heading_lead = 0.0
+        self._path_error_integral = 0.0
 
     def plan(self, lane: LaneGeometry) -> ControlCommand:
         if not lane.found or lane.confidence < self.config.min_confidence:
@@ -154,11 +160,17 @@ class YoloLaneFollower:
             -heading_lead_limit,
             heading_lead_limit,
         )
+        integral_steering = self._path_integral_correction(
+            lane,
+            path_error,
+            heading_lead,
+        )
         raw_steering = (
             self.config.path_lateral_gain * path_error
             + self.config.path_heading_gain * lane.heading_error
             + self.config.path_derivative_gain * derivative
             + heading_feedforward
+            + integral_steering
         )
 
         alpha = self._path_steering_alpha(
@@ -293,6 +305,50 @@ class YoloLaneFollower:
         confidence = self._clip_float(float(lane.confidence), 0.0, 1.0)
         return self._clip_float(lead * alignment * confidence, 0.0, 1.0)
 
+    def _path_integral_correction(
+        self,
+        lane: LaneGeometry,
+        path_error: float,
+        heading_lead: float,
+    ) -> float:
+        reason = str(lane.reason)
+        state = self._classify_path_state(
+            path_error,
+            float(lane.heading_error),
+            heading_lead,
+        )
+        reliable_straight = (
+            state == "straight"
+            and reason.startswith("corridor_tier1")
+            and all(
+                token not in reason
+                for token in ("lane_change", "crosswalk", "coast", "virtual")
+            )
+            and float(lane.confidence) >= 0.80
+        )
+        limit = max(0.0, float(self.config.path_integral_limit))
+        if reliable_straight and limit > 0.0:
+            if self._path_error_integral * path_error < 0.0:
+                self._path_error_integral *= 0.5
+            self._path_error_integral = self._clip_float(
+                self._path_error_integral + float(path_error),
+                -limit,
+                limit,
+            )
+        else:
+            decay = self._clip_float(
+                float(self.config.path_integral_decay),
+                0.0,
+                1.0,
+            )
+            self._path_error_integral *= decay
+            if abs(self._path_error_integral) < 1e-4:
+                self._path_error_integral = 0.0
+        return (
+            float(self.config.path_integral_gain)
+            * self._path_error_integral
+        )
+
     @staticmethod
     def _classify_path_state(
         path_error: float,
@@ -342,6 +398,8 @@ class YoloLaneFollower:
         if not running:
             self.reset()
             return
+        if command.brake:
+            self._path_error_integral = 0.0
         self._last_steering = int(command.steering)
 
     def _plan_pure_pursuit(self, lane: LaneGeometry) -> ControlCommand:
@@ -458,6 +516,7 @@ class YoloLaneFollower:
         self._lane_lost_frames = 0
         self._path_state = "straight"
         self._path_heading_lead = 0.0
+        self._path_error_integral = 0.0
 
     @staticmethod
     def _derivative(value: float, previous: Optional[float]) -> float:

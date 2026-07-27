@@ -69,6 +69,7 @@ def run(args: argparse.Namespace) -> int:
             min_color_pixels=args.light_min_color_pixels,
             min_color_ratio=args.light_min_color_ratio,
             dominance_ratio=args.light_dominance_ratio,
+            max_mask_area_ratio=args.light_max_mask_area_ratio,
             confirm_frames=args.light_confirm_frames,
             red_confirm_frames=args.light_red_confirm_frames,
             contact_confirm_frames=args.light_contact_confirm_frames,
@@ -432,6 +433,9 @@ def build_follower_config(args: argparse.Namespace) -> YoloLaneFollowerConfig:
         path_heading_lead_gain=args.path_heading_lead_gain,
         path_heading_lead_span=args.path_heading_lead_span,
         path_heading_lead_max_steering=args.path_heading_lead_max_steering,
+        path_integral_gain=args.path_integral_gain,
+        path_integral_limit=args.path_integral_limit,
+        path_integral_decay=args.path_integral_decay,
         pure_pursuit=args.pure_pursuit,
         pure_pursuit_gain=args.pp_gain,
         pure_pursuit_full_angle=args.pp_full_angle,
@@ -464,7 +468,7 @@ def log_effective_config(
             follower_config.steering_release_rate_limit,
         )
     LOG.info(
-        "control mode=%s speed=%d min_curve=%d max=%d max_steer=%d path_gain=%.1f/%.1f/%.1f path_weight=%.2f..%.2f path_alpha=%.2f/%.2f heading_lead=%.1f/%.2f/max%.1f center_lock=%s lane_lost_release=%d/frame",
+        "control mode=%s speed=%d min_curve=%d max=%d max_steer=%d path_gain=%.1f/%.1f/%.1f path_weight=%.2f..%.2f path_alpha=%.2f/%.2f heading_lead=%.1f/%.2f/max%.1f integral=%.1f/max%.2f center_lock=%s lane_lost_release=%d/frame",
         (
             "whole_path"
             if follower_config.path_tracking
@@ -484,6 +488,8 @@ def log_effective_config(
         follower_config.path_heading_lead_gain,
         follower_config.path_heading_lead_span,
         follower_config.path_heading_lead_max_steering,
+        follower_config.path_integral_gain,
+        follower_config.path_integral_limit,
         "on" if follower_config.center_lock_enabled else "off",
         lane_lost_release,
     )
@@ -782,6 +788,12 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument("--light-min-color-pixels", type=int, default=TrafficLightConfig.min_color_pixels)
     parser.add_argument("--light-min-color-ratio", type=float, default=TrafficLightConfig.min_color_ratio)
     parser.add_argument("--light-dominance-ratio", type=float, default=TrafficLightConfig.dominance_ratio)
+    parser.add_argument(
+        "--light-max-mask-area-ratio",
+        type=float,
+        default=TrafficLightConfig.max_mask_area_ratio,
+        help="ignore implausibly large YOLO light masks, such as a nearby face",
+    )
     parser.add_argument(
         "--light-stop-line-y",
         type=float,
@@ -1170,6 +1182,24 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         type=float,
         default=YoloLaneFollowerConfig.path_heading_lead_max_steering,
         help="maximum steering contribution from curve-entry heading feed-forward",
+    )
+    parser.add_argument(
+        "--path-integral-gain",
+        type=float,
+        default=YoloLaneFollowerConfig.path_integral_gain,
+        help="bounded straight-line integral gain for persistent centering bias",
+    )
+    parser.add_argument(
+        "--path-integral-limit",
+        type=float,
+        default=YoloLaneFollowerConfig.path_integral_limit,
+        help="maximum accumulated normalized straight-line path error",
+    )
+    parser.add_argument(
+        "--path-integral-decay",
+        type=float,
+        default=YoloLaneFollowerConfig.path_integral_decay,
+        help="integral state retention outside reliable tier-1 straight driving",
     )
     parser.add_argument(
         "--pp-gain",

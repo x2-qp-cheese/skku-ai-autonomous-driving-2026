@@ -15,6 +15,7 @@ class TrafficLightConfig:
     min_color_pixels: int = 8
     min_color_ratio: float = 0.01
     dominance_ratio: float = 1.35
+    max_mask_area_ratio: float = 1.0
     confirm_frames: int = 3
     red_confirm_frames: Optional[int] = None
     contact_confirm_frames: int = 2
@@ -69,7 +70,22 @@ class TrafficLightController:
 
         union = self._union_masks(masks)
         contact_union = union if contact_masks is None else self._union_masks(contact_masks)
-        detected = union is not None and bool(union.any())
+        union_pixels = int(union.sum()) if union is not None else 0
+        frame_pixels = max(1, int(frame.shape[0]) * int(frame.shape[1]))
+        max_mask_pixels = int(
+            round(
+                frame_pixels
+                * max(0.0, float(self.config.max_mask_area_ratio))
+            )
+        )
+        detected = (
+            union is not None
+            and union_pixels > 0
+            and (
+                max_mask_pixels <= 0
+                or union_pixels <= max_mask_pixels
+            )
+        )
         candidate = "unknown"
         red_pixels = 0
         green_pixels = 0
@@ -90,7 +106,7 @@ class TrafficLightController:
             green = vivid & (hue >= 35) & (hue <= 95)
             red_pixels = int(red.sum())
             green_pixels = int(green.sum())
-            mask_pixels = int(union.sum())
+            mask_pixels = union_pixels
             candidate = self._candidate(red_pixels, green_pixels, mask_pixels)
             self._advance(candidate)
 

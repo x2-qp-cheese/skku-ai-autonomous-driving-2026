@@ -162,6 +162,78 @@ class YoloLaneGeometryTest(unittest.TestCase):
 
         self.assertEqual(command.steering, 30)
 
+    def test_path_integral_removes_persistent_straight_centering_bias(self):
+        follower = YoloLaneFollower(
+            YoloLaneFollowerConfig(
+                path_tracking=True,
+                path_lateral_gain=0.0,
+                path_heading_gain=0.0,
+                path_derivative_gain=0.0,
+                path_heading_lead_gain=0.0,
+                path_integral_gain=40.0,
+                path_integral_limit=0.25,
+                path_integral_decay=0.0,
+                path_steering_rise_alpha=1.0,
+                path_steering_release_alpha=1.0,
+                steering_rate_limit=500,
+                min_steering_rate_limit=500,
+                steering_release_rate_limit=500,
+                max_steering=500,
+            )
+        )
+        biased_straight = lane_geometry(
+            lateral_error_norm=-0.02,
+            heading_error=0.0,
+            near_lateral_error_norm=-0.02,
+            reason="corridor_tier1",
+        )
+
+        command = None
+        for _ in range(20):
+            command = follower.plan(biased_straight)
+
+        self.assertIsNotNone(command)
+        self.assertEqual(command.steering, -10)
+
+    def test_path_integral_releases_outside_reliable_straight(self):
+        follower = YoloLaneFollower(
+            YoloLaneFollowerConfig(
+                path_tracking=True,
+                path_lateral_gain=0.0,
+                path_heading_gain=0.0,
+                path_derivative_gain=0.0,
+                path_heading_lead_gain=0.0,
+                path_integral_gain=40.0,
+                path_integral_limit=0.25,
+                path_integral_decay=0.0,
+                path_steering_rise_alpha=1.0,
+                path_steering_release_alpha=1.0,
+                steering_rate_limit=500,
+                min_steering_rate_limit=500,
+                steering_release_rate_limit=500,
+                max_steering=500,
+            )
+        )
+        biased_straight = lane_geometry(
+            lateral_error_norm=-0.02,
+            heading_error=0.0,
+            near_lateral_error_norm=-0.02,
+            reason="corridor_tier1",
+        )
+        for _ in range(20):
+            follower.plan(biased_straight)
+
+        curve = follower.plan(
+            lane_geometry(
+                lateral_error_norm=0.0,
+                heading_error=0.50,
+                near_lateral_error_norm=0.0,
+                reason="corridor_tier1",
+            )
+        )
+
+        self.assertEqual(curve.steering, 0)
+
     def test_path_filter_tracks_actual_brake_steering_before_restart(self):
         follower = YoloLaneFollower(
             YoloLaneFollowerConfig(
@@ -932,6 +1004,7 @@ def lane_geometry(
     lateral_error_norm: float,
     heading_error: float,
     near_lateral_error_norm: float = None,
+    reason: str = "test",
 ) -> LaneGeometry:
     return LaneGeometry(
         found=True,
@@ -942,7 +1015,7 @@ def lane_geometry(
         lateral_error_norm=lateral_error_norm,
         heading_error=heading_error,
         confidence=1.0,
-        reason="test",
+        reason=reason,
         near_lateral_error_norm=near_lateral_error_norm,
     )
 
