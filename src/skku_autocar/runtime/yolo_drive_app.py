@@ -442,8 +442,10 @@ def build_follower_config(args: argparse.Namespace) -> YoloLaneFollowerConfig:
         path_reversal_rate_limit=args.path_reversal_rate_limit,
         path_near_conflict_error_threshold=args.path_near_conflict_error_threshold,
         path_near_conflict_release_alpha=args.path_near_conflict_release_alpha,
+        path_near_conflict_heading_limit=args.path_near_conflict_heading_limit,
         path_curve_guard_heading_threshold=args.path_curve_guard_heading_threshold,
         path_curve_guard_near_error=args.path_curve_guard_near_error,
+        path_curve_guard_release_error=args.path_curve_guard_release_error,
         path_curve_guard_steering_limit=args.path_curve_guard_steering_limit,
         path_heading_lead_gain=args.path_heading_lead_gain,
         path_heading_lead_span=args.path_heading_lead_span,
@@ -483,7 +485,7 @@ def log_effective_config(
             follower_config.steering_release_rate_limit,
         )
     LOG.info(
-        "control mode=%s speed=%d min_curve=%d max=%d max_steer=%d path_gain=%.1f/%.1f/%.1f path_weight=%.2f..%.2f path_alpha=%.2f/%.2f path_recovery=%.2f/min%.0f path_reversal=%.2f/min%.0f/%d path_conflict=%.3f/%.2f path_guard=%.2f/%.2f/max%.0f heading_lead=%.1f/%.2f/max%.1f integral=%.1f/max%.2f center_lock=%s lane_lost_release=%d/frame",
+        "control mode=%s speed=%d min_curve=%d max=%d max_steer=%d path_gain=%.1f/%.1f/%.1f path_weight=%.2f..%.2f path_alpha=%.2f/%.2f path_recovery=%.2f/min%.0f path_reversal=%.2f/min%.0f/%d path_conflict=%.3f/%.2f/head%.2f path_guard=%.2f/%.2f..%.2f/max%.0f heading_lead=%.1f/%.2f/max%.1f integral=%.1f/max%.2f center_lock=%s lane_lost_release=%d/frame",
         (
             "whole_path"
             if follower_config.path_tracking
@@ -507,8 +509,10 @@ def log_effective_config(
         follower_config.path_reversal_rate_limit,
         follower_config.path_near_conflict_error_threshold,
         follower_config.path_near_conflict_release_alpha,
+        follower_config.path_near_conflict_heading_limit,
         follower_config.path_curve_guard_heading_threshold,
         follower_config.path_curve_guard_near_error,
+        follower_config.path_curve_guard_release_error,
         follower_config.path_curve_guard_steering_limit,
         follower_config.path_heading_lead_gain,
         follower_config.path_heading_lead_span,
@@ -1251,6 +1255,11 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         default=YoloLaneFollowerConfig.path_near_conflict_release_alpha,
     )
     parser.add_argument(
+        "--path-near-conflict-heading-limit",
+        type=float,
+        default=YoloLaneFollowerConfig.path_near_conflict_heading_limit,
+    )
+    parser.add_argument(
         "--path-curve-guard-heading-threshold",
         type=float,
         default=YoloLaneFollowerConfig.path_curve_guard_heading_threshold,
@@ -1259,6 +1268,11 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         "--path-curve-guard-near-error",
         type=float,
         default=YoloLaneFollowerConfig.path_curve_guard_near_error,
+    )
+    parser.add_argument(
+        "--path-curve-guard-release-error",
+        type=float,
+        default=YoloLaneFollowerConfig.path_curve_guard_release_error,
     )
     parser.add_argument(
         "--path-curve-guard-steering-limit",

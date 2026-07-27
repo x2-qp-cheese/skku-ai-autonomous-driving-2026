@@ -342,25 +342,14 @@ class ObstacleFusionPlanner:
             target_blocked,
             solid_blocked,
         )
-        visual_commit_confirmed = self._visual_commit_confirmed(
-            frame_assessment,
-            frame_obstacle_masks,
-            visual_confidence,
-        )
-        range_confirmed = (
-            self.config.fusion_mode == "yolo"
-            or self._range_hazard
-            or visual_commit_confirmed
-        )
-        fused_hazard = self._visual_confirmed and range_confirmed
-        blocked = target_blocked or solid_blocked or not side_clear
         different_path_event = (
             self._consumed
             and self._last_trigger_path_lane is not None
             and path_lane != self._last_trigger_path_lane
         )
-        # Immediately after an avoidance, one nearby source obstacle can span
-        # both projected paths. It is not a new obstacle in the destination.
+        # The old obstacle first appears on the destination projection while the
+        # vehicle clears it. Only after that evidence may a projection-only mask
+        # on the new current path represent a distinct obstacle.
         clearing_source = different_path_event and target_blocked
         if clearing_source and stable_lane:
             self._source_clearing_frames += 1
@@ -372,6 +361,19 @@ class ObstacleFusionPlanner:
             and self._source_clearing_frames
             >= max(1, int(self.config.source_clear_confirm_frames))
         )
+        visual_commit_confirmed = self._visual_commit_confirmed(
+            frame_assessment,
+            frame_obstacle_masks,
+            visual_confidence,
+            allow_projected_current=separated_path_event,
+        )
+        range_confirmed = (
+            self.config.fusion_mode == "yolo"
+            or self._range_hazard
+            or visual_commit_confirmed
+        )
+        fused_hazard = self._visual_confirmed and range_confirmed
+        blocked = target_blocked or solid_blocked or not side_clear
         emergency = self._emergency_present(
             raw_visual,
             bev_assessment.closest_y_ratio,
@@ -560,6 +562,7 @@ class ObstacleFusionPlanner:
         frame_assessment: PathAssessment,
         frame_obstacle_masks: Sequence[Any],
         visual_confidence: float,
+        allow_projected_current: bool = False,
     ) -> bool:
         if not self.config.visual_commit_enabled:
             return False
@@ -567,11 +570,12 @@ class ObstacleFusionPlanner:
             return False
         if not frame_obstacle_masks:
             return False
-        if (
-            not frame_assessment.physical_lane_known
-            or not frame_assessment.current_detected
-            or frame_assessment.physical_target_blocked
-        ):
+        if not frame_assessment.current_detected:
+            return False
+        if frame_assessment.physical_lane_known:
+            if frame_assessment.physical_target_blocked:
+                return False
+        elif not allow_projected_current or frame_assessment.target_blocked:
             return False
         if visual_confidence < max(
             float(self.config.visual_action_confidence),

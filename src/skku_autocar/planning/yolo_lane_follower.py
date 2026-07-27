@@ -64,15 +64,17 @@ class YoloLaneFollowerConfig:
     path_reversal_min_geometry: float = 0.08
     path_reversal_output_min_steering: float = 60.0
     path_reversal_rate_limit: int = 220
-    # During an S transition, the far path can reverse before the near path has
-    # reached the vehicle. Release the old command immediately, but do not steer
-    # toward the far path while that would move away from the near path.
+    # Near-field disagreement is blended into the whole-path command only on
+    # almost-straight geometry. It must not switch the command off at a binary
+    # threshold while coherent curve heading is available.
     path_near_conflict_error_threshold: float = 0.01
     path_near_conflict_release_alpha: float = 0.90
+    path_near_conflict_heading_limit: float = 0.18
     # A large far-path heading with an already centered near field is curve
     # preview, not permission to keep increasing steering into the inner line.
     path_curve_guard_heading_threshold: float = 0.25
     path_curve_guard_near_error: float = 0.13
+    path_curve_guard_release_error: float = 0.25
     path_curve_guard_steering_limit: float = 115.0
     # A curve first appears as a change in path heading while the near-field
     # lateral error is still small. Convert that geometric lead into continuous
@@ -211,28 +213,33 @@ class YoloLaneFollower:
                 raw_steering,
                 near_error,
             )
-        near_conflict = self._path_near_conflict_active(
+        near_conflict_strength = self._path_near_conflict_strength(
             lane,
             near_error,
             raw_steering,
         )
+        near_conflict = near_conflict_strength > 0.0
         if near_conflict:
-            raw_steering = 0.0
-        curve_guard = self._path_curve_guard_active(
+            near_steering = self._clip_float(
+                float(self.config.path_lateral_gain) * float(near_error),
+                -float(self.config.max_steering),
+                float(self.config.max_steering),
+            )
+            raw_steering += near_conflict_strength * (
+                near_steering - raw_steering
+            )
+        curve_guard_limit = self._path_curve_guard_limit(
             lane,
             path_error,
             near_error,
             raw_steering,
         )
-        if curve_guard:
-            curve_limit = max(
-                0.0,
-                float(self.config.path_curve_guard_steering_limit),
-            )
+        curve_guard = curve_guard_limit is not None
+        if curve_guard_limit is not None:
             raw_steering = self._clip_float(
                 raw_steering,
-                -curve_limit,
-                curve_limit,
+                -curve_guard_limit,
+                curve_guard_limit,
             )
         direction_reversal = self._path_direction_reversal_active(
             lane,
@@ -264,13 +271,14 @@ class YoloLaneFollower:
                 ),
             )
         if near_conflict:
+            conflict_alpha = self._clip_float(
+                float(self.config.path_near_conflict_release_alpha),
+                0.0,
+                1.0,
+            )
             alpha = max(
                 alpha,
-                self._clip_float(
-                    float(self.config.path_near_conflict_release_alpha),
-                    0.0,
-                    1.0,
-                ),
+                alpha + near_conflict_strength * (conflict_alpha - alpha),
             )
         filtered = (
             float(self._last_steering)
@@ -308,14 +316,7 @@ class YoloLaneFollower:
             fast_release=near_conflict,
         )
         if curve_guard:
-            curve_limit = int(
-                round(
-                    max(
-                        0.0,
-                        float(self.config.path_curve_guard_steering_limit),
-                    )
-                )
-            )
+            curve_limit = int(round(float(curve_guard_limit)))
             steering = self._clip(steering, -curve_limit, curve_limit)
         steering = self._clip(
             steering,
@@ -436,61 +437,114 @@ class YoloLaneFollower:
         )
         return coherent_path or coherent_heading
 
-    def _path_near_conflict_active(
+    def _path_near_conflict_strength(
         self,
         lane: LaneGeometry,
         near_error: float,
         raw_steering: float,
-    ) -> bool:
+    ) -> float:
         reason = str(lane.reason)
         if not reason.startswith("corridor_tier1"):
-            return False
+            return 0.0
         if any(
             token in reason
             for token in ("lane_change", "crosswalk", "coast", "virtual")
         ):
-            return False
-        return (
-            float(lane.confidence) >= 0.75
-            and abs(float(near_error))
-            >= max(
-                0.0,
-                float(self.config.path_near_conflict_error_threshold),
-            )
-            and float(near_error) * float(raw_steering) < 0.0
+            return 0.0
+        threshold = max(
+            0.0,
+            float(self.config.path_near_conflict_error_threshold),
         )
+        magnitude = abs(float(near_error))
+        if (
+            float(lane.confidence) < 0.75
+            or magnitude < threshold
+            or float(near_error) * float(raw_steering) >= 0.0
+        ):
+            return 0.0
 
-    def _path_curve_guard_active(
+        heading_limit = max(
+            0.0,
+            float(self.config.path_near_conflict_heading_limit),
+        )
+        heading = abs(float(lane.heading_error))
+        if heading_limit <= 1e-6:
+            heading_strength = 1.0 if heading <= 1e-6 else 0.0
+        else:
+            heading_ratio = self._clip_float(
+                heading / heading_limit,
+                0.0,
+                1.0,
+            )
+            heading_ratio = heading_ratio * heading_ratio * (
+                3.0 - 2.0 * heading_ratio
+            )
+            heading_strength = 1.0 - heading_ratio
+
+        error_span = max(threshold, 0.02)
+        error_ratio = self._clip_float(
+            (magnitude - threshold) / error_span,
+            0.0,
+            1.0,
+        )
+        error_strength = error_ratio * error_ratio * (
+            3.0 - 2.0 * error_ratio
+        )
+        return heading_strength * error_strength
+
+    def _path_curve_guard_limit(
         self,
         lane: LaneGeometry,
         path_error: float,
         near_error: float,
         raw_steering: float,
-    ) -> bool:
+    ) -> Optional[float]:
         reason = str(lane.reason)
         if not reason.startswith("corridor_tier1"):
-            return False
+            return None
         if any(
             token in reason
             for token in ("lane_change", "crosswalk", "coast", "virtual")
         ):
-            return False
+            return None
         heading = float(lane.heading_error)
-        return (
-            float(lane.confidence) >= 0.80
-            and abs(heading)
-            >= max(
+        if (
+            float(lane.confidence) < 0.80
+            or abs(heading)
+            < max(
                 0.0,
                 float(self.config.path_curve_guard_heading_threshold),
             )
-            and abs(float(near_error))
-            <= max(
-                0.0,
-                float(self.config.path_curve_guard_near_error),
-            )
-            and heading * float(path_error) > 0.0
-            and heading * float(raw_steering) > 0.0
+            or heading * float(path_error) <= 0.0
+            or heading * float(raw_steering) <= 0.0
+        ):
+            return None
+
+        full_guard_error = max(
+            0.0,
+            float(self.config.path_curve_guard_near_error),
         )
+        release_error = max(
+            full_guard_error + 1e-6,
+            float(self.config.path_curve_guard_release_error),
+        )
+        magnitude = abs(float(near_error))
+        if magnitude >= release_error:
+            return None
+
+        blend = self._clip_float(
+            (magnitude - full_guard_error)
+            / (release_error - full_guard_error),
+            0.0,
+            1.0,
+        )
+        blend = blend * blend * (3.0 - 2.0 * blend)
+        guarded_limit = max(
+            0.0,
+            float(self.config.path_curve_guard_steering_limit),
+        )
+        maximum = max(guarded_limit, float(self.config.max_steering))
+        return guarded_limit + (maximum - guarded_limit) * blend
 
     def _weighted_path_error(self, lane: LaneGeometry) -> float:
         points = list(lane.path_points)
@@ -504,9 +558,17 @@ class YoloLaneFollower:
             near = lane.near_lateral_error_norm
             if near is None:
                 return float(lane.lateral_error_norm)
+            near_weight = max(0.0, float(self.config.path_near_weight))
+            far_weight = max(0.0, float(self.config.path_far_weight))
+            weight_sum = near_weight + far_weight
+            if weight_sum <= 1e-6:
+                return float(lane.lateral_error_norm)
             return self._clip_float(
-                0.65 * float(near)
-                + 0.35 * float(lane.lateral_error_norm),
+                (
+                    near_weight * float(near)
+                    + far_weight * float(lane.lateral_error_norm)
+                )
+                / weight_sum,
                 -1.0,
                 1.0,
             )
@@ -556,11 +618,27 @@ class YoloLaneFollower:
         if abs(heading) <= 1e-6:
             return 0.0
 
-        # Conflicting signs mean the geometry does not yet provide a coherent
-        # turn direction. A small reference error is treated as neutral.
+        # A near/far sign split is normal at an S-curve transition. Preserve
+        # heading preview when the complete path endpoint and heading agree;
+        # otherwise treat the split as incoherent geometry.
         alignment = 1.0
         if abs(reference) > 0.015 and heading * reference < 0.0:
-            alignment = 0.0
+            far_error = float(lane.lateral_error_norm)
+            minimum_geometry = max(
+                0.015,
+                float(self.config.path_reversal_min_geometry),
+            )
+            coherent_far_curve = (
+                abs(heading)
+                >= max(
+                    minimum_geometry,
+                    float(self.config.path_near_conflict_heading_limit),
+                )
+                and abs(far_error) >= minimum_geometry
+                and heading * far_error > 0.0
+            )
+            if not coherent_far_curve:
+                alignment = 0.0
 
         span = max(1e-6, float(self.config.path_heading_lead_span))
         lead = max(0.0, abs(heading) - abs(reference)) / span

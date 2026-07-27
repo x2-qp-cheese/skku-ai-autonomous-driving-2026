@@ -237,7 +237,7 @@ class YoloLaneGeometryTest(unittest.TestCase):
 
         self.assertLess(command.steering, 0)
 
-    def test_path_near_conflict_releases_without_forcing_far_direction(self):
+    def test_path_near_conflict_blends_toward_near_path_without_hard_zero(self):
         follower = YoloLaneFollower(
             YoloLaneFollowerConfig(
                 path_tracking=True,
@@ -269,7 +269,50 @@ class YoloLaneGeometryTest(unittest.TestCase):
             )
         )
 
-        self.assertEqual(command.steering, 0)
+        self.assertGreater(command.steering, -120)
+        self.assertLess(command.steering, 0)
+
+    def test_path_near_conflict_does_not_cancel_coherent_curve_preview(self):
+        follower = YoloLaneFollower(
+            YoloLaneFollowerConfig(
+                path_tracking=True,
+                path_lateral_gain=225.0,
+                path_heading_gain=65.0,
+                path_derivative_gain=0.0,
+                path_near_weight=1.0,
+                path_far_weight=1.0,
+                path_heading_lead_gain=170.0,
+                path_heading_lead_span=0.16,
+                path_heading_lead_max_steering=32.0,
+                path_center_recovery_error_threshold=2.0,
+                path_near_conflict_error_threshold=0.06,
+                path_near_conflict_release_alpha=0.90,
+                path_near_conflict_heading_limit=0.18,
+                path_reversal_alpha=0.90,
+                path_reversal_min_steering=25.0,
+                path_reversal_min_geometry=0.05,
+                path_reversal_output_min_steering=70.0,
+                path_reversal_rate_limit=160,
+                steering_rate_limit=80,
+                min_steering_rate_limit=35,
+                steering_release_rate_limit=55,
+                max_steering=150,
+            )
+        )
+        follower.accept_applied_command(
+            ControlCommand(speed=255, steering=-105, reason="previous_curve")
+        )
+
+        command = follower.plan(
+            lane_geometry(
+                lateral_error_norm=0.12,
+                heading_error=0.36,
+                near_lateral_error_norm=-0.13,
+                reason="corridor_tier1",
+            )
+        )
+
+        self.assertGreater(command.steering, 0)
 
     def test_path_curve_guard_caps_inner_cut_while_near_field_is_centered(self):
         follower = YoloLaneFollower(
@@ -302,6 +345,40 @@ class YoloLaneGeometryTest(unittest.TestCase):
         )
 
         self.assertEqual(command.steering, -110)
+
+    def test_path_curve_guard_blends_continuously_as_center_error_grows(self):
+        follower = YoloLaneFollower(
+            YoloLaneFollowerConfig(
+                path_tracking=True,
+                path_lateral_gain=0.0,
+                path_heading_gain=500.0,
+                path_derivative_gain=0.0,
+                path_heading_lead_gain=0.0,
+                path_center_recovery_error_threshold=2.0,
+                path_curve_guard_heading_threshold=0.25,
+                path_curve_guard_near_error=0.10,
+                path_curve_guard_release_error=0.24,
+                path_curve_guard_steering_limit=105.0,
+                path_steering_rise_alpha=1.0,
+                path_steering_release_alpha=1.0,
+                steering_rate_limit=500,
+                min_steering_rate_limit=500,
+                steering_release_rate_limit=500,
+                max_steering=150,
+            )
+        )
+
+        command = follower.plan(
+            lane_geometry(
+                lateral_error_norm=-0.20,
+                heading_error=-0.50,
+                near_lateral_error_norm=-0.17,
+                reason="corridor_tier1",
+            )
+        )
+
+        self.assertGreater(abs(command.steering), 105)
+        self.assertLess(abs(command.steering), 150)
 
     def test_path_heading_lead_anticipates_curve_before_lateral_drift(self):
         follower = YoloLaneFollower(
@@ -904,10 +981,14 @@ class YoloLaneGeometryTest(unittest.TestCase):
                 "0.09",
                 "--path-reversal-rate-limit",
                 "165",
+                "--path-near-conflict-heading-limit",
+                "0.17",
                 "--path-curve-guard-heading-threshold",
                 "0.26",
                 "--path-curve-guard-near-error",
                 "0.07",
+                "--path-curve-guard-release-error",
+                "0.21",
                 "--path-curve-guard-steering-limit",
                 "108",
             ]
@@ -924,8 +1005,10 @@ class YoloLaneGeometryTest(unittest.TestCase):
         self.assertAlmostEqual(config.path_reversal_min_steering, 27.0)
         self.assertAlmostEqual(config.path_reversal_min_geometry, 0.09)
         self.assertEqual(config.path_reversal_rate_limit, 165)
+        self.assertAlmostEqual(config.path_near_conflict_heading_limit, 0.17)
         self.assertAlmostEqual(config.path_curve_guard_heading_threshold, 0.26)
         self.assertAlmostEqual(config.path_curve_guard_near_error, 0.07)
+        self.assertAlmostEqual(config.path_curve_guard_release_error, 0.21)
         self.assertAlmostEqual(config.path_curve_guard_steering_limit, 108.0)
 
     def test_crosswalk_cache_defaults_hold_preliminary_run_geometry(self):

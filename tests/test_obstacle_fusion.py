@@ -1185,6 +1185,98 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertIn("lane1 -> lane2", event)
         self.assertEqual(change.return_source, "obstacle_fusion")
 
+    def test_consecutive_obstacle_visual_commit_does_not_wait_for_front_range(self):
+        fusion = planner(
+            visual_confirm_frames=1,
+            visual_commit_enabled=True,
+            visual_commit_confidence=0.90,
+            visual_commit_frame_y_ratio=0.40,
+            source_clear_confirm_frames=2,
+        )
+        change = controller()
+        lane2_mask = obstacle_mask(130, 151, 45, 70)
+        lane1_mask = obstacle_mask(70, 91, 45, 70)
+        frame_paths = projected_paths()
+
+        fusion.update(
+            [lane2_mask], SHAPE, CENTERLINE, lane(), change, ultrasound(), 1.0, True
+        )
+        change.state = "lane1"
+        side_only = UltrasonicSnapshot(
+            sr=500,
+            sl=500,
+            fresh_keys=("SR", "SL"),
+            age_seconds=0.0,
+        )
+        for now in (1.1, 1.2):
+            fusion.update(
+                [],
+                SHAPE,
+                CENTERLINE,
+                lane(),
+                change,
+                side_only,
+                now,
+                True,
+                frame_obstacle_masks=[lane2_mask],
+                frame_paths=frame_paths,
+                obstacle_confidence=0.96,
+            )
+
+        event = fusion.update(
+            [],
+            SHAPE,
+            CENTERLINE,
+            lane(),
+            change,
+            side_only,
+            1.3,
+            True,
+            frame_obstacle_masks=[lane1_mask],
+            frame_paths=frame_paths,
+            obstacle_confidence=0.96,
+        )
+
+        self.assertIn("lane1 -> lane2", event)
+        self.assertTrue(fusion.observation.visual_commit_confirmed)
+        self.assertTrue(fusion.observation.range_confirmed)
+        self.assertIsNone(fusion.observation.front_mm)
+
+    def test_projected_visual_commit_requires_obstacle_handoff_evidence(self):
+        fusion = planner(
+            visual_confirm_frames=1,
+            visual_commit_enabled=True,
+            visual_commit_confidence=0.90,
+            visual_commit_frame_y_ratio=0.40,
+        )
+        change = controller()
+        change.state = "lane1"
+        lane1_mask = obstacle_mask(70, 91, 45, 70)
+        side_only = UltrasonicSnapshot(
+            sr=500,
+            sl=500,
+            fresh_keys=("SR", "SL"),
+            age_seconds=0.0,
+        )
+
+        event = fusion.update(
+            [],
+            SHAPE,
+            CENTERLINE,
+            lane(),
+            change,
+            side_only,
+            1.0,
+            True,
+            frame_obstacle_masks=[lane1_mask],
+            frame_paths=projected_paths(),
+            obstacle_confidence=0.96,
+        )
+
+        self.assertIsNone(event)
+        self.assertFalse(fusion.observation.visual_commit_confirmed)
+        self.assertFalse(fusion.observation.range_confirmed)
+
     def test_stable_clear_gap_requests_return_to_lane2(self):
         fusion = planner(rearm_clear_frames=3)
         change = controller()
