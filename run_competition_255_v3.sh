@@ -39,8 +39,8 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-reversal-output-min-steering 60 \
   --path-reversal-rate-limit 220 \
   --path-curve-guard-heading-threshold 0.25 \
-  --path-curve-guard-near-error 0.13 \
-  --path-curve-guard-steering-limit 115 \
+  --path-curve-guard-near-error 0.18 \
+  --path-curve-guard-steering-limit 105 \
   --path-heading-lead-gain 170 \
   --path-heading-lead-span 0.16 \
   --path-heading-lead-max-steering 32 \
