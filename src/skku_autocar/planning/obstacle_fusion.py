@@ -35,6 +35,9 @@ class ObstacleFusionConfig:
     path_assignment_overlap_margin: float = 0.10
     contact_band_ratio: float = 0.25
     visual_action_confidence: float = 0.75
+    visual_commit_enabled: bool = False
+    visual_commit_confidence: float = 0.90
+    visual_commit_frame_y_ratio: float = 0.40
     range_visual_fallback_enabled: bool = True
     range_visual_fallback_confidence: float = 0.90
     visual_confirm_frames: int = 2
@@ -107,6 +110,7 @@ class ObstacleFusionObservation:
     visual_confidence: float = 0.0
     visual_confirmed: bool = False
     range_confirmed: bool = False
+    visual_commit_confirmed: bool = False
     fused_hazard: bool = False
     target_blocked: bool = False
     solid_blocked: bool = False
@@ -148,6 +152,7 @@ class PathAssessment:
     range_fallback_candidate: bool = False
     closest_y_ratio: float = 0.0
     physical_lane_overlap: float = 0.0
+    physical_lane_known: bool = False
     obstacle_count: int = 0
 
 
@@ -247,10 +252,21 @@ class ObstacleFusionPlanner:
             or frame_assessment.current_detected
         )
         visual_confidence = max(0.0, min(1.0, float(obstacle_confidence)))
+        single_physical_current = (
+            frame_assessment.physical_lane_known
+            and frame_assessment.current_detected
+            and frame_assessment.obstacle_count == 1
+            and len(frame_obstacle_masks) == 1
+        )
         target_blocked = (
             bev_assessment.target_blocked
             or frame_assessment.target_blocked
         )
+        if single_physical_current:
+            # The same wide source-lane mask can touch both projected paths in a
+            # curve. A separately detected destination-lane object still blocks,
+            # but one physically current-lane object must not block its own exit.
+            target_blocked = False
         solid_blocked = self._solid_boundary_blocked(
             solid_masks,
             bev_shape,
@@ -320,8 +336,15 @@ class ObstacleFusionPlanner:
             target_blocked,
             solid_blocked,
         )
+        visual_commit_confirmed = self._visual_commit_confirmed(
+            frame_assessment,
+            frame_obstacle_masks,
+            visual_confidence,
+        )
         range_confirmed = (
-            self.config.fusion_mode == "yolo" or self._range_hazard
+            self.config.fusion_mode == "yolo"
+            or self._range_hazard
+            or visual_commit_confirmed
         )
         fused_hazard = self._visual_confirmed and range_confirmed
         blocked = target_blocked or solid_blocked or not side_clear
@@ -348,6 +371,7 @@ class ObstacleFusionPlanner:
             visual_confidence=visual_confidence,
             visual_confirmed=self._visual_confirmed,
             range_confirmed=range_confirmed,
+            visual_commit_confirmed=visual_commit_confirmed,
             fused_hazard=fused_hazard,
             target_blocked=target_blocked,
             solid_blocked=solid_blocked,
@@ -480,19 +504,47 @@ class ObstacleFusionPlanner:
             if obs.planned_target_lane is None
             else "L%d" % obs.planned_target_lane
         )
-        return "L%d %s plan=%s by=%.2f fy=%.2f in=%.2f conf=%.2f front=%s q=%d r=%d ttc=%s side=%s" % (
+        return "L%d %s plan=%s by=%.2f fy=%.2f in=%.2f vc=%s conf=%.2f front=%s q=%d r=%d ttc=%s side=%s" % (
             obs.path_lane,
             state,
             plan,
             obs.closest_y_ratio,
             obs.frame_y_ratio,
             obs.physical_lane_overlap,
+            "Y" if obs.visual_commit_confirmed else "N",
             obs.visual_confidence,
             front,
             obs.front_sensor_count,
             obs.range_frames,
             ttc,
             "clear" if obs.side_clear else "blocked/unknown",
+        )
+
+    def _visual_commit_confirmed(
+        self,
+        frame_assessment: PathAssessment,
+        frame_obstacle_masks: Sequence[Any],
+        visual_confidence: float,
+    ) -> bool:
+        if not self.config.visual_commit_enabled:
+            return False
+        if not self._visual_confirmed:
+            return False
+        if len(frame_obstacle_masks) != 1:
+            return False
+        if (
+            not frame_assessment.physical_lane_known
+            or not frame_assessment.current_detected
+        ):
+            return False
+        if visual_confidence < max(
+            float(self.config.visual_action_confidence),
+            float(self.config.visual_commit_confidence),
+        ):
+            return False
+        return frame_assessment.closest_y_ratio >= max(
+            float(self.config.frame_visual_trigger_y_ratio),
+            float(self.config.visual_commit_frame_y_ratio),
         )
 
     def _update_visual_state(self, visual: bool) -> None:
@@ -796,6 +848,7 @@ class ObstacleFusionPlanner:
             measurements,
             self.config.frame_visual_trigger_y_ratio,
             self.config.frame_target_block_y_ratio,
+            physical_lane_known=physical_bounds is not None,
         )
 
     def _solid_boundary_blocked(
@@ -897,6 +950,7 @@ class ObstacleFusionPlanner:
         measurements: Sequence[PathOccupancy],
         current_y_threshold: float,
         target_y_threshold: float,
+        physical_lane_known: bool = False,
     ) -> PathAssessment:
         overlap_min = max(0.0, min(1.0, self.config.min_path_overlap_ratio))
         current_overlap_min = max(
@@ -1000,6 +1054,7 @@ class ObstacleFusionPlanner:
                 ),
                 default=0.0,
             ),
+            physical_lane_known=physical_lane_known,
             obstacle_count=len(measurements),
         )
 

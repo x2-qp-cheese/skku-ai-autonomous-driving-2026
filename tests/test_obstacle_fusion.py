@@ -283,6 +283,9 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
             visual_confirm_frames=1,
             min_current_path_overlap_ratio=0.35,
             min_physical_lane_overlap_ratio=0.65,
+            visual_commit_enabled=True,
+            visual_commit_confidence=0.90,
+            visual_commit_frame_y_ratio=0.40,
         )
         change = controller()
         frame_paths = FramePathGeometry(
@@ -313,6 +316,7 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
 
         self.assertIsNone(event)
         self.assertFalse(fusion.observation.visual_detected)
+        self.assertFalse(fusion.observation.visual_commit_confirmed)
         self.assertFalse(fusion.observation.fused_hazard)
         self.assertEqual(change.state, "lane2")
 
@@ -353,6 +357,92 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertTrue(fusion.observation.visual_detected)
         self.assertTrue(fusion.observation.fused_hazard)
         self.assertEqual(change.state, "armed")
+
+    def test_single_physical_current_obstacle_does_not_block_its_exit_path(self):
+        fusion = planner(
+            fusion_mode="yolo",
+            visual_confirm_frames=1,
+            min_current_path_overlap_ratio=0.35,
+            min_physical_lane_overlap_ratio=0.65,
+        )
+        change = controller()
+        frame_paths = FramePathGeometry(
+            lane1=tuple((80.0, float(y)) for y in range(0, 100, 5)),
+            lane2=tuple((140.0, float(y)) for y in range(0, 100, 5)),
+            lane2_left_boundary=tuple(
+                (110.0, float(y)) for y in range(0, 100, 5)
+            ),
+            lane2_right_boundary=tuple(
+                (170.0, float(y)) for y in range(0, 100, 5)
+            ),
+        )
+        bev_target_smear = obstacle_mask(70, 96, 45, 70)
+        frame_current = obstacle_mask(130, 151, 45, 70)
+
+        event = fusion.update(
+            [bev_target_smear],
+            SHAPE,
+            CENTERLINE,
+            lane(),
+            change,
+            UltrasonicSnapshot(),
+            1.0,
+            True,
+            frame_obstacle_masks=[frame_current],
+            frame_paths=frame_paths,
+            obstacle_confidence=0.96,
+        )
+
+        self.assertIn("lane2 -> lane1", event)
+        self.assertFalse(fusion.observation.target_blocked)
+        self.assertEqual(change.state, "armed")
+
+    def test_visual_commit_can_start_before_front_range_acquisition(self):
+        fusion = planner(
+            visual_confirm_frames=1,
+            min_current_path_overlap_ratio=0.35,
+            min_physical_lane_overlap_ratio=0.65,
+            visual_commit_enabled=True,
+            visual_commit_confidence=0.90,
+            visual_commit_frame_y_ratio=0.40,
+        )
+        change = controller()
+        frame_paths = FramePathGeometry(
+            lane1=tuple((80.0, float(y)) for y in range(0, 100, 5)),
+            lane2=tuple((140.0, float(y)) for y in range(0, 100, 5)),
+            lane2_left_boundary=tuple(
+                (110.0, float(y)) for y in range(0, 100, 5)
+            ),
+            lane2_right_boundary=tuple(
+                (170.0, float(y)) for y in range(0, 100, 5)
+            ),
+        )
+        current = obstacle_mask(130, 151, 45, 70)
+        side_only = UltrasonicSnapshot(
+            sr=500,
+            sl=500,
+            fresh_keys=("SR", "SL"),
+            age_seconds=0.0,
+        )
+
+        event = fusion.update(
+            [],
+            SHAPE,
+            CENTERLINE,
+            lane(),
+            change,
+            side_only,
+            1.0,
+            True,
+            frame_obstacle_masks=[current],
+            frame_paths=frame_paths,
+            obstacle_confidence=0.96,
+        )
+
+        self.assertIn("lane2 -> lane1", event)
+        self.assertTrue(fusion.observation.visual_commit_confirmed)
+        self.assertTrue(fusion.observation.range_confirmed)
+        self.assertIsNone(fusion.observation.front_mm)
 
     def test_range_backed_visual_fallback_ignores_target_lane_obstacle(self):
         fusion = planner(
@@ -1146,6 +1236,12 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
                 "0.67",
                 "--obstacle-current-path-max-distance-ratio",
                 "0.54",
+                "--obstacle-visual-commit",
+                "on",
+                "--obstacle-visual-commit-confidence",
+                "0.93",
+                "--obstacle-visual-commit-frame-y",
+                "0.44",
                 "--obstacle-trigger-mm",
                 "900",
                 "--obstacle-min-front-sensors",
@@ -1185,6 +1281,9 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertAlmostEqual(config.min_current_path_overlap_ratio, 0.41)
         self.assertAlmostEqual(config.min_physical_lane_overlap_ratio, 0.67)
         self.assertAlmostEqual(config.max_current_path_distance_ratio, 0.54)
+        self.assertTrue(config.visual_commit_enabled)
+        self.assertAlmostEqual(config.visual_commit_confidence, 0.93)
+        self.assertAlmostEqual(config.visual_commit_frame_y_ratio, 0.44)
         self.assertEqual(config.ultrasonic_trigger_mm, 900.0)
         self.assertEqual(config.min_front_sensors, 2)
         self.assertEqual(config.range_confirm_frames, 3)

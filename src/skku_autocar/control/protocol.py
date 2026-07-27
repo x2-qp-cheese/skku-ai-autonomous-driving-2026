@@ -10,6 +10,10 @@ def encode_command(
 ) -> str:
     clipped = command.clipped(max_speed=max_speed, max_steering=max_steering)
     if clipped.brake:
+        if clipped.steering != 0:
+            # DRIVE 0 keeps propulsion stopped while the steering controller
+            # holds the lane-following angle. STOP intentionally recenters.
+            return "DRIVE 0 %d\n" % clipped.steering
         return "STOP\n"
     return "DRIVE %d %d\n" % (clipped.speed, clipped.steering)
 

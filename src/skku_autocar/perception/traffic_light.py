@@ -188,7 +188,16 @@ class TrafficLightController:
 
     def apply(self, command: ControlCommand, running: bool) -> ControlCommand:
         if running and self.state == "red" and self._stop_latched:
-            return ControlCommand.stop("traffic_light:red_contact")
+            # Stop propulsion without centering the front wheels. The lane
+            # follower continues to observe the cached crosswalk path while the
+            # car is stationary, so preserving that steering avoids a full-speed
+            # straight lurch when GREEN is confirmed.
+            return ControlCommand(
+                speed=0,
+                steering=command.steering,
+                brake=True,
+                reason="traffic_light:red_contact",
+            )
         return command
 
     def _candidate(self, red: int, green: int, total: int) -> str:

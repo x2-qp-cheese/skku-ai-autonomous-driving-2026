@@ -9,6 +9,16 @@ class ProtocolTest(unittest.TestCase):
     def test_stop_command(self):
         self.assertEqual(encode_command(ControlCommand.stop()), "STOP\n")
 
+    def test_zero_speed_holds_steering_for_mission_stop(self):
+        command = ControlCommand(
+            speed=0,
+            steering=-72,
+            brake=True,
+            reason="traffic_light:red_contact",
+        )
+
+        self.assertEqual(encode_command(command), "DRIVE 0 -72\n")
+
     def test_drive_command_is_clipped(self):
         command = ControlCommand(speed=999, steering=-999)
         self.assertEqual(

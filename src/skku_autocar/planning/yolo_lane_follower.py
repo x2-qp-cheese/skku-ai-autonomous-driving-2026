@@ -50,6 +50,24 @@ class YoloLaneFollowerConfig:
     path_far_weight: float = 0.70
     path_steering_rise_alpha: float = 0.55
     path_steering_release_alpha: float = 0.28
+    # Recover a car that starts measurably off-center before full-speed travel
+    # turns a correct but small path command into a boundary approach.
+    path_center_recovery_error_threshold: float = 0.10
+    path_center_recovery_heading_limit: float = 0.12
+    path_center_recovery_min_steering: float = 70.0
+    path_center_recovery_alpha: float = 0.90
+    path_center_recovery_rate_limit: int = 120
+    # S-curves need the old steering direction removed in one control frame,
+    # while small sign noise must continue through the ordinary path filter.
+    path_reversal_alpha: float = 0.90
+    path_reversal_min_steering: float = 25.0
+    path_reversal_min_geometry: float = 0.08
+    path_reversal_rate_limit: int = 160
+    # A large far-path heading with an already centered near field is curve
+    # preview, not permission to keep increasing steering into the inner line.
+    path_curve_guard_heading_threshold: float = 0.25
+    path_curve_guard_near_error: float = 0.08
+    path_curve_guard_steering_limit: float = 110.0
     # A curve first appears as a change in path heading while the near-field
     # lateral error is still small. Convert that geometric lead into continuous
     # steering feed-forward instead of waiting until the car has drifted.
@@ -172,12 +190,66 @@ class YoloLaneFollower:
             + heading_feedforward
             + integral_steering
         )
+        near_error = (
+            float(lane.near_lateral_error_norm)
+            if lane.near_lateral_error_norm is not None
+            else float(path_error)
+        )
+        center_recovery = self._path_center_recovery_active(
+            lane,
+            near_error,
+            heading_lead,
+        )
+        if center_recovery:
+            raw_steering = self._apply_path_center_recovery(
+                raw_steering,
+                near_error,
+            )
+        curve_guard = self._path_curve_guard_active(
+            lane,
+            path_error,
+            near_error,
+            raw_steering,
+        )
+        if curve_guard:
+            curve_limit = max(
+                0.0,
+                float(self.config.path_curve_guard_steering_limit),
+            )
+            raw_steering = self._clip_float(
+                raw_steering,
+                -curve_limit,
+                curve_limit,
+            )
+        direction_reversal = self._path_direction_reversal_active(
+            lane,
+            path_error,
+            raw_steering,
+        )
 
         alpha = self._path_steering_alpha(
             raw_steering,
             lane.reason,
             heading_lead,
         )
+        if center_recovery:
+            alpha = max(
+                alpha,
+                self._clip_float(
+                    float(self.config.path_center_recovery_alpha),
+                    0.0,
+                    1.0,
+                ),
+            )
+        if direction_reversal:
+            alpha = max(
+                alpha,
+                self._clip_float(
+                    float(self.config.path_reversal_alpha),
+                    0.0,
+                    1.0,
+                ),
+            )
         filtered = (
             float(self._last_steering)
             + alpha * (raw_steering - float(self._last_steering))
@@ -191,7 +263,29 @@ class YoloLaneFollower:
             int(round(filtered)),
             curve_strength,
             0.0,
+            minimum_rate_limit=max(
+                (
+                    int(self.config.path_center_recovery_rate_limit)
+                    if center_recovery
+                    else 0
+                ),
+                (
+                    int(self.config.path_reversal_rate_limit)
+                    if direction_reversal
+                    else 0
+                ),
+            ),
         )
+        if curve_guard:
+            curve_limit = int(
+                round(
+                    max(
+                        0.0,
+                        float(self.config.path_curve_guard_steering_limit),
+                    )
+                )
+            )
+            steering = self._clip(steering, -curve_limit, curve_limit)
         steering = self._clip(
             steering,
             -self.config.max_steering,
@@ -229,6 +323,119 @@ class YoloLaneFollower:
         self._last_command = command
         self._lane_lost_frames = 0
         return command
+
+    def _path_center_recovery_active(
+        self,
+        lane: LaneGeometry,
+        near_error: float,
+        heading_lead: float,
+    ) -> bool:
+        reason = str(lane.reason)
+        if not reason.startswith("corridor_tier1"):
+            return False
+        if any(
+            token in reason
+            for token in ("lane_change", "crosswalk", "coast", "virtual")
+        ):
+            return False
+        return (
+            float(lane.confidence) >= 0.75
+            and abs(float(near_error))
+            >= max(
+                0.0,
+                float(self.config.path_center_recovery_error_threshold),
+            )
+            and abs(float(lane.heading_error))
+            <= max(
+                0.0,
+                float(self.config.path_center_recovery_heading_limit),
+            )
+            and float(heading_lead) < 0.20
+        )
+
+    def _apply_path_center_recovery(
+        self,
+        steering: float,
+        near_error: float,
+    ) -> float:
+        minimum = max(
+            0.0,
+            float(self.config.path_center_recovery_min_steering),
+        )
+        direction = 1.0 if near_error >= 0.0 else -1.0
+        if steering * direction > 0.0 and abs(steering) >= minimum:
+            return steering
+        return direction * minimum
+
+    def _path_direction_reversal_active(
+        self,
+        lane: LaneGeometry,
+        path_error: float,
+        raw_steering: float,
+    ) -> bool:
+        reason = str(lane.reason)
+        if not reason.startswith("corridor_tier1"):
+            return False
+        if any(
+            token in reason
+            for token in ("lane_change", "crosswalk", "coast", "virtual")
+        ):
+            return False
+        minimum_steering = max(
+            0.0,
+            float(self.config.path_reversal_min_steering),
+        )
+        if (
+            raw_steering * float(self._last_steering) >= 0.0
+            or abs(raw_steering) < minimum_steering
+            or abs(float(self._last_steering)) < minimum_steering
+        ):
+            return False
+        minimum_geometry = max(
+            0.0,
+            float(self.config.path_reversal_min_geometry),
+        )
+        coherent_path = (
+            abs(float(path_error)) >= minimum_geometry
+            and raw_steering * float(path_error) > 0.0
+        )
+        coherent_heading = (
+            abs(float(lane.heading_error)) >= minimum_geometry
+            and raw_steering * float(lane.heading_error) > 0.0
+        )
+        return coherent_path or coherent_heading
+
+    def _path_curve_guard_active(
+        self,
+        lane: LaneGeometry,
+        path_error: float,
+        near_error: float,
+        raw_steering: float,
+    ) -> bool:
+        reason = str(lane.reason)
+        if not reason.startswith("corridor_tier1"):
+            return False
+        if any(
+            token in reason
+            for token in ("lane_change", "crosswalk", "coast", "virtual")
+        ):
+            return False
+        heading = float(lane.heading_error)
+        return (
+            float(lane.confidence) >= 0.80
+            and abs(heading)
+            >= max(
+                0.0,
+                float(self.config.path_curve_guard_heading_threshold),
+            )
+            and abs(float(near_error))
+            <= max(
+                0.0,
+                float(self.config.path_curve_guard_near_error),
+            )
+            and heading * float(path_error) > 0.0
+            and heading * float(raw_steering) > 0.0
+        )
 
     def _weighted_path_error(self, lane: LaneGeometry) -> float:
         points = list(lane.path_points)
@@ -606,11 +813,18 @@ class YoloLaneFollower:
         ))
         return min(speed, cap)
 
-    def _rate_limit(self, steering: int, curve_strength: float, recovery_strength: float) -> int:
+    def _rate_limit(
+        self,
+        steering: int,
+        curve_strength: float,
+        recovery_strength: float,
+        minimum_rate_limit: int = 0,
+    ) -> int:
         delta = steering - self._last_steering
         min_limit = min(self.config.min_steering_rate_limit, self.config.steering_rate_limit)
         max_limit = max(self.config.min_steering_rate_limit, self.config.steering_rate_limit)
         limit = int(round(min_limit + (max_limit - min_limit) * curve_strength))
+        limit = max(limit, max(0, int(minimum_rate_limit)))
         if recovery_strength > 0.0:
             recovery_limit = int(round(
                 limit + (self.config.center_recovery_rate_limit - limit) * recovery_strength

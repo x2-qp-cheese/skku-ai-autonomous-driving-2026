@@ -342,7 +342,8 @@ class ObstacleDriveMode:
         )
         LOG.info(
             "obstacle vision bev_y=%.2f/%.2f frame_y=%.2f/%.2f action_conf=%.2f "
-            "overlap=%.2f physical=%.2f confirm=%d front_quorum=%d side=%.0fmm",
+            "overlap=%.2f physical=%.2f visual_commit=%s/%.2f@%.2f "
+            "confirm=%d front_quorum=%d side=%.0fmm",
             args.obstacle_visual_trigger_y,
             args.obstacle_target_block_y,
             args.obstacle_frame_visual_trigger_y,
@@ -350,6 +351,9 @@ class ObstacleDriveMode:
             args.obstacle_action_confidence,
             args.obstacle_current_path_min_overlap,
             args.obstacle_physical_lane_min_overlap,
+            args.obstacle_visual_commit,
+            args.obstacle_visual_commit_confidence,
+            args.obstacle_visual_commit_frame_y,
             args.obstacle_visual_confirm_frames,
             args.obstacle_min_front_sensors,
             args.obstacle_side_clearance_mm,
@@ -555,6 +559,9 @@ def build_obstacle_fusion_config(args: argparse.Namespace) -> ObstacleFusionConf
         frame_boundary_margin_px=args.obstacle_frame_boundary_margin_px,
         contact_band_ratio=args.obstacle_contact_band,
         visual_action_confidence=args.obstacle_action_confidence,
+        visual_commit_enabled=args.obstacle_visual_commit == "on",
+        visual_commit_confidence=args.obstacle_visual_commit_confidence,
+        visual_commit_frame_y_ratio=args.obstacle_visual_commit_frame_y,
         range_visual_fallback_enabled=args.obstacle_range_visual_fallback == "on",
         range_visual_fallback_confidence=args.obstacle_range_visual_confidence,
         visual_confirm_frames=args.obstacle_visual_confirm_frames,
@@ -715,6 +722,16 @@ def add_obstacle_arguments(parser: argparse.ArgumentParser) -> None:
         ),
         ("--obstacle-contact-band", float, ObstacleFusionConfig.contact_band_ratio),
         ("--obstacle-action-confidence", float, ObstacleFusionConfig.visual_action_confidence),
+        (
+            "--obstacle-visual-commit-confidence",
+            float,
+            ObstacleFusionConfig.visual_commit_confidence,
+        ),
+        (
+            "--obstacle-visual-commit-frame-y",
+            float,
+            ObstacleFusionConfig.visual_commit_frame_y_ratio,
+        ),
         ("--obstacle-range-visual-confidence", float, ObstacleFusionConfig.range_visual_fallback_confidence),
         ("--obstacle-visual-confirm-frames", int, 2),
         ("--obstacle-visual-clear-frames", int, ObstacleFusionConfig.visual_clear_frames),
@@ -737,6 +754,12 @@ def add_obstacle_arguments(parser: argparse.ArgumentParser) -> None:
     )
     for name, value_type, default in obstacle_specs:
         group.add_argument(name, type=value_type, default=default)
+    group.add_argument(
+        "--obstacle-visual-commit",
+        choices=("on", "off"),
+        default="off",
+        help="allow a confirmed high-confidence in-lane mask to commit before front range acquisition",
+    )
     group.add_argument(
         "--obstacle-range-visual-fallback",
         choices=("on", "off"),

@@ -56,6 +56,7 @@ class TrafficLightControllerTest(unittest.TestCase):
         stopped = self.controller.apply(self.drive, running=True)
         self.assertTrue(stopped.brake)
         self.assertEqual(stopped.speed, 0)
+        self.assertEqual(stopped.steering, self.drive.steering)
         self.assertEqual(stopped.reason, "traffic_light:red_contact")
 
     def test_confirmed_red_keeps_driving_until_mask_touches_contact_line(self):

@@ -22,15 +22,27 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --speed-curve-slowdown 0 \
   --path-tracking \
   --path-lateral-gain 225 \
-  --path-heading-gain 70 \
+  --path-heading-gain 65 \
   --path-derivative-gain 18 \
-  --path-near-weight 1.25 \
-  --path-far-weight 0.70 \
+  --path-near-weight 1.45 \
+  --path-far-weight 0.55 \
   --path-steering-rise-alpha 0.72 \
   --path-steering-release-alpha 0.28 \
-  --path-heading-lead-gain 180 \
-  --path-heading-lead-span 0.15 \
-  --path-heading-lead-max-steering 36 \
+  --path-center-recovery-error-threshold 0.10 \
+  --path-center-recovery-heading-limit 0.12 \
+  --path-center-recovery-min-steering 70 \
+  --path-center-recovery-alpha 0.90 \
+  --path-center-recovery-rate-limit 120 \
+  --path-reversal-alpha 0.90 \
+  --path-reversal-min-steering 25 \
+  --path-reversal-min-geometry 0.08 \
+  --path-reversal-rate-limit 160 \
+  --path-curve-guard-heading-threshold 0.25 \
+  --path-curve-guard-near-error 0.08 \
+  --path-curve-guard-steering-limit 110 \
+  --path-heading-lead-gain 170 \
+  --path-heading-lead-span 0.16 \
+  --path-heading-lead-max-steering 32 \
   --path-integral-gain 45 \
   --path-integral-limit 0.25 \
   --path-integral-decay 0.65 \
@@ -62,6 +74,9 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --obstacle-physical-lane-min-overlap 0.65 \
   --obstacle-current-path-max-distance-ratio 0.48 \
   --obstacle-frame-boundary-margin-px 3 \
+  --obstacle-visual-commit on \
+  --obstacle-visual-commit-confidence 0.90 \
+  --obstacle-visual-commit-frame-y 0.40 \
   --obstacle-range-visual-fallback off \
   --lane-change-target-width-px 150 \
   --lane-change-steering-override off \
