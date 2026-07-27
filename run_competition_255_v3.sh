@@ -26,8 +26,11 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-derivative-gain 18 \
   --path-near-weight 1.25 \
   --path-far-weight 0.70 \
-  --path-steering-rise-alpha 0.55 \
+  --path-steering-rise-alpha 0.72 \
   --path-steering-release-alpha 0.28 \
+  --path-heading-lead-gain 180 \
+  --path-heading-lead-span 0.15 \
+  --path-heading-lead-max-steering 36 \
   --bev-lookahead 0.32 \
   --bev-center-smooth 0.32 \
   --bev-heading-smooth 1.0 \

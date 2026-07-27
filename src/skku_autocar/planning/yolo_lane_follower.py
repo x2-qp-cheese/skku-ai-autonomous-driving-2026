@@ -50,6 +50,12 @@ class YoloLaneFollowerConfig:
     path_far_weight: float = 0.70
     path_steering_rise_alpha: float = 0.55
     path_steering_release_alpha: float = 0.28
+    # A curve first appears as a change in path heading while the near-field
+    # lateral error is still small. Convert that geometric lead into continuous
+    # steering feed-forward instead of waiting until the car has drifted.
+    path_heading_lead_gain: float = 180.0
+    path_heading_lead_span: float = 0.15
+    path_heading_lead_max_steering: float = 36.0
 
     # Pure-pursuit steering: instead of summing a lateral-error PID and a heading
     # PID, steer the wheel directly toward the BEV centerline's lookahead point
@@ -74,6 +80,8 @@ class YoloLaneFollower:
         self._curve_strength = 0.0
         self._last_command: Optional[ControlCommand] = None
         self._lane_lost_frames = 0
+        self._path_state = "straight"
+        self._path_heading_lead = 0.0
 
     def plan(self, lane: LaneGeometry) -> ControlCommand:
         if not lane.found or lane.confidence < self.config.min_confidence:
@@ -131,13 +139,33 @@ class YoloLaneFollower:
         """Track the complete BEV centerline with bounded temporal response."""
         path_error = self._weighted_path_error(lane)
         derivative = self._derivative(path_error, self._last_path_error)
+        heading_lead = self._path_heading_lead_strength(lane, path_error)
+        heading_feedforward = (
+            self.config.path_heading_lead_gain
+            * float(lane.heading_error)
+            * heading_lead
+        )
+        heading_lead_limit = max(
+            0.0,
+            float(self.config.path_heading_lead_max_steering),
+        )
+        heading_feedforward = self._clip_float(
+            heading_feedforward,
+            -heading_lead_limit,
+            heading_lead_limit,
+        )
         raw_steering = (
             self.config.path_lateral_gain * path_error
             + self.config.path_heading_gain * lane.heading_error
             + self.config.path_derivative_gain * derivative
+            + heading_feedforward
         )
 
-        alpha = self._path_steering_alpha(raw_steering, lane.reason)
+        alpha = self._path_steering_alpha(
+            raw_steering,
+            lane.reason,
+            heading_lead,
+        )
         filtered = (
             float(self._last_steering)
             + alpha * (raw_steering - float(self._last_steering))
@@ -174,11 +202,17 @@ class YoloLaneFollower:
         self._last_lateral_error = lane.lateral_error_norm
         self._last_heading_error = lane.heading_error
         self._last_path_error = path_error
+        self._path_heading_lead = heading_lead
+        self._path_state = self._classify_path_state(
+            path_error,
+            lane.heading_error,
+            heading_lead,
+        )
         command = ControlCommand(
             speed=speed,
             steering=steering,
             brake=False,
-            reason="path_tracking:whole_centerline",
+            reason="path_tracking:whole_centerline:%s" % self._path_state,
         )
         self._last_command = command
         self._lane_lost_frames = 0
@@ -232,18 +266,83 @@ class YoloLaneFollower:
             1.0,
         )
 
-    def _path_steering_alpha(self, raw_steering: float, reason: str) -> float:
+    def _path_heading_lead_strength(
+        self,
+        lane: LaneGeometry,
+        path_error: float,
+    ) -> float:
+        """Measure how far path direction leads near-field displacement."""
+        heading = float(lane.heading_error)
+        near_error = (
+            float(lane.near_lateral_error_norm)
+            if lane.near_lateral_error_norm is not None
+            else float(path_error)
+        )
+        reference = 0.70 * near_error + 0.30 * float(path_error)
+        if abs(heading) <= 1e-6:
+            return 0.0
+
+        # Conflicting signs mean the geometry does not yet provide a coherent
+        # turn direction. A small reference error is treated as neutral.
+        alignment = 1.0
+        if abs(reference) > 0.015 and heading * reference < 0.0:
+            alignment = 0.0
+
+        span = max(1e-6, float(self.config.path_heading_lead_span))
+        lead = max(0.0, abs(heading) - abs(reference)) / span
+        confidence = self._clip_float(float(lane.confidence), 0.0, 1.0)
+        return self._clip_float(lead * alignment * confidence, 0.0, 1.0)
+
+    @staticmethod
+    def _classify_path_state(
+        path_error: float,
+        heading_error: float,
+        heading_lead: float,
+    ) -> str:
+        if heading_lead >= 0.20:
+            return "curve_entry"
+        if max(abs(path_error), abs(heading_error)) >= 0.10:
+            return "curve_hold"
+        return "straight"
+
+    def _path_steering_alpha(
+        self,
+        raw_steering: float,
+        reason: str,
+        heading_lead: float = 0.0,
+    ) -> float:
         previous = float(self._last_steering)
         same_direction = raw_steering == 0.0 or raw_steering * previous >= 0.0
         increasing = same_direction and abs(raw_steering) >= abs(previous)
-        alpha = (
-            self.config.path_steering_rise_alpha
-            if increasing
-            else self.config.path_steering_release_alpha
-        )
+        direction_reversal = raw_steering * previous < 0.0
+        if increasing or direction_reversal:
+            alpha = self.config.path_steering_rise_alpha
+        else:
+            alpha = self.config.path_steering_release_alpha
+        if heading_lead > 0.0:
+            alpha = max(
+                alpha,
+                self.config.path_steering_release_alpha
+                + (
+                    self.config.path_steering_rise_alpha
+                    - self.config.path_steering_release_alpha
+                )
+                * heading_lead,
+            )
         if ":lane_change" in reason:
             alpha = max(alpha, 0.65)
         return self._clip_float(alpha, 0.0, 1.0)
+
+    def accept_applied_command(
+        self,
+        command: ControlCommand,
+        running: bool = True,
+    ) -> None:
+        """Synchronize filter state with the steering sent to the vehicle."""
+        if not running:
+            self.reset()
+            return
+        self._last_steering = int(command.steering)
 
     def _plan_pure_pursuit(self, lane: LaneGeometry) -> ControlCommand:
         """Geometric steering straight from the BEV lookahead point.
@@ -357,6 +456,8 @@ class YoloLaneFollower:
         self._curve_strength = 0.0
         self._last_command = None
         self._lane_lost_frames = 0
+        self._path_state = "straight"
+        self._path_heading_lead = 0.0
 
     @staticmethod
     def _derivative(value: float, previous: Optional[float]) -> float:

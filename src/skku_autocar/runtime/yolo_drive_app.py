@@ -234,6 +234,10 @@ def run(args: argparse.Namespace) -> int:
                 obstacle_mode,
                 traffic_light,
             )
+            # The follower's temporal filter must reflect what the actuator
+            # actually receives. Traffic-light braking and mission guards may
+            # replace a planned steering value with zero.
+            follower.accept_applied_command(command, running)
 
             if vehicle is not None and wall_now - last_command_at >= 1.0 / args.command_rate:
                 serial_lines = vehicle.send(command)
@@ -322,6 +326,7 @@ def build_bev_corridor_config(args: argparse.Namespace) -> BevCorridorConfig:
         center_anchor=args.corridor_center_anchor == "on",
         max_center_jump_px=args.corridor_max_center_jump,
         max_heading_jump=args.corridor_max_heading_jump,
+        trusted_tier1_min_confidence=args.corridor_trusted_tier1_confidence,
         max_coast_frames=args.corridor_max_coast_frames,
         max_width_jump_px=args.corridor_max_width_jump,
         crosswalk_halt=args.crosswalk_halt == "on",
@@ -424,6 +429,9 @@ def build_follower_config(args: argparse.Namespace) -> YoloLaneFollowerConfig:
         path_far_weight=args.path_far_weight,
         path_steering_rise_alpha=args.path_steering_rise_alpha,
         path_steering_release_alpha=args.path_steering_release_alpha,
+        path_heading_lead_gain=args.path_heading_lead_gain,
+        path_heading_lead_span=args.path_heading_lead_span,
+        path_heading_lead_max_steering=args.path_heading_lead_max_steering,
         pure_pursuit=args.pure_pursuit,
         pure_pursuit_gain=args.pp_gain,
         pure_pursuit_full_angle=args.pp_full_angle,
@@ -456,7 +464,7 @@ def log_effective_config(
             follower_config.steering_release_rate_limit,
         )
     LOG.info(
-        "control mode=%s speed=%d min_curve=%d max=%d max_steer=%d path_gain=%.1f/%.1f/%.1f path_weight=%.2f..%.2f path_alpha=%.2f/%.2f center_lock=%s lane_lost_release=%d/frame",
+        "control mode=%s speed=%d min_curve=%d max=%d max_steer=%d path_gain=%.1f/%.1f/%.1f path_weight=%.2f..%.2f path_alpha=%.2f/%.2f heading_lead=%.1f/%.2f/max%.1f center_lock=%s lane_lost_release=%d/frame",
         (
             "whole_path"
             if follower_config.path_tracking
@@ -473,6 +481,9 @@ def log_effective_config(
         follower_config.path_near_weight,
         follower_config.path_steering_rise_alpha,
         follower_config.path_steering_release_alpha,
+        follower_config.path_heading_lead_gain,
+        follower_config.path_heading_lead_span,
+        follower_config.path_heading_lead_max_steering,
         "on" if follower_config.center_lock_enabled else "off",
         lane_lost_release,
     )
@@ -971,6 +982,12 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         help="[--bev-corridor] reject and coast a frame whose heading jumps more than this normalized amount",
     )
     parser.add_argument(
+        "--corridor-trusted-tier1-confidence",
+        type=float,
+        default=BevCorridorConfig.trusted_tier1_min_confidence,
+        help="[--bev-corridor] accept a two-physical-boundary corridor above this confidence even during a fast curve transition",
+    )
+    parser.add_argument(
         "--corridor-max-coast-frames",
         type=int,
         default=3,
@@ -1135,6 +1152,24 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         "--path-steering-release-alpha",
         type=float,
         default=YoloLaneFollowerConfig.path_steering_release_alpha,
+    )
+    parser.add_argument(
+        "--path-heading-lead-gain",
+        type=float,
+        default=YoloLaneFollowerConfig.path_heading_lead_gain,
+        help="steering feed-forward from path heading that appears before near-field lateral displacement",
+    )
+    parser.add_argument(
+        "--path-heading-lead-span",
+        type=float,
+        default=YoloLaneFollowerConfig.path_heading_lead_span,
+        help="normalized heading-versus-near-error lead needed for full curve-entry feed-forward",
+    )
+    parser.add_argument(
+        "--path-heading-lead-max-steering",
+        type=float,
+        default=YoloLaneFollowerConfig.path_heading_lead_max_steering,
+        help="maximum steering contribution from curve-entry heading feed-forward",
     )
     parser.add_argument(
         "--pp-gain",
@@ -1451,6 +1486,7 @@ def draw_debug(
             else "%.3f" % lane.near_lateral_error_norm
         ),
         "path_points=%d" % len(lane.path_points),
+        "control=%s" % _control_state(command.reason),
         "fps=%.1f" % fps,
     ]
     if light_observation is not None:
@@ -1481,6 +1517,16 @@ def draw_debug(
             cv2.LINE_AA,
         )
     return display
+
+
+def _control_state(reason: str) -> str:
+    parts = str(reason).split(":")
+    if parts and parts[0] == "path_tracking":
+        for state in ("curve_entry", "curve_hold", "straight"):
+            if state in parts:
+                return state
+        return "whole_centerline"
+    return parts[0] if parts and parts[0] else "unknown"
 
 
 def draw_bev_mask_debug(

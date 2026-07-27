@@ -131,6 +131,7 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
                 heading_smooth_alpha=1.0,
                 path_smooth_alpha=1.0,
                 crosswalk_transit_enabled=True,
+                crosswalk_recovery_max_center_jump_px=5.0,
                 vehicle_center_x_offset_ratio=0.0,
             )
         )
@@ -158,7 +159,18 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
 
         self.assertEqual(recovered.reason, "corridor_tier2")
         self.assertNotIn("heading_jump", recovered.reason)
-        self.assertEqual(estimator._crosswalk_transit_remaining, 0)
+        self.assertGreater(estimator._crosswalk_transit_remaining, 0)
+
+        curved_exit = estimator.estimate(
+            BevClassMasks(
+                center=[slanted_line_mask(100.0, -0.55)],
+                center_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+
+        self.assertEqual(curved_exit.reason, "corridor_tier2")
+        self.assertNotIn("center_jump", curved_exit.reason)
 
     def test_crosswalk_tracks_lane_with_stronger_smoothing(self):
         estimator = BevCorridorLaneEstimator(
@@ -425,6 +437,43 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
         self.assertAlmostEqual(lane.center_x, 86.5, delta=0.2)
         self.assertLess(lane.center_x, 111.5)
 
+    def test_trusted_two_boundary_curve_bypasses_scalar_center_jump(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lane_width_px=60.0,
+                min_lane_width_px=40.0,
+                max_lane_width_px=100.0,
+                max_center_jump_px=5.0,
+                trusted_tier1_min_confidence=0.80,
+                center_smooth_alpha=1.0,
+                heading_smooth_alpha=1.0,
+                path_smooth_alpha=1.0,
+                vehicle_center_x_offset_ratio=0.0,
+            )
+        )
+        estimator.estimate(
+            BevClassMasks(
+                center=[line_mask(40)],
+                side=[line_mask(100)],
+                center_conf=1.0,
+                side_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+
+        curved = estimator.estimate(
+            BevClassMasks(
+                center=[line_mask(90)],
+                side=[line_mask(150)],
+                center_conf=1.0,
+                side_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+
+        self.assertEqual(curved.reason, "corridor_tier1")
+        self.assertNotIn("center_jump", curved.reason)
+
     def test_virtual_hold_preserves_last_curve_direction(self):
         estimator = BevCorridorLaneEstimator(
             BevCorridorConfig(
@@ -615,6 +664,25 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
         )
 
         self.assertAlmostEqual(heading, 0.0, delta=1e-6)
+
+    def test_heading_uses_visible_control_segment_without_bottom_extrapolation(self):
+        estimator = BevCorridorLaneEstimator(BevCorridorConfig())
+        points = [
+            (
+                100.0 + 0.02 * (float(y) - 66.0) ** 2,
+                float(y),
+            )
+            for y in range(0, 100, 5)
+        ]
+
+        heading = estimator._heading_from_path(
+            points,
+            height=100,
+            fallback=-1.0,
+        )
+
+        self.assertGreater(heading, 0.0)
+        self.assertLess(abs(heading), 0.15)
 
     def test_disabled_obstacle_mode_skips_obstacle_bev_warp(self):
         transformer = CountingTransformer()

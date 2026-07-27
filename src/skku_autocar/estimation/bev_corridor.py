@@ -168,6 +168,10 @@ class BevCorridorConfig:
     # each held frame.
     max_center_jump_px: float = 80.0
     max_heading_jump: float = 0.32
+    # Tier 1 contains both physical lane boundaries. At high confidence it is a
+    # stronger observation than a stale temporal cache, especially when a fast
+    # curve legitimately moves the path farther than the scalar jump gate.
+    trusted_tier1_min_confidence: float = 0.80
     max_coast_frames: int = 10
     coast_confidence_decay: float = 0.8
 
@@ -350,14 +354,20 @@ class BevCorridorLaneEstimator:
             and abs_error <= 0.52
             and abs_heading <= reliable_heading_limit
         )
-        if reliable_center or reliable_right:
+        recovery_geometry = (
+            not crosswalk_seen
+            and lane.found
+            and fresh_geometry
+            and self.last_tier in (1, 2)
+            and float(lane.confidence) >= 0.45
+        )
+        if reliable_center or reliable_right or recovery_geometry:
             self._crosswalk_transit_reliable_frames += 1
             # _estimate_lane() already applies per-anchor innovation limits.
             # Returning the fresh bounded path immediately avoids resetting that
             # progress to the stale cache for two frames and then jumping.
             self._remember_crosswalk_transit_lane(lane)
             if not crosswalk_seen:
-                self._crosswalk_transit_remaining = 0
                 self._crosswalk_marker_y = None
                 self._crosswalk_advance_px = 0.0
             return lane
@@ -444,19 +454,31 @@ class BevCorridorLaneEstimator:
         # Temporal gate: outlier fits show up as a big lookahead center_x or
         # heading jump. Reject the frame and coast on the last good geometry
         # instead of letting the EMA follow it.
-        if self._is_center_jump(raw_center_x):
-            held = self._hold_crosswalk_lane_if_available("center_jump")
-            if held is not None:
-                return held
-            return self._coast_or_lost(bev.shape, "center_jump")
         trusted_recovery_measurement = (
             self._crosswalk_transit_remaining > 0
             and tier in (1, 2)
             and float(det_conf) >= 0.45
         )
+        trusted_tier1_measurement = (
+            tier == 1
+            and float(det_conf)
+            >= float(self.config.trusted_tier1_min_confidence)
+        )
+        trusted_measurement = (
+            trusted_recovery_measurement
+            or trusted_tier1_measurement
+        )
+        if (
+            self._is_center_jump(raw_center_x)
+            and not trusted_measurement
+        ):
+            held = self._hold_crosswalk_lane_if_available("center_jump")
+            if held is not None:
+                return held
+            return self._coast_or_lost(bev.shape, "center_jump")
         if (
             self._is_heading_jump(raw_heading)
-            and not trusted_recovery_measurement
+            and not trusted_measurement
         ):
             held = self._hold_crosswalk_lane_if_available("heading_jump")
             if held is not None:
@@ -1693,8 +1715,17 @@ class BevCorridorLaneEstimator:
             ]
         ys = np.asarray([point[1] for point in control_points], dtype=float)
         xs = np.asarray([point[0] for point in control_points], dtype=float)
-        fit = np.polyfit(ys, xs, min(2, len(path) - 1))
-        return self._heading_error(fit, height)
+        # Heading is the direction of the complete control segment, not the
+        # derivative of a quadratic extrapolated below that segment. The latter
+        # can report a large turn on an almost-straight visible path and causes
+        # a wrong-way steering pulse immediately before an S-curve reversal.
+        fit = np.polyfit(ys, xs, 1)
+        slope = float(fit[0])
+        return self._clip(
+            -slope * self.config.heading_gain,
+            -1.0,
+            1.0,
+        )
 
     def reset(self) -> None:
         self._lane_width_px = None

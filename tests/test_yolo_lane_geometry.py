@@ -71,6 +71,134 @@ class YoloLaneGeometryTest(unittest.TestCase):
         )
         self.assertIn("whole_centerline", path_command.reason)
 
+    def test_path_tracking_uses_rise_response_on_direction_reversal(self):
+        follower = YoloLaneFollower(
+            YoloLaneFollowerConfig(
+                path_tracking=True,
+                path_lateral_gain=100.0,
+                path_heading_gain=0.0,
+                path_derivative_gain=0.0,
+                path_heading_lead_gain=0.0,
+                path_steering_rise_alpha=1.0,
+                path_steering_release_alpha=0.05,
+                steering_rate_limit=500,
+                min_steering_rate_limit=500,
+                steering_release_rate_limit=500,
+                max_steering=500,
+            )
+        )
+
+        follower.plan(
+            lane_geometry(
+                lateral_error_norm=0.20,
+                heading_error=0.0,
+                near_lateral_error_norm=0.20,
+            )
+        )
+        reversed_command = follower.plan(
+            lane_geometry(
+                lateral_error_norm=-0.20,
+                heading_error=0.0,
+                near_lateral_error_norm=-0.20,
+            )
+        )
+
+        self.assertEqual(reversed_command.steering, -20)
+
+    def test_path_heading_lead_anticipates_curve_before_lateral_drift(self):
+        follower = YoloLaneFollower(
+            YoloLaneFollowerConfig(
+                path_tracking=True,
+                path_lateral_gain=0.0,
+                path_heading_gain=0.0,
+                path_derivative_gain=0.0,
+                path_heading_lead_gain=100.0,
+                path_heading_lead_span=0.20,
+                path_steering_rise_alpha=1.0,
+                path_steering_release_alpha=1.0,
+                steering_rate_limit=500,
+                min_steering_rate_limit=500,
+                steering_release_rate_limit=500,
+                max_steering=500,
+            )
+        )
+        curve_entry = lane_geometry(
+            lateral_error_norm=-0.02,
+            heading_error=-0.20,
+            near_lateral_error_norm=-0.04,
+        )
+
+        command = follower.plan(curve_entry)
+
+        self.assertLessEqual(command.steering, -15)
+        self.assertIn("curve_entry", command.reason)
+
+    def test_path_heading_lead_is_bounded_during_s_curve_transition(self):
+        follower = YoloLaneFollower(
+            YoloLaneFollowerConfig(
+                path_tracking=True,
+                path_lateral_gain=0.0,
+                path_heading_gain=0.0,
+                path_derivative_gain=0.0,
+                path_heading_lead_gain=500.0,
+                path_heading_lead_span=0.01,
+                path_heading_lead_max_steering=30.0,
+                path_steering_rise_alpha=1.0,
+                path_steering_release_alpha=1.0,
+                steering_rate_limit=500,
+                min_steering_rate_limit=500,
+                steering_release_rate_limit=500,
+                max_steering=500,
+            )
+        )
+
+        command = follower.plan(
+            lane_geometry(
+                lateral_error_norm=0.01,
+                heading_error=0.60,
+                near_lateral_error_norm=0.01,
+            )
+        )
+
+        self.assertEqual(command.steering, 30)
+
+    def test_path_filter_tracks_actual_brake_steering_before_restart(self):
+        follower = YoloLaneFollower(
+            YoloLaneFollowerConfig(
+                path_tracking=True,
+                path_lateral_gain=100.0,
+                path_heading_gain=0.0,
+                path_derivative_gain=0.0,
+                path_heading_lead_gain=0.0,
+                path_steering_rise_alpha=1.0,
+                path_steering_release_alpha=0.05,
+                steering_rate_limit=500,
+                min_steering_rate_limit=500,
+                steering_release_rate_limit=500,
+                max_steering=500,
+            )
+        )
+        follower.plan(
+            lane_geometry(
+                lateral_error_norm=0.30,
+                heading_error=0.0,
+                near_lateral_error_norm=0.30,
+            )
+        )
+        follower.accept_applied_command(
+            ControlCommand.stop("traffic_light:red_contact")
+        )
+
+        restarted = follower.plan(
+            lane_geometry(
+                lateral_error_norm=-0.20,
+                heading_error=0.0,
+                near_lateral_error_norm=-0.20,
+            )
+        )
+
+        self.assertEqual(restarted.steering, -20)
+
     def test_pd_steering_adds_derivative_when_error_changes(self):
         follower = YoloLaneFollower(
             YoloLaneFollowerConfig(

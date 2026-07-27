@@ -22,7 +22,8 @@ resolution, or Arduino firmware at the venue. The validated launcher is
 
 5. Confirm the terminal prints `serial connected` and the correct port.
 6. In the debug image, confirm `path_points=24`, `lane_change=LANE2`, and a
-   magenta path centered in the current lane.
+   magenta path centered in the current lane. `control` should normally read
+   `straight`, `curve_entry`, or `curve_hold`.
 7. Press Space once to start.
 
 If the Arduino device number changes, replace only the `--serial-port` value
@@ -32,6 +33,9 @@ with the new `usbmodem` path. Do not choose `usbserial-2130`.
 
 - Normal lane: whole magenta path remains between the lane boundaries; speed is
   `255`.
+- Curve entry: `control=curve_entry` may appear before the target point has
+  moved far from center. Steering follows the path direction without a large
+  opposite-direction pulse.
 - Crosswalk: state changes to `CROSSWALK_HOLD`; the magenta path follows the
   visible current-lane boundaries. If both boundaries are briefly hidden, it
   continues the motion-adjusted entry path until a valid boundary returns.
