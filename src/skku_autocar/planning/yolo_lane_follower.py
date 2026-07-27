@@ -457,11 +457,6 @@ class YoloLaneFollower:
                 0.0,
                 float(self.config.path_near_conflict_error_threshold),
             )
-            and abs(float(raw_steering))
-            >= max(
-                0.0,
-                float(self.config.path_reversal_min_steering),
-            )
             and float(near_error) * float(raw_steering) < 0.0
         )
 

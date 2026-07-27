@@ -72,7 +72,8 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --obstacle-clear-mm 3150 \
   --obstacle-min-front-sensors 2 \
   --obstacle-range-confirm-frames 1 \
-  --obstacle-visual-confirm-frames 2 \
+  --obstacle-visual-confirm-frames 1 \
+  --obstacle-rearm-clear-frames 4 \
   --obstacle-current-path-min-overlap 0.40 \
   --obstacle-physical-lane-min-overlap 0.65 \
   --obstacle-current-path-max-distance-ratio 0.48 \
@@ -81,14 +82,14 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --obstacle-visual-commit-confidence 0.90 \
   --obstacle-visual-commit-frame-y 0.40 \
   --obstacle-range-visual-fallback off \
-  --lane-change-target-width-px 150 \
+  --lane-change-target-width-px 160 \
   --lane-change-steering-override off \
-  --lane-change-steering-min 0 \
-  --lane-change-steering-boost 0 \
-  --lane-change-steering-cap 130 \
-  --lane-change-unreliable-steering-cap 90 \
-  --lane-change-stabilizing-steering-min 0 \
-  --lane-change-transition-seconds 1.2 \
+  --lane-change-steering-min 80 \
+  --lane-change-steering-boost 25 \
+  --lane-change-steering-cap 150 \
+  --lane-change-unreliable-steering-cap 120 \
+  --lane-change-stabilizing-steering-min 65 \
+  --lane-change-transition-seconds 0.85 \
   --lane-change-stable-lateral-error 0.25 \
   --lane-change-stable-near-error 0.35 \
   --lane-change-stable-frames 3 \

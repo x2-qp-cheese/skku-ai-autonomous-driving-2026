@@ -329,7 +329,10 @@ class ObstacleFusionPlanner:
             >= max(0.0, float(self.config.visual_action_confidence))
         )
         self._update_visual_state(visual)
-        self._update_rearm_state(raw_visual, stable_lane)
+        cleared_source_lane = self._update_rearm_state(
+            raw_visual,
+            stable_lane,
+        )
         self._update_path_plan(
             path_lane,
             stable_lane,
@@ -395,10 +398,24 @@ class ObstacleFusionPlanner:
         )
 
         if (
+            cleared_source_lane == 2
+            and path_lane == 1
+            and lane_change.state == "lane1"
+        ):
+            event = self._request_lane_change(lane_change, now)
+            if event is not None:
+                # Keep the return maneuver consumed until it reaches lane 2 and
+                # sees another stable clear gap.
+                self._consumed = True
+                self._last_trigger_path_lane = path_lane
+                self._clear_path_plan()
+                return event
+
+        if (
             fused_hazard
             and stable_lane
             and self._path_plan_ready(path_lane)
-            and (not self._consumed or different_path_event)
+            and not self._consumed
             and not blocked
             and now - self._last_trigger_at >= max(0.0, self.config.cooldown_seconds)
         ):
@@ -560,18 +577,25 @@ class ObstacleFusionPlanner:
         if self._clear_frames >= max(1, int(self.config.visual_clear_frames)):
             self._visual_confirmed = False
 
-    def _update_rearm_state(self, raw_visual: bool, stable_lane: bool) -> None:
+    def _update_rearm_state(
+        self,
+        raw_visual: bool,
+        stable_lane: bool,
+    ) -> Optional[int]:
         if not self._consumed:
             self._rearm_frames = 0
-            return
+            return None
         if stable_lane and not raw_visual and not self._range_hazard:
             self._rearm_frames += 1
         else:
             self._rearm_frames = 0
         if self._rearm_frames >= max(1, int(self.config.rearm_clear_frames)):
+            cleared_source_lane = self._last_trigger_path_lane
             self._consumed = False
             self._last_trigger_path_lane = None
             self._rearm_frames = 0
+            return cleared_source_lane
+        return None
 
     def _update_path_plan(
         self,
@@ -988,19 +1012,14 @@ class ObstacleFusionPlanner:
             return item.physical_lane_overlap >= min_physical_overlap
 
         def current_preferred(item: PathOccupancy) -> bool:
+            if physical_lane_known:
+                return inside_physical_lane(item)
             return (
                 item.current_overlap >= current_overlap_min
                 and inside_current_path(item)
-                and inside_physical_lane(item)
-                and (
-                    physical_lane_known
-                    or not target_preferred(item)
-                )
-                and (
-                    physical_lane_known
-                    or item.current_distance_px
-                    <= item.target_distance_px + assignment_margin_px
-                )
+                and not target_preferred(item)
+                and item.current_distance_px
+                <= item.target_distance_px + assignment_margin_px
             )
 
         def target_preferred(item: PathOccupancy) -> bool:
@@ -1018,9 +1037,6 @@ class ObstacleFusionPlanner:
             item
             for item in measurements
             if item.bottom_y_ratio >= current_y_threshold
-            and item.current_overlap >= current_overlap_min
-            and inside_current_path(item)
-            and inside_physical_lane(item)
             and current_preferred(item)
         ]
         target = [

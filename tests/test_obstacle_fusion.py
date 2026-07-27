@@ -155,11 +155,11 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
             [
                 PathOccupancy(
                     bottom_y_ratio=0.75,
-                    current_overlap=0.62,
+                    current_overlap=0.05,
                     target_overlap=0.84,
                     current_distance_px=18.0,
                     target_distance_px=7.0,
-                    current_distance_ratio=0.30,
+                    current_distance_ratio=0.90,
                     target_distance_ratio=0.12,
                     physical_lane_overlap=1.0,
                 )
@@ -1127,7 +1127,7 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertIsNone(second)
         self.assertEqual(change.state, "lane1")
 
-    def test_new_path_obstacle_replans_without_a_clear_gap(self):
+    def test_new_path_obstacle_does_not_force_return_without_clear_gap(self):
         fusion = planner(rearm_clear_frames=3)
         change = controller()
         lane2_mask = obstacle_mask(130, 151, 45, 70)
@@ -1149,14 +1149,13 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         )
 
         self.assertIsNone(first)
-        self.assertIn("lane1 -> lane2", second)
-        self.assertEqual(change.return_source, "obstacle_fusion")
+        self.assertIsNone(second)
+        self.assertEqual(change.state, "lane1")
 
-    def test_new_obstacle_can_toggle_lane_after_stable_clear_rearm(self):
+    def test_stable_clear_gap_requests_return_to_lane2(self):
         fusion = planner(rearm_clear_frames=3)
         change = controller()
         lane2_mask = obstacle_mask(130, 151, 45, 70)
-        lane1_mask = obstacle_mask(70, 91, 45, 70)
 
         fusion.update(
             [lane2_mask], SHAPE, CENTERLINE, lane(), change, ultrasound(), 1.0, True
@@ -1166,15 +1165,18 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         )
         change.state = "lane1"
         no_echo = ultrasound(fc=0, fr=0, fl=0)
+        event = None
         for now in (1.2, 1.3, 1.4):
-            fusion.update([], SHAPE, CENTERLINE, lane(), change, no_echo, now, True)
-
-        fusion.update(
-            [lane1_mask], SHAPE, CENTERLINE, lane(), change, ultrasound(), 1.5, True
-        )
-        event = fusion.update(
-            [lane1_mask], SHAPE, CENTERLINE, lane(), change, ultrasound(), 1.6, True
-        )
+            event = fusion.update(
+                [],
+                SHAPE,
+                CENTERLINE,
+                lane(),
+                change,
+                no_echo,
+                now,
+                True,
+            )
 
         self.assertIn("lane1 -> lane2", event)
         self.assertEqual(change.return_source, "obstacle_fusion")
