@@ -1152,6 +1152,39 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertIsNone(second)
         self.assertEqual(change.state, "lane1")
 
+    def test_new_path_obstacle_triggers_after_source_lane_clearing_evidence(self):
+        fusion = planner(
+            rearm_clear_frames=4,
+            source_clear_confirm_frames=2,
+        )
+        change = controller()
+        lane2_mask = obstacle_mask(130, 151, 45, 70)
+        lane1_mask = obstacle_mask(70, 91, 45, 70)
+
+        fusion.update(
+            [lane2_mask], SHAPE, CENTERLINE, lane(), change, ultrasound(), 1.0, True
+        )
+        fusion.update(
+            [lane2_mask], SHAPE, CENTERLINE, lane(), change, ultrasound(), 1.1, True
+        )
+        change.state = "lane1"
+        fusion.update(
+            [lane2_mask], SHAPE, CENTERLINE, lane(), change, ultrasound(), 1.2, True
+        )
+        fusion.update(
+            [lane2_mask], SHAPE, CENTERLINE, lane(), change, ultrasound(), 1.3, True
+        )
+
+        fusion.update(
+            [lane1_mask], SHAPE, CENTERLINE, lane(), change, ultrasound(), 1.4, True
+        )
+        event = fusion.update(
+            [lane1_mask], SHAPE, CENTERLINE, lane(), change, ultrasound(), 1.5, True
+        )
+
+        self.assertIn("lane1 -> lane2", event)
+        self.assertEqual(change.return_source, "obstacle_fusion")
+
     def test_stable_clear_gap_requests_return_to_lane2(self):
         fusion = planner(rearm_clear_frames=3)
         change = controller()
@@ -1179,7 +1212,7 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
             )
 
         self.assertIn("lane1 -> lane2", event)
-        self.assertEqual(change.return_source, "obstacle_fusion")
+        self.assertEqual(change.return_source, "obstacle_clear")
 
     def test_yolo_mode_supports_offline_video_replay(self):
         fusion = planner(fusion_mode="yolo")
@@ -1275,6 +1308,8 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
                 "3",
                 "--obstacle-rearm-clear-frames",
                 "4",
+                "--obstacle-source-clear-frames",
+                "3",
                 "--obstacle-ttc-seconds",
                 "1.6",
                 "--obstacle-solid-crossing-margin-px",
@@ -1289,6 +1324,14 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
                 "0.19",
                 "--lane-change-stabilizing-steering-min",
                 "75",
+                "--lane-change-steering-slew-limit",
+                "32",
+                "--lane-change-return-duration-scale",
+                "1.25",
+                "--lane-change-return-steering-cap",
+                "125",
+                "--lane-change-return-stabilizing-steering-cap",
+                "85",
                 "--obstacle-side-clearance-mm",
                 "350",
                 "--obstacle-emergency-stop",
@@ -1313,6 +1356,7 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertEqual(config.min_front_sensors, 2)
         self.assertEqual(config.range_confirm_frames, 3)
         self.assertEqual(config.rearm_clear_frames, 4)
+        self.assertEqual(config.source_clear_confirm_frames, 3)
         self.assertAlmostEqual(config.ttc_trigger_seconds, 1.6)
         self.assertEqual(config.solid_crossing_margin_px, 7.0)
         self.assertEqual(config.side_clearance_mm, 350.0)
@@ -1323,6 +1367,10 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertEqual(lane_config.target_lane_width_px, 142.0)
         self.assertAlmostEqual(lane_config.stable_near_lateral_error, 0.19)
         self.assertEqual(lane_config.stabilizing_steering_min, 75)
+        self.assertEqual(lane_config.steering_slew_limit, 32)
+        self.assertAlmostEqual(lane_config.return_duration_scale, 1.25)
+        self.assertEqual(lane_config.return_steering_cap, 125)
+        self.assertEqual(lane_config.return_stabilizing_steering_cap, 85)
 
     def test_competition_defaults_use_early_range_and_strong_stabilization(self):
         args = parse_args([])

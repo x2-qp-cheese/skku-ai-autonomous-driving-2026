@@ -18,6 +18,7 @@ class LaneChangeConfig:
     steering_min: int = 100
     steering_boost: int = 25
     steering_cap: int = 120
+    steering_slew_limit: int = 0
     steering_override: bool = False
     unreliable_speed_cap: int = 70
     unreliable_steering_cap: int = 90
@@ -72,6 +73,8 @@ class LaneChangeController:
         self._target_capture_frames = 0
         self._locked_lane_width_px = None
         self._last_reliable_shifted_lane: Optional[LaneGeometry] = None
+        self._last_output_steering: Optional[int] = None
+        self._steering_slew_releasing = False
         self._paused_at: Optional[float] = None
 
     def reset(self) -> None:
@@ -87,6 +90,8 @@ class LaneChangeController:
         self._target_capture_frames = 0
         self._locked_lane_width_px = None
         self._last_reliable_shifted_lane = None
+        self._last_output_steering = None
+        self._steering_slew_releasing = False
         self._paused_at = None
 
     def pause(self, now: float) -> None:
@@ -355,28 +360,73 @@ class LaneChangeController:
     ) -> ControlCommand:
         adjusted = self._apply_steering_assist_base(command, result)
         if adjusted.brake:
+            self._last_output_steering = None
+            self._steering_slew_releasing = False
             return adjusted
-        if result.state == "changing_to_lane2":
-            cap = max(0, int(self.config.return_steering_cap))
-        elif result.state == "stabilizing_lane2":
-            cap = max(
-                0,
-                int(self.config.return_stabilizing_steering_cap),
-            )
-        else:
-            return adjusted
-        if cap <= 0:
-            return adjusted
-        steering = self._clip(adjusted.steering, -cap, cap)
-        if steering == adjusted.steering:
-            return adjusted
+        if self._return_profile != "avoidance":
+            if result.state == "changing_to_lane2":
+                cap = max(0, int(self.config.return_steering_cap))
+            elif result.state == "stabilizing_lane2":
+                cap = max(
+                    0,
+                    int(self.config.return_stabilizing_steering_cap),
+                )
+            else:
+                cap = 0
+            if cap > 0:
+                steering = self._clip(adjusted.steering, -cap, cap)
+                if steering != adjusted.steering:
+                    reason = (
+                        "%s:lane2_return_smooth" % adjusted.reason
+                        if adjusted.reason
+                        else "lane2_return_smooth"
+                    )
+                    adjusted = ControlCommand(
+                        speed=adjusted.speed,
+                        steering=steering,
+                        brake=False,
+                        reason=reason,
+                    )
+        return self._apply_steering_slew(adjusted, result)
+
+    def _apply_steering_slew(
+        self,
+        command: ControlCommand,
+        result: LaneChangeResult,
+    ) -> ControlCommand:
+        limit = max(0, int(self.config.steering_slew_limit))
+        active = result.state in (
+            "changing_to_lane1",
+            "stabilizing_lane1",
+            "changing_to_lane2",
+            "stabilizing_lane2",
+        )
+        if limit <= 0:
+            self._last_output_steering = int(command.steering)
+            self._steering_slew_releasing = active
+            return command
+        if self._last_output_steering is None:
+            self._last_output_steering = int(command.steering)
+            self._steering_slew_releasing = active
+            return command
+        if not active and not self._steering_slew_releasing:
+            self._last_output_steering = int(command.steering)
+            return command
+
+        previous = self._last_output_steering
+        target = int(command.steering)
+        steering = self._clip(target, previous - limit, previous + limit)
+        self._last_output_steering = steering
+        self._steering_slew_releasing = active or steering != target
+        if steering == target:
+            return command
         reason = (
-            "%s:lane2_return_smooth" % adjusted.reason
-            if adjusted.reason
-            else "lane2_return_smooth"
+            "%s:lane_change_slew" % command.reason
+            if command.reason
+            else "lane_change_slew"
         )
         return ControlCommand(
-            speed=adjusted.speed,
+            speed=command.speed,
             steering=steering,
             brake=False,
             reason=reason,
@@ -552,7 +602,10 @@ class LaneChangeController:
 
     def _progress(self, now: float) -> float:
         duration = max(0.05, self.config.transition_seconds)
-        if self.state == "changing_to_lane2":
+        if (
+            self.state == "changing_to_lane2"
+            and self._return_profile != "avoidance"
+        ):
             duration *= max(1.0, float(self.config.return_duration_scale))
         if self._phase_started_at is None:
             return 0.0

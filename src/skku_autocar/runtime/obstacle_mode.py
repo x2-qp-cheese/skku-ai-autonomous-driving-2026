@@ -404,6 +404,7 @@ def build_lane_change_config(args: argparse.Namespace) -> LaneChangeConfig:
         steering_min=args.lane_change_steering_min,
         steering_boost=args.lane_change_steering_boost,
         steering_cap=steering_cap,
+        steering_slew_limit=args.lane_change_steering_slew_limit,
         steering_override=args.lane_change_steering_override == "on",
         unreliable_speed_cap=args.lane_change_unreliable_speed_cap,
         unreliable_steering_cap=args.lane_change_unreliable_steering_cap,
@@ -418,9 +419,11 @@ def build_lane_change_config(args: argparse.Namespace) -> LaneChangeConfig:
         target_capture_frames=args.lane_change_target_capture_frames,
         allow_virtual_stabilize=args.lane_change_allow_virtual_stabilize == "on",
         smooth_avoidance=True,
-        return_duration_scale=1.35,
-        return_steering_cap=115,
-        return_stabilizing_steering_cap=90,
+        return_duration_scale=args.lane_change_return_duration_scale,
+        return_steering_cap=args.lane_change_return_steering_cap,
+        return_stabilizing_steering_cap=(
+            args.lane_change_return_stabilizing_steering_cap
+        ),
     )
 
 
@@ -575,6 +578,7 @@ def build_obstacle_fusion_config(args: argparse.Namespace) -> ObstacleFusionConf
         range_confirm_frames=args.obstacle_range_confirm_frames,
         range_clear_frames=args.obstacle_range_clear_frames,
         rearm_clear_frames=args.obstacle_rearm_clear_frames,
+        source_clear_confirm_frames=args.obstacle_source_clear_frames,
         ttc_trigger_seconds=args.obstacle_ttc_seconds,
         min_closing_rate_mm_s=args.obstacle_min_closing_rate,
         side_clearance_mm=args.obstacle_side_clearance_mm,
@@ -664,6 +668,7 @@ def add_obstacle_arguments(parser: argparse.ArgumentParser) -> None:
         ("--lane-change-speed-cap", int, 255),
         ("--lane-change-steering-min", int, 150),
         ("--lane-change-steering-boost", int, 35),
+        ("--lane-change-steering-slew-limit", int, 0),
         ("--lane-change-unreliable-speed-cap", int, 255),
         ("--lane-change-unreliable-steering-cap", int, 150),
         ("--lane-change-stabilizing-steering-min", int, 90),
@@ -674,6 +679,9 @@ def add_obstacle_arguments(parser: argparse.ArgumentParser) -> None:
         ("--lane-change-target-width-px", float, 120.0),
         ("--lane-change-target-approach-error", float, 0.20),
         ("--lane-change-target-capture-frames", int, LaneChangeConfig.target_capture_frames),
+        ("--lane-change-return-duration-scale", float, 1.35),
+        ("--lane-change-return-steering-cap", int, 115),
+        ("--lane-change-return-stabilizing-steering-cap", int, 90),
     )
     for name, value_type, default in lane_specs:
         group.add_argument(name, type=value_type, default=default)
@@ -743,6 +751,11 @@ def add_obstacle_arguments(parser: argparse.ArgumentParser) -> None:
         ("--obstacle-range-confirm-frames", int, ObstacleFusionConfig.range_confirm_frames),
         ("--obstacle-range-clear-frames", int, ObstacleFusionConfig.range_clear_frames),
         ("--obstacle-rearm-clear-frames", int, ObstacleFusionConfig.rearm_clear_frames),
+        (
+            "--obstacle-source-clear-frames",
+            int,
+            ObstacleFusionConfig.source_clear_confirm_frames,
+        ),
         ("--obstacle-ttc-seconds", float, ObstacleFusionConfig.ttc_trigger_seconds),
         ("--obstacle-min-closing-rate", float, ObstacleFusionConfig.min_closing_rate_mm_s),
         ("--obstacle-side-clearance-mm", float, ObstacleFusionConfig.side_clearance_mm),

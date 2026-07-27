@@ -56,6 +56,7 @@ class ObstacleFusionConfig:
     range_confirm_frames: int = 1
     range_clear_frames: int = 2
     rearm_clear_frames: int = 3
+    source_clear_confirm_frames: int = 2
     ttc_trigger_seconds: float = 0.0
     min_closing_rate_mm_s: float = 120.0
     side_clearance_mm: float = 300.0
@@ -178,6 +179,7 @@ class ObstacleFusionPlanner:
         self._range_frames = 0
         self._range_clear_frames = 0
         self._rearm_frames = 0
+        self._source_clearing_frames = 0
         self._consumed = False
         self._last_trigger_path_lane: Optional[int] = None
         self._planned_from_lane: Optional[int] = None
@@ -197,6 +199,7 @@ class ObstacleFusionPlanner:
         self._range_frames = 0
         self._range_clear_frames = 0
         self._rearm_frames = 0
+        self._source_clearing_frames = 0
         self._consumed = False
         self._last_trigger_path_lane = None
         self._clear_path_plan()
@@ -359,6 +362,16 @@ class ObstacleFusionPlanner:
         # Immediately after an avoidance, one nearby source obstacle can span
         # both projected paths. It is not a new obstacle in the destination.
         clearing_source = different_path_event and target_blocked
+        if clearing_source and stable_lane:
+            self._source_clearing_frames += 1
+        elif not different_path_event:
+            self._source_clearing_frames = 0
+        separated_path_event = (
+            different_path_event
+            and not clearing_source
+            and self._source_clearing_frames
+            >= max(1, int(self.config.source_clear_confirm_frames))
+        )
         emergency = self._emergency_present(
             raw_visual,
             bev_assessment.closest_y_ratio,
@@ -402,7 +415,11 @@ class ObstacleFusionPlanner:
             and path_lane == 1
             and lane_change.state == "lane1"
         ):
-            event = self._request_lane_change(lane_change, now)
+            event = self._request_lane_change(
+                lane_change,
+                now,
+                avoidance=False,
+            )
             if event is not None:
                 # Keep the return maneuver consumed until it reaches lane 2 and
                 # sees another stable clear gap.
@@ -415,7 +432,7 @@ class ObstacleFusionPlanner:
             fused_hazard
             and stable_lane
             and self._path_plan_ready(path_lane)
-            and not self._consumed
+            and (not self._consumed or separated_path_event)
             and not blocked
             and now - self._last_trigger_at >= max(0.0, self.config.cooldown_seconds)
         ):
@@ -423,6 +440,7 @@ class ObstacleFusionPlanner:
             if event is not None:
                 self._consumed = True
                 self._last_trigger_path_lane = path_lane
+                self._source_clearing_frames = 0
                 self._clear_path_plan()
                 return event
         return None
@@ -594,6 +612,7 @@ class ObstacleFusionPlanner:
             self._consumed = False
             self._last_trigger_path_lane = None
             self._rearm_frames = 0
+            self._source_clearing_frames = 0
             return cleared_source_lane
         return None
 
@@ -1100,13 +1119,17 @@ class ObstacleFusionPlanner:
         self,
         lane_change: LaneChangeController,
         now: float,
+        avoidance: bool = True,
     ) -> Optional[str]:
         source = "obstacle_fusion"
         if lane_change.state in ("lane2", "completed"):
             accepted = lane_change.request_avoidance(source)
             direction = "lane2 -> lane1"
         elif lane_change.state == "lane1":
-            accepted = lane_change.request_avoidance_return(source)
+            if avoidance:
+                accepted = lane_change.request_avoidance_return(source)
+            else:
+                accepted = lane_change.request_return("obstacle_clear")
             direction = "lane1 -> lane2"
         else:
             return None

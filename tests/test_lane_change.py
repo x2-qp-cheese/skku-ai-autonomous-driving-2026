@@ -657,6 +657,108 @@ class LaneChangeControllerTest(unittest.TestCase):
         self.assertEqual(changing.direction, 1)
         self.assertEqual(adjusted.steering, 150)
 
+    def test_urgent_avoidance_return_uses_full_transition_rate_and_cap(self):
+        self.controller = LaneChangeController(
+            LaneChangeConfig(
+                mode="external",
+                transition_seconds=1.0,
+                smooth_avoidance=True,
+                steering_override=True,
+                steering_min=150,
+                steering_cap=150,
+                return_duration_scale=1.35,
+                return_steering_cap=115,
+                stable_required_frames=0,
+            )
+        )
+        self.controller.state = "lane1"
+        self.assertTrue(
+            self.controller.request_avoidance_return("obstacle_fusion")
+        )
+        started = self.controller.update(
+            lane_for_shifted_lane1(), 150.0, 800.0, 0.0, True
+        )
+        changing = self.controller.update(
+            lane_for_shifted_lane1(), 150.0, 800.0, 0.1, True
+        )
+        adjusted = self.controller.apply_steering_assist(
+            ControlCommand(speed=255, steering=-40, reason="lane"),
+            changing,
+        )
+        finished = self.controller.update(
+            lane_for_shifted_lane1(), 150.0, 800.0, 1.1, True
+        )
+
+        self.assertEqual(started.state, "changing_to_lane2")
+        self.assertEqual(changing.state, "changing_to_lane2")
+        self.assertEqual(adjusted.steering, 150)
+        self.assertEqual(finished.state, "completed")
+
+    def test_normal_return_keeps_slow_return_profile(self):
+        self.controller = LaneChangeController(
+            LaneChangeConfig(
+                mode="external",
+                transition_seconds=1.0,
+                smooth_avoidance=True,
+                return_duration_scale=1.35,
+                stable_required_frames=0,
+            )
+        )
+        self.controller.state = "lane1"
+        self.assertTrue(self.controller.request_return("obstacle_clear"))
+        self.controller.update(
+            lane_for_shifted_lane1(), 150.0, 800.0, 0.0, True
+        )
+
+        returning = self.controller.update(
+            lane_for_shifted_lane1(), 150.0, 800.0, 1.0, True
+        )
+
+        self.assertEqual(returning.state, "changing_to_lane2")
+
+    def test_avoidance_steering_slew_is_continuous_through_stabilization(self):
+        self.controller = LaneChangeController(
+            LaneChangeConfig(
+                mode="external",
+                transition_seconds=1.0,
+                smooth_avoidance=True,
+                steering_min=80,
+                steering_boost=25,
+                steering_cap=150,
+                steering_slew_limit=35,
+                stabilizing_steering_min=0,
+                stable_required_frames=5,
+            )
+        )
+        idle = self.controller.update(lane(), 150.0, 800.0, 0.0, True)
+        self.controller.apply_steering_assist(
+            ControlCommand(speed=255, steering=0, reason="lane"),
+            idle,
+        )
+        self.controller.request_avoidance("obstacle_fusion")
+        changing1 = self.controller.update(lane(), 150.0, 800.0, 0.1, True)
+        output1 = self.controller.apply_steering_assist(
+            ControlCommand(speed=255, steering=-150, reason="lane"),
+            changing1,
+        )
+        changing2 = self.controller.update(lane(), 150.0, 800.0, 0.2, True)
+        output2 = self.controller.apply_steering_assist(
+            ControlCommand(speed=255, steering=-150, reason="lane"),
+            changing2,
+        )
+        stabilizing = self.controller.update(lane(), 150.0, 800.0, 1.2, True)
+        output3 = self.controller.apply_steering_assist(
+            ControlCommand(speed=255, steering=80, reason="lane"),
+            stabilizing,
+        )
+
+        self.assertEqual(output1.steering, -35)
+        self.assertEqual(output2.steering, -70)
+        self.assertEqual(stabilizing.state, "stabilizing_lane1")
+        self.assertEqual(output3.steering, -35)
+        self.assertEqual(output3.speed, 255)
+        self.assertIn("lane_change_slew", output3.reason)
+
     def test_avoidance_releases_max_steering_inside_target_capture_zone(self):
         self.controller = LaneChangeController(
             LaneChangeConfig(
