@@ -41,7 +41,12 @@ from ..perception.bev import BevTransformer
 from ..perception.yolo_lane import YoloLaneConfig, YoloLaneSegmenter
 from ..planning.model_based_parking import ModelBasedTParkingPlanner
 from ..planning.t_parking_planner import ParkingState
-from ..sensors.lidar import LidarCsvReplay, RplidarScanner, find_lidar_port
+from ..sensors.lidar import (
+    LidarCsvRecorder,
+    LidarCsvReplay,
+    RplidarScanner,
+    find_lidar_port,
+)
 
 
 LOG = logging.getLogger("skku_autocar.parking")
@@ -384,6 +389,7 @@ def run_prepared(args: argparse.Namespace) -> int:
 
     dashboard_recorder: Optional[DashboardVideoRecorder] = None
     dashboard_record_path: Optional[Path] = None
+    lidar_recorder: Optional[LidarCsvRecorder] = None
     if dashboard_recording_enabled(args.record_dashboard, is_replay):
         dashboard_record_path = timestamped_dashboard_path(args.parking_record_dir)
         dashboard_recorder = DashboardVideoRecorder(
@@ -392,6 +398,12 @@ def run_prepared(args: argparse.Namespace) -> int:
             args.dashboard_record_fps,
         )
         LOG.info("dashboard recording enabled: %s", dashboard_record_path)
+        if lidar_scanner is not None:
+            lidar_record_path = dashboard_record_path.with_name(
+                dashboard_record_path.stem + "_lidar.csv"
+            )
+            lidar_recorder = LidarCsvRecorder(lidar_record_path)
+            LOG.info("raw LiDAR recording enabled: %s", lidar_record_path)
 
     try:
         while True:
@@ -467,6 +479,8 @@ def run_prepared(args: argparse.Namespace) -> int:
                 elapsed + args.lidar_offset + config.runtime.lidar_video_offset_s,
                 args.allow_no_lidar,
             )
+            if lidar_recorder is not None:
+                lidar_recorder.write(lidar_scan)
             lidar_points = lidar_estimator.vehicle_points(lidar_scan)
             # The two bordering cars determine an official-size 950 x 1500 mm
             # bay. Fresh, consistent two-car observations re-anchor its pose;
@@ -662,6 +676,14 @@ def run_prepared(args: argparse.Namespace) -> int:
                     dashboard_recorder.path,
                     dashboard_recorder.frames_written,
                 )
+        if lidar_recorder is not None:
+            lidar_recorder.close()
+            LOG.info(
+                "raw LiDAR recording saved: %s (%d scans, %d points)",
+                lidar_recorder.path,
+                lidar_recorder.scans_written,
+                lidar_recorder.points_written,
+            )
         if lidar_scanner is not None:
             lidar_scanner.close()
         if cap is not None:
@@ -891,10 +913,13 @@ def draw_live_dashboard(
             plan.command.steering,
             plan.reason,
         ),
-        "LiDAR %s pts=%d/%d cars=%d gap=%s centerY=%s cm width=%s cm" % (
+        "LiDAR %s raw=%d valid=%d R=%d/%d L=%d cars=%d gap=%s centerY=%s cm width=%s cm" % (
             lidar.reason,
+            lidar.raw_points,
             lidar.observed_points,
             lidar.car_roi_points,
+            lidar.accumulated_car_roi_points,
+            lidar.left_roi_points,
             lidar.car_count,
             "CONFIRMED" if lidar.gap_confirmed else (
                 "candidate" if lidar.gap_found else "no"
@@ -1158,7 +1183,7 @@ def draw_lidar_debug(
     slot_status: str = "",
 ) -> Any:
     size = 600
-    scale = 0.10  # 6 m across the full canvas.
+    scale = 0.065  # About 9.2 m across, including the expanded right ROI.
     origin = (size // 2, size // 2)
     rotation_deg = config.runtime.lidar_display_rotation_deg
     canvas = np.zeros((size, size, 3), dtype=np.uint8)

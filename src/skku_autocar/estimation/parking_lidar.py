@@ -35,6 +35,7 @@ class CarCluster:
     x_max_mm: float
     y_back_min_mm: float
     y_back_max_mm: float
+    scan_count: int = 1
 
     @property
     def center_y_back_mm(self) -> float:
@@ -82,12 +83,18 @@ class LidarParkingConfig:
     min_observed_points: int = 5
     car_cluster_radius_mm: float = 350.0
     car_cluster_min_points: int = 3
+    detection_accumulation_scans: int = 1
+    detection_accumulation_max_age_s: float = 0.6
     # First-car detection stays intentionally sensitive, but a parking bay
     # must be bordered by two stronger parked-car clusters. Otherwise a partial
     # return from the first obstacle plus a stray reflection can look like a
     # false slot.
     gap_cluster_min_points: int = 5
+    gap_cluster_min_scans: int = 1
+    gap_cluster_min_span_mm: float = 0.0
     gap_pair_min_points: int = 10
+    gap_pair_max_lateral_offset_mm: float = 1.0e9
+    gap_pair_min_longitudinal_alignment: float = 0.0
 
     # Official painted bay dimensions. The observed surface gap is larger
     # because LiDAR sees the neighboring vehicles, not the painted boundaries.
@@ -126,6 +133,7 @@ class LidarParkingConfig:
     # right; require a denser, physically wider cluster before it is treated as
     # the first parked car.
     first_car_cluster_min_points: int = 5
+    first_car_min_scans: int = 1
     first_car_min_span_mm: float = 80.0
     first_car_max_center_jump_mm: float = 450.0
     first_car_turn_target_y_back_mm: float = -650.0
@@ -144,8 +152,11 @@ class LidarParkingObservation:
     timestamp: float = 0.0
     valid: bool = False
     unsafe: bool = False
+    raw_points: int = 0
     observed_points: int = 0
     car_roi_points: int = 0
+    accumulated_car_roi_points: int = 0
+    left_roi_points: int = 0
     car_count: int = 0
     first_car_seen: bool = False
     first_car_confirmed: bool = False
@@ -207,6 +218,10 @@ class LidarParkingSpaceEstimator:
         self._last_gap: Optional[
             Tuple[float, float, float, float, float, float, float]
         ] = None
+        self._recent_car_scans: List[
+            Tuple[float, Tuple[Tuple[float, float, float], ...]]
+        ] = []
+        self._last_accumulated_timestamp: Optional[float] = None
 
     def reset(self) -> None:
         self._last_timestamp = None
@@ -228,6 +243,8 @@ class LidarParkingSpaceEstimator:
         self._smoothed_edge_span_mm = None
         self._smoothed_gap_width_mm = None
         self._last_gap = None
+        self._recent_car_scans = []
+        self._last_accumulated_timestamp = None
 
     def vehicle_points(self, scan: Optional[LidarScan]) -> List[Tuple[float, float]]:
         if scan is None:
@@ -247,7 +264,12 @@ class LidarParkingSpaceEstimator:
             self.reset()
             return LidarParkingObservation(timestamp=scan.timestamp, reason="stale_scan")
 
-        transformed = [value for value in (self._transform(point) for point in scan.points) if value]
+        transformed = [
+            value
+            for value in (self._transform(point) for point in scan.points)
+            if value
+        ]
+        new_scan = self._last_timestamp != scan.timestamp
         cluster_roi = (
             self.config.slot_tracking_roi
             if self._confirmed and self.config.slot_tracking_roi is not None
@@ -257,8 +279,12 @@ class LidarParkingSpaceEstimator:
             point for point in transformed
             if cluster_roi.contains(point[0], point[1])
         ]
-        cluster_points_list = cluster_points(
+        accumulated_car_points = self._accumulate_car_points(
             car_points,
+            scan.timestamp,
+        )
+        cluster_points_list = cluster_points(
+            accumulated_car_points,
             self.config.car_cluster_radius_mm,
             self.config.car_cluster_min_points,
         )
@@ -271,11 +297,24 @@ class LidarParkingSpaceEstimator:
             for x_right, y_back in transformed
             if self.config.safety_roi.contains(x_right, y_back)
         ]
+        search_roi = self.config.car_detection_roi
+        mirrored_left_roi = RectangleRoi(
+            -search_roi.x_max_mm,
+            -search_roi.x_min_mm,
+            search_roi.y_back_min_mm,
+            search_roi.y_back_max_mm,
+        )
+        left_roi_points = sum(
+            1
+            for x_right, y_back in transformed
+            if mirrored_left_roi.contains(x_right, y_back)
+        )
         nearest_safety = min(safety_distances) if safety_distances else None
         unsafe = nearest_safety is not None
         valid = (
             len(transformed) >= max(1, self.config.min_observed_points)
-            or len(car_points) >= max(1, self.config.car_cluster_min_points)
+            or len(accumulated_car_points)
+            >= max(1, self.config.car_cluster_min_points)
         )
         reference_depth = (
             (self._tracked_depth_x, self._tracked_depth_y)
@@ -305,8 +344,6 @@ class LidarParkingSpaceEstimator:
         gap_pair_observed = candidate is not None
         if candidate is None and valid and self._confirmed:
             candidate = self._track_gap_from_single_cluster(clusters)
-        new_scan = self._last_timestamp != scan.timestamp
-
         first_car = select_first_approach_car(clusters, self.config) if valid else None
         if new_scan:
             if first_car is None:
@@ -403,6 +440,8 @@ class LidarParkingSpaceEstimator:
             reason = "one_parked_car"
         elif len(clusters) >= 2:
             reason = "two_cars_no_valid_gap"
+        elif len(car_points) < max(1, self.config.car_cluster_min_points):
+            reason = "right_roi_sparse"
         else:
             reason = "searching_for_parked_cars"
 
@@ -410,8 +449,11 @@ class LidarParkingSpaceEstimator:
             timestamp=scan.timestamp,
             valid=valid,
             unsafe=unsafe,
+            raw_points=len(scan.points),
             observed_points=len(transformed),
             car_roi_points=len(car_points),
+            accumulated_car_roi_points=len(accumulated_car_points),
+            left_roi_points=left_roi_points,
             car_count=len(clusters),
             first_car_seen=first_car is not None,
             first_car_confirmed=first_car_confirmed,
@@ -439,6 +481,38 @@ class LidarParkingSpaceEstimator:
             car_clusters=clusters,
             coasted=coasted,
             reason=reason,
+        )
+
+    def _accumulate_car_points(
+        self,
+        current_points: Sequence[Tuple[float, float]],
+        timestamp: float,
+    ) -> Tuple[Tuple[float, float, float], ...]:
+        if self._last_accumulated_timestamp != timestamp:
+            tagged = tuple(
+                (float(x_right), float(y_back), float(timestamp))
+                for x_right, y_back in current_points
+            )
+            self._recent_car_scans.append((float(timestamp), tagged))
+            self._last_accumulated_timestamp = timestamp
+
+        scan_limit = max(1, int(self.config.detection_accumulation_scans))
+        if len(self._recent_car_scans) > scan_limit:
+            self._recent_car_scans = self._recent_car_scans[-scan_limit:]
+        maximum_age = max(
+            0.0,
+            float(self.config.detection_accumulation_max_age_s),
+        )
+        if maximum_age > 0.0:
+            cutoff = float(timestamp) - maximum_age
+            self._recent_car_scans = [
+                item for item in self._recent_car_scans
+                if item[0] >= cutoff
+            ]
+        return tuple(
+            point
+            for _, points in self._recent_car_scans
+            for point in points
         )
 
     def _update_tracking(
@@ -760,6 +834,8 @@ def first_car_cluster_eligible(
         return False
     if cluster.point_count < max(1, config.first_car_cluster_min_points):
         return False
+    if cluster.scan_count < max(1, config.first_car_min_scans):
+        return False
     if cluster.max_span_mm < max(0.0, config.first_car_min_span_mm):
         return False
     return True
@@ -770,7 +846,10 @@ def is_gap_cluster_eligible(
     config: LidarParkingConfig,
 ) -> bool:
     min_points = max(1, config.car_cluster_min_points, config.gap_cluster_min_points)
-    return cluster.point_count >= min_points
+    return (
+        cluster.point_count >= min_points
+        and cluster.scan_count >= max(1, config.gap_cluster_min_scans)
+    )
 
 
 def cluster_slot_edge(
@@ -840,6 +919,29 @@ def choose_gap(
                 continue
             unit_x = axis_x / center_distance
             unit_y = axis_y / center_distance
+            if reference_depth is None:
+                if (
+                    abs(first_center_x - second_center_x)
+                    > max(0.0, config.gap_pair_max_lateral_offset_mm)
+                ):
+                    continue
+                if (
+                    abs(unit_y)
+                    < max(
+                        0.0,
+                        min(1.0, config.gap_pair_min_longitudinal_alignment),
+                    )
+                ):
+                    continue
+                minimum_span = max(
+                    0.0,
+                    config.gap_cluster_min_span_mm,
+                )
+                if (
+                    first.max_span_mm < minimum_span
+                    or second.max_span_mm < minimum_span
+                ):
+                    continue
             first_radius = (
                 abs(unit_x) * (first.x_max_mm - first.x_min_mm) / 2.0
                 + abs(unit_y) * (first.y_back_max_mm - first.y_back_min_mm) / 2.0
@@ -905,6 +1007,7 @@ def choose_gap(
             )
             candidates.append((
                 continuity_distance,
+                -(first.point_count + second.point_count),
                 abs(width - config.expected_observed_gap_mm),
                 width,
                 first_edge_y,
@@ -916,12 +1019,23 @@ def choose_gap(
             ))
     if not candidates:
         return None
-    _, _, width, first_y, second_y, first_x, second_x, depth_x, depth_y = min(
+    (
+        _,
+        _,
+        _,
+        width,
+        first_y,
+        second_y,
+        first_x,
+        second_x,
+        depth_x,
+        depth_y,
+    ) = min(
         candidates,
         key=(
-            (lambda item: (item[0], item[1]))
+            (lambda item: (item[0], item[2], item[1]))
             if reference_center is not None
-            else (lambda item: (item[1], item[0]))
+            else (lambda item: (item[1], item[2], item[0]))
         ),
     )
     return width, first_y, second_y, first_x, second_x, depth_x, depth_y
@@ -1008,23 +1122,29 @@ def infer_dynamic_slot_polygon(
     )
 
 
-def summarize_cluster(points: Sequence[Tuple[float, float]]) -> CarCluster:
+def summarize_cluster(points: Sequence[Sequence[float]]) -> CarCluster:
     xs = [point[0] for point in points]
     ys = [point[1] for point in points]
+    scan_ids = {
+        point[2]
+        for point in points
+        if len(point) >= 3
+    }
     return CarCluster(
         point_count=len(points),
         x_min_mm=min(xs),
         x_max_mm=max(xs),
         y_back_min_mm=min(ys),
         y_back_max_mm=max(ys),
+        scan_count=max(1, len(scan_ids)),
     )
 
 
 def cluster_points(
-    points: Sequence[Tuple[float, float]],
+    points: Sequence[Sequence[float]],
     radius_mm: float,
     minimum_points: int,
-) -> List[List[Tuple[float, float]]]:
+) -> List[List[Sequence[float]]]:
     if not points:
         return []
     radius_squared = max(0.0, radius_mm) ** 2
@@ -1036,10 +1156,10 @@ def cluster_points(
         pending = [seed]
         while pending:
             current = pending.pop()
-            cx, cy = points[current]
+            cx, cy = points[current][:2]
             neighbors = []
             for index in unvisited:
-                px, py = points[index]
+                px, py = points[index][:2]
                 if (px - cx) ** 2 + (py - cy) ** 2 <= radius_squared:
                     neighbors.append(index)
             for index in neighbors:

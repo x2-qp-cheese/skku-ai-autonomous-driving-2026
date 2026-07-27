@@ -13,6 +13,7 @@ from skku_autocar.estimation.parking_lidar import (
     choose_gap,
 )
 from skku_autocar.sensors.lidar import (
+    LidarCsvRecorder,
     LidarCsvReplay,
     LidarPoint,
     LidarScan,
@@ -189,11 +190,71 @@ class ParkingLidarTest(unittest.TestCase):
 
         self.assertTrue(observation.valid)
         self.assertEqual(observation.car_roi_points, 0)
+        self.assertEqual(observation.left_roi_points, 3)
         self.assertEqual(observation.car_count, 0)
         self.assertFalse(observation.first_car_seen)
         self.assertFalse(observation.first_car_confirmed)
         self.assertFalse(observation.first_car_turn_reached)
         self.assertFalse(observation.gap_found)
+
+    def test_sparse_right_car_returns_accumulate_across_distinct_scans(self):
+        config = replace(
+            self.make_estimator().config,
+            detection_accumulation_scans=3,
+            detection_accumulation_max_age_s=1.0,
+            gap_cluster_min_points=4,
+            gap_cluster_min_scans=2,
+            gap_pair_min_points=8,
+            gap_cluster_min_span_mm=20.0,
+            gap_pair_max_lateral_offset_mm=300.0,
+            gap_pair_min_longitudinal_alignment=0.9,
+            gap_confirm_scans=1,
+        )
+        estimator = LidarParkingSpaceEstimator(config)
+        sparse = tuple(
+            point_at(x, y)
+            for x, y in (
+                (980.0, -680.0),
+                (1020.0, -660.0),
+                (980.0, 660.0),
+                (1020.0, 680.0),
+            )
+        )
+
+        first = estimator.estimate(LidarScan(1.0, sparse), now=1.0)
+        second = estimator.estimate(LidarScan(1.1, sparse), now=1.1)
+
+        self.assertEqual(first.car_count, 0)
+        self.assertFalse(first.gap_found)
+        self.assertEqual(second.car_count, 2)
+        self.assertTrue(second.gap_confirmed)
+        self.assertEqual(second.car_clusters[0].scan_count, 2)
+        self.assertEqual(second.car_roi_points, 4)
+        self.assertEqual(second.accumulated_car_roi_points, 8)
+
+    def test_signal_gantry_crossbar_pair_is_not_a_parking_gap(self):
+        config = replace(
+            self.make_estimator().config,
+            gap_cluster_min_span_mm=60.0,
+            gap_pair_max_lateral_offset_mm=450.0,
+            gap_pair_min_longitudinal_alignment=0.82,
+        )
+        left_support = CarCluster(8, 700.0, 800.0, 500.0, 620.0, 2)
+        right_support = CarCluster(8, 2050.0, 2150.0, 500.0, 620.0, 2)
+
+        self.assertIsNone(choose_gap((left_support, right_support), config))
+
+    def test_slender_signal_pole_cannot_pair_with_a_car(self):
+        config = replace(
+            self.make_estimator().config,
+            gap_cluster_min_span_mm=60.0,
+            gap_pair_max_lateral_offset_mm=450.0,
+            gap_pair_min_longitudinal_alignment=0.82,
+        )
+        pole = CarCluster(8, 990.0, 1010.0, -665.0, -635.0, 2)
+        car = CarCluster(8, 950.0, 1050.0, 660.0, 760.0, 2)
+
+        self.assertIsNone(choose_gap((pole, car), config))
 
     def test_close_right_side_sparse_returns_do_not_trigger_first_car(self):
         config = LidarParkingConfig(
@@ -650,6 +711,28 @@ class ParkingLidarTest(unittest.TestCase):
         self.assertEqual(len(scans), 2)
         self.assertEqual(len(scans[0].points), 2)
         self.assertEqual(replay.scan_at_elapsed(0.09).timestamp, 10.1)
+
+    def test_lidar_csv_recorder_writes_each_scan_once(self):
+        first = LidarScan(
+            10.0,
+            (
+                LidarPoint(15, 1.0, 1000.0),
+                LidarPoint(8, 2.0, 1100.0),
+            ),
+        )
+        second = LidarScan(10.1, (LidarPoint(12, 3.0, 1200.0),))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "run_lidar.csv"
+            recorder = LidarCsvRecorder(path)
+            self.assertTrue(recorder.write(first))
+            self.assertFalse(recorder.write(first))
+            self.assertTrue(recorder.write(second))
+            recorder.close()
+            scans = load_lidar_csv(str(path))
+
+        self.assertEqual(recorder.scans_written, 2)
+        self.assertEqual(recorder.points_written, 3)
+        self.assertEqual(scans, [first, second])
 
 
 if __name__ == "__main__":

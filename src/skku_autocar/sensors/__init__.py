@@ -1,4 +1,5 @@
 from .lidar import (
+    LidarCsvRecorder,
     LidarCsvReplay,
     LidarPoint,
     LidarScan,
@@ -10,6 +11,7 @@ from .lidar import (
 )
 
 __all__ = [
+    "LidarCsvRecorder",
     "LidarCsvReplay",
     "LidarPoint",
     "LidarScan",

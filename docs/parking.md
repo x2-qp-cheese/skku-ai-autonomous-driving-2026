@@ -79,6 +79,20 @@ IDLE
 - LiDAR 중심에서 후축 중심까지의 부호 있는 거리를 실측해
   `sensor_to_rear_axle_y_back_mm`에 입력
 
+현재 시작 배치에서는 목표 주차칸을 오른쪽에서만 찾는다. 초기 탐색 ROI는
+차량 오른쪽 `0.25~4.0 m`, 진행방향 기준 `앞 2.5 m~뒤 1.8 m`이다. 시작점
+오른쪽 뒤의 신호등까지 무작정 포함하지 않도록 뒤쪽 범위를 제한했고, 다음
+조건을 모두 만족하는 경우에만 두 차량 사이의 슬롯으로 인정한다.
+
+- 각 경계 물체가 서로 다른 LiDAR scan에서 두 번 이상 반복 관측됨
+- 각 물체의 scan 평면상 폭이 `80 mm` 이상임
+- 두 물체의 좌우 중심 차가 `450 mm` 이하임
+- 두 물체를 잇는 축이 차량 진행방향과 충분히 나란함
+- 두 안쪽 면 사이 거리가 예상 주차 간격 범위에 들어옴
+
+따라서 신호등 기둥 점 자체가 화면에 보이는 것은 정상이다. 기둥 한 개나
+좌우로 긴 신호등 가로 구조물만으로 `gap=CONFIRMED`가 되면 안 된다.
+
 ### 후방 카메라
 
 - 차체 중심, 높이 `600~700 mm`
@@ -137,7 +151,8 @@ lookup table로 바꿔야 한다.
 2. 바퀴를 띄운 상태에서 speed/steering 부호와 비상 정지를 확인한다.
 3. 바닥 2 m 직선에서 `straight_steering_trim`만 맞춘다.
 4. 평평한 벽을 LiDAR 오른쪽에 두고 debug 화면의 오른쪽에 수직으로 나타나도록
-   `angle_offset_deg`를 맞춘다.
+   먼저 `clockwise_angles`를 맞춘 뒤 `angle_offset_deg`를 맞춘다. 실제 오른쪽
+   물체가 debug 화면의 `LEFT`에 보이면 `clockwise_angles`를 반전한다.
 5. 정지 상태에서 목표 주차칸을 스캔해 주황 사각형이 두 차량 사이에 있고,
    초록 깊이축이 슬롯 안쪽을 향하는지 확인한다.
 6. 바닥에 실제 좌표를 잰 네 점을 놓고 후방 카메라 BEV homography를 다시
@@ -155,6 +170,7 @@ PYTHONPATH=src venv/bin/python scripts/parking.py \
   --source 1 \
   --front-source 0 \
   --lidar-port /dev/cu.usbserial-1130 \
+  --manual-start \
   --no-auto-exit
 ```
 
@@ -186,9 +202,30 @@ PYTHONPATH=src venv/bin/python scripts/parking.py \
 - `R`: 즉시 정지하고 슬롯 추적기와 상태 머신 초기화
 - `Q` 또는 `Esc`: 종료
 
+숫자 카메라 source로 live 실행하면 대시보드 MP4와 같은 이름의 원시 LiDAR
+CSV가 `data/parking`에 자동 저장된다.
+
+```text
+YYYYMMDD_HHMMSS.mp4
+YYYYMMDD_HHMMSS_lidar.csv
+```
+
+LiDAR만 다시 재생해 검출을 확인할 때는 모터 없이 실행한다.
+
+```bash
+PYTHONPATH=src venv/bin/python scripts/parking.py \
+  --no-camera \
+  --lidar-csv data/parking/YYYYMMDD_HHMMSS_lidar.csv \
+  --manual-start \
+  --no-auto-exit
+```
+
 ## 대시보드에서 합격시킬 항목
 
 - LiDAR `gap=CONFIRMED`, `pair=Y`
+- `R=현재 오른쪽 ROI 점/누적 오른쪽 ROI 점`, `L=왼쪽 대칭 ROI 점`
+- 목표 차량에 접근하면 `R`이 0에서 증가하고 약 3 scan 안에 `cars=2`가 됨
+- 신호등만 보일 때는 점이나 `cars`가 표시되어도 `gap=CONFIRMED`가 되지 않음
 - 주황 슬롯 사각형이 인접 차량과 겹치지 않음
 - 흰색 Hybrid A* 목표와 청록 경로가 슬롯 중앙으로 들어감
 - 전진에서 후진으로 바뀔 때 정지 command가 먼저 출력됨

@@ -7,7 +7,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple, Union
 
 
 ScanPoint = Tuple[float, float]
@@ -24,6 +24,42 @@ class LidarPoint:
 class LidarScan:
     timestamp: float
     points: Tuple[LidarPoint, ...]
+
+
+class LidarCsvRecorder:
+    """Persist each distinct live LiDAR scan in the replay CSV format."""
+
+    def __init__(self, path: Union[Path, str]):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = self.path.open("w", newline="", encoding="utf-8")
+        self._writer = csv.writer(self._handle)
+        self._writer.writerow(("timestamp", "quality", "angle_deg", "distance_mm"))
+        self._last_timestamp: Optional[float] = None
+        self.scans_written = 0
+        self.points_written = 0
+
+    def write(self, scan: Optional[LidarScan]) -> bool:
+        if scan is None or scan.timestamp == self._last_timestamp:
+            return False
+        for point in scan.points:
+            self._writer.writerow(
+                (
+                    "%.9f" % scan.timestamp,
+                    point.quality,
+                    "%.6f" % point.angle_deg,
+                    "%.3f" % point.distance_mm,
+                )
+            )
+        self._handle.flush()
+        self._last_timestamp = scan.timestamp
+        self.scans_written += 1
+        self.points_written += len(scan.points)
+        return True
+
+    def close(self) -> None:
+        if not self._handle.closed:
+            self._handle.close()
 
 
 def angle_in_window(angle_deg: float, start_deg: float, end_deg: float) -> bool:

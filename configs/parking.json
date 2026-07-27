@@ -71,15 +71,15 @@
     "sensor_y_forward_mm": 0.0,
     "car_detection_roi": {
       "x_min_mm": 250.0,
-      "x_max_mm": 2600.0,
+      "x_max_mm": 4000.0,
       "y_back_min_mm": -2500.0,
-      "y_back_max_mm": 2500.0
+      "y_back_max_mm": 1800.0
     },
     "slot_tracking_roi": {
-      "x_min_mm": -1800.0,
-      "x_max_mm": 2600.0,
-      "y_back_min_mm": -2500.0,
-      "y_back_max_mm": 2500.0
+      "x_min_mm": -2200.0,
+      "x_max_mm": 4200.0,
+      "y_back_min_mm": -3000.0,
+      "y_back_max_mm": 3000.0
     },
     "safety_roi": {
       "x_min_mm": -300.0,
@@ -90,8 +90,14 @@
     "min_observed_points": 5,
     "car_cluster_radius_mm": 350.0,
     "car_cluster_min_points": 3,
+    "detection_accumulation_scans": 3,
+    "detection_accumulation_max_age_s": 0.65,
     "gap_cluster_min_points": 5,
+    "gap_cluster_min_scans": 2,
+    "gap_cluster_min_span_mm": 80.0,
     "gap_pair_min_points": 10,
+    "gap_pair_max_lateral_offset_mm": 450.0,
+    "gap_pair_min_longitudinal_alignment": 0.82,
     "parking_space_width_mm": 950.0,
     "parking_space_depth_mm": 1500.0,
     "expected_observed_gap_mm": 1375.0,
@@ -112,6 +118,7 @@
     "first_car_confirm_scans": 3,
     "first_car_min_x_right_mm": 450.0,
     "first_car_cluster_min_points": 5,
+    "first_car_min_scans": 2,
     "first_car_min_span_mm": 80.0,
     "first_car_max_center_jump_mm": 450.0,
     "first_car_turn_target_y_back_mm": -650.0,
@@ -294,7 +301,7 @@
     "locked_slot_min_points": 8,
     "locked_slot_max_points": 180,
     "locked_slot_min_range_mm": 200.0,
-    "locked_slot_max_range_mm": 3500.0,
+    "locked_slot_max_range_mm": 4500.0,
     "locked_slot_max_correspondence_mm": 320.0,
     "locked_slot_trim_ratio": 0.65,
     "locked_slot_iterations": 6,
