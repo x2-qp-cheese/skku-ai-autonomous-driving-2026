@@ -38,6 +38,8 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-reversal-min-geometry 0.05 \
   --path-reversal-output-min-steering 70 \
   --path-reversal-rate-limit 160 \
+  --path-reversal-near-guard-error 0.025 \
+  --path-reversal-near-full-error 0.12 \
   --path-near-conflict-error-threshold 0.06 \
   --path-near-conflict-release-alpha 0.90 \
   --path-near-conflict-heading-limit 0.18 \

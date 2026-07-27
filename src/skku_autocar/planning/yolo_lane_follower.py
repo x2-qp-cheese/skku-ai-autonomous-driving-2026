@@ -64,6 +64,11 @@ class YoloLaneFollowerConfig:
     path_reversal_min_geometry: float = 0.08
     path_reversal_output_min_steering: float = 60.0
     path_reversal_rate_limit: int = 220
+    # When an S-curve preview changes sign before the near-field centerline has
+    # crossed the vehicle, unwind the old turn first. The new turn is blended in
+    # as the near error approaches the center instead of being forced at once.
+    path_reversal_near_guard_error: float = 0.025
+    path_reversal_near_full_error: float = 0.12
     # Near-field disagreement is blended into the whole-path command only on
     # almost-straight geometry. It must not switch the command off at a binary
     # threshold while coherent curve heading is available.
@@ -228,6 +233,20 @@ class YoloLaneFollower:
             raw_steering += near_conflict_strength * (
                 near_steering - raw_steering
             )
+        reversal_near_guard = self._path_reversal_near_guard_strength(
+            lane,
+            near_error,
+            raw_steering,
+        )
+        if reversal_near_guard > 0.0:
+            near_steering = self._clip_float(
+                float(self.config.path_lateral_gain) * float(near_error),
+                -float(self.config.max_steering),
+                float(self.config.max_steering),
+            )
+            raw_steering += reversal_near_guard * (
+                near_steering - raw_steering
+            )
         curve_guard_limit = self._path_curve_guard_limit(
             lane,
             path_error,
@@ -280,6 +299,15 @@ class YoloLaneFollower:
                 alpha,
                 alpha + near_conflict_strength * (conflict_alpha - alpha),
             )
+        if reversal_near_guard > 0.0:
+            alpha = max(
+                alpha,
+                self._clip_float(
+                    float(self.config.path_reversal_alpha),
+                    0.0,
+                    1.0,
+                ),
+            )
         filtered = (
             float(self._last_steering)
             + alpha * (raw_steering - float(self._last_steering))
@@ -312,8 +340,13 @@ class YoloLaneFollower:
                     if direction_reversal or near_conflict
                     else 0
                 ),
+                (
+                    int(self.config.steering_rate_limit)
+                    if reversal_near_guard > 0.0
+                    else 0
+                ),
             ),
-            fast_release=near_conflict,
+            fast_release=near_conflict or reversal_near_guard > 0.0,
         )
         if curve_guard:
             curve_limit = int(round(float(curve_guard_limit)))
@@ -341,10 +374,14 @@ class YoloLaneFollower:
         self._last_heading_error = lane.heading_error
         self._last_path_error = path_error
         self._path_heading_lead = heading_lead
-        self._path_state = self._classify_path_state(
-            path_error,
-            lane.heading_error,
-            heading_lead,
+        self._path_state = (
+            "curve_transition"
+            if reversal_near_guard > 0.0
+            else self._classify_path_state(
+                path_error,
+                lane.heading_error,
+                heading_lead,
+            )
         )
         command = ControlCommand(
             speed=speed,
@@ -436,6 +473,57 @@ class YoloLaneFollower:
             and raw_steering * float(lane.heading_error) > 0.0
         )
         return coherent_path or coherent_heading
+
+    def _path_reversal_near_guard_strength(
+        self,
+        lane: LaneGeometry,
+        near_error: float,
+        raw_steering: float,
+    ) -> float:
+        """Phase an S-curve reversal using the near-field centerline."""
+        reason = str(lane.reason)
+        previous = float(self._last_steering)
+        heading = float(lane.heading_error)
+        far_error = float(lane.lateral_error_norm)
+        minimum_geometry = max(
+            0.0,
+            float(self.config.path_reversal_min_geometry),
+        )
+        if (
+            not reason.startswith("corridor_tier1")
+            or any(
+                token in reason
+                for token in ("lane_change", "crosswalk", "coast", "virtual")
+            )
+            or float(lane.confidence) < 0.75
+            or abs(previous)
+            < max(0.0, float(self.config.path_reversal_min_steering))
+            or raw_steering * previous >= 0.0
+            or raw_steering * float(near_error) >= 0.0
+            or abs(heading) < minimum_geometry
+            or abs(far_error) < minimum_geometry
+            or raw_steering * heading <= 0.0
+            or heading * far_error <= 0.0
+        ):
+            return 0.0
+
+        guard_error = max(
+            0.0,
+            float(self.config.path_reversal_near_guard_error),
+        )
+        full_error = max(
+            guard_error + 1e-6,
+            float(self.config.path_reversal_near_full_error),
+        )
+        magnitude = abs(float(near_error))
+        if magnitude <= guard_error:
+            return 0.0
+        ratio = self._clip_float(
+            (magnitude - guard_error) / (full_error - guard_error),
+            0.0,
+            1.0,
+        )
+        return ratio * ratio * (3.0 - 2.0 * ratio)
 
     def _path_near_conflict_strength(
         self,

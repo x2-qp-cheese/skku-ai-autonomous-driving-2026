@@ -440,6 +440,8 @@ def build_follower_config(args: argparse.Namespace) -> YoloLaneFollowerConfig:
         path_reversal_min_geometry=args.path_reversal_min_geometry,
         path_reversal_output_min_steering=args.path_reversal_output_min_steering,
         path_reversal_rate_limit=args.path_reversal_rate_limit,
+        path_reversal_near_guard_error=args.path_reversal_near_guard_error,
+        path_reversal_near_full_error=args.path_reversal_near_full_error,
         path_near_conflict_error_threshold=args.path_near_conflict_error_threshold,
         path_near_conflict_release_alpha=args.path_near_conflict_release_alpha,
         path_near_conflict_heading_limit=args.path_near_conflict_heading_limit,
@@ -485,7 +487,7 @@ def log_effective_config(
             follower_config.steering_release_rate_limit,
         )
     LOG.info(
-        "control mode=%s speed=%d min_curve=%d max=%d max_steer=%d path_gain=%.1f/%.1f/%.1f path_weight=%.2f..%.2f path_alpha=%.2f/%.2f path_recovery=%.2f/min%.0f path_reversal=%.2f/min%.0f/%d path_conflict=%.3f/%.2f/head%.2f path_guard=%.2f/%.2f..%.2f/max%.0f heading_lead=%.1f/%.2f/max%.1f integral=%.1f/max%.2f center_lock=%s lane_lost_release=%d/frame",
+        "control mode=%s speed=%d min_curve=%d max=%d max_steer=%d path_gain=%.1f/%.1f/%.1f path_weight=%.2f..%.2f path_alpha=%.2f/%.2f path_recovery=%.2f/min%.0f path_reversal=%.2f/min%.0f/%d/near%.3f..%.3f path_conflict=%.3f/%.2f/head%.2f path_guard=%.2f/%.2f..%.2f/max%.0f heading_lead=%.1f/%.2f/max%.1f integral=%.1f/max%.2f center_lock=%s lane_lost_release=%d/frame",
         (
             "whole_path"
             if follower_config.path_tracking
@@ -507,6 +509,8 @@ def log_effective_config(
         follower_config.path_reversal_alpha,
         follower_config.path_reversal_output_min_steering,
         follower_config.path_reversal_rate_limit,
+        follower_config.path_reversal_near_guard_error,
+        follower_config.path_reversal_near_full_error,
         follower_config.path_near_conflict_error_threshold,
         follower_config.path_near_conflict_release_alpha,
         follower_config.path_near_conflict_heading_limit,
@@ -1243,6 +1247,18 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         "--path-reversal-rate-limit",
         type=int,
         default=YoloLaneFollowerConfig.path_reversal_rate_limit,
+    )
+    parser.add_argument(
+        "--path-reversal-near-guard-error",
+        type=float,
+        default=YoloLaneFollowerConfig.path_reversal_near_guard_error,
+        help="near-field error below which an opposite S-curve turn may engage without transition guarding",
+    )
+    parser.add_argument(
+        "--path-reversal-near-full-error",
+        type=float,
+        default=YoloLaneFollowerConfig.path_reversal_near_full_error,
+        help="near-field error at which an early opposite S-curve command is fully deferred to centering",
     )
     parser.add_argument(
         "--path-near-conflict-error-threshold",
