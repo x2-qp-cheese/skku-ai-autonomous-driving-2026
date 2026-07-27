@@ -362,6 +362,49 @@ class YoloLaneGeometryTest(unittest.TestCase):
 
         self.assertGreater(command.steering, 0)
 
+    def test_far_heading_lead_is_damped_when_near_center_disagrees(self):
+        config = YoloLaneFollowerConfig(
+            path_tracking=True,
+            path_lateral_gain=0.0,
+            path_heading_gain=0.0,
+            path_derivative_gain=0.0,
+            path_near_weight=1.60,
+            path_far_weight=0.45,
+            path_heading_lead_gain=170.0,
+            path_heading_lead_span=0.16,
+            path_heading_lead_max_steering=50.0,
+            path_near_conflict_error_threshold=0.04,
+            path_near_conflict_heading_limit=0.34,
+            path_reversal_near_full_error=0.12,
+            path_center_recovery_error_threshold=2.0,
+            path_steering_rise_alpha=1.0,
+            path_steering_release_alpha=1.0,
+            steering_rate_limit=500,
+            min_steering_rate_limit=500,
+            steering_release_rate_limit=500,
+            max_steering=500,
+        )
+        aligned = YoloLaneFollower(config).plan(
+            lane_geometry(
+                lateral_error_norm=0.12,
+                heading_error=0.36,
+                near_lateral_error_norm=0.0,
+                reason="corridor_tier1",
+            )
+        )
+        conflicted = YoloLaneFollower(config).plan(
+            lane_geometry(
+                lateral_error_norm=0.12,
+                heading_error=0.36,
+                near_lateral_error_norm=-0.13,
+                reason="corridor_tier1",
+            )
+        )
+
+        self.assertGreater(aligned.steering, 0)
+        self.assertGreater(conflicted.steering, 0)
+        self.assertLess(conflicted.steering, aligned.steering)
+
     def test_weak_s_curve_reversal_unwinds_instead_of_flipping_direction(self):
         follower = YoloLaneFollower(
             YoloLaneFollowerConfig(

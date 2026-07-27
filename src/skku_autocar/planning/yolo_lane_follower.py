@@ -46,8 +46,8 @@ class YoloLaneFollowerConfig:
     path_lateral_gain: float = 225.0
     path_heading_gain: float = 70.0
     path_derivative_gain: float = 18.0
-    path_near_weight: float = 1.25
-    path_far_weight: float = 0.70
+    path_near_weight: float = 1.60
+    path_far_weight: float = 0.45
     path_steering_rise_alpha: float = 0.55
     path_steering_release_alpha: float = 0.28
     # Recover a car that starts measurably off-center before full-speed travel
@@ -777,9 +777,10 @@ class YoloLaneFollower:
         if abs(heading) <= 1e-6:
             return 0.0
 
-        # A near/far sign split is normal at an S-curve transition. Preserve
-        # heading preview when the complete path endpoint and heading agree;
-        # otherwise treat the split as incoherent geometry.
+        # A near/far sign split is normal at an S-curve transition. The far
+        # endpoint can still preview the next curve, but it must not overpower
+        # a reliable near-field center error because that is what keeps the
+        # car inside the lane at the reversal point.
         alignment = 1.0
         if abs(reference) > 0.015 and heading * reference < 0.0:
             far_error = float(lane.lateral_error_norm)
@@ -798,6 +799,26 @@ class YoloLaneFollower:
             )
             if not coherent_far_curve:
                 alignment = 0.0
+            elif abs(near_error) > max(
+                0.0,
+                float(self.config.path_near_conflict_error_threshold),
+            ):
+                conflict_start = max(
+                    0.0,
+                    float(self.config.path_near_conflict_error_threshold),
+                )
+                conflict_full = max(
+                    conflict_start + 1e-6,
+                    float(self.config.path_reversal_near_full_error),
+                )
+                near_ratio = self._clip_float(
+                    (abs(near_error) - conflict_start)
+                    / (conflict_full - conflict_start),
+                    0.0,
+                    1.0,
+                )
+                near_ratio = near_ratio * near_ratio * (3.0 - 2.0 * near_ratio)
+                alignment *= 1.0 - 0.70 * near_ratio
 
         span = max(1e-6, float(self.config.path_heading_lead_span))
         lead = max(0.0, abs(heading) - abs(reference)) / span

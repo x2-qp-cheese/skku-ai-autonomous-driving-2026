@@ -24,8 +24,8 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-lateral-gain 225 \
   --path-heading-gain 65 \
   --path-derivative-gain 18 \
-  --path-near-weight 1.00 \
-  --path-far-weight 1.00 \
+  --path-near-weight 1.60 \
+  --path-far-weight 0.45 \
   --path-steering-rise-alpha 0.72 \
   --path-steering-release-alpha 0.28 \
   --path-center-recovery-error-threshold 0.07 \
@@ -40,16 +40,16 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-reversal-rate-limit 160 \
   --path-reversal-near-guard-error 0.025 \
   --path-reversal-near-full-error 0.12 \
-  --path-near-conflict-error-threshold 0.06 \
+  --path-near-conflict-error-threshold 0.04 \
   --path-near-conflict-release-alpha 0.90 \
-  --path-near-conflict-heading-limit 0.18 \
+  --path-near-conflict-heading-limit 0.34 \
   --path-curve-guard-heading-threshold 0.25 \
   --path-curve-guard-near-error 0.10 \
   --path-curve-guard-release-error 0.24 \
   --path-curve-guard-steering-limit 105 \
-  --path-heading-lead-gain 170 \
+  --path-heading-lead-gain 145 \
   --path-heading-lead-span 0.16 \
-  --path-heading-lead-max-steering 32 \
+  --path-heading-lead-max-steering 24 \
   --path-integral-gain 20 \
   --path-integral-limit 0.16 \
   --path-integral-decay 0.45 \
@@ -101,9 +101,9 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --lane-change-return-duration-scale 1.35 \
   --lane-change-return-steering-cap 115 \
   --lane-change-return-stabilizing-steering-cap 90 \
-  --lane-change-stable-lateral-error 0.25 \
-  --lane-change-stable-near-error 0.35 \
-  --lane-change-stable-frames 3 \
+  --lane-change-stable-lateral-error 0.14 \
+  --lane-change-stable-near-error 0.20 \
+  --lane-change-stable-frames 4 \
   --light-stop-during-lane-change on \
   --light-confirm-frames 2 \
   --light-red-confirm-frames 2 \

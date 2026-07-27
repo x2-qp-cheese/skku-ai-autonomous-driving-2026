@@ -857,6 +857,40 @@ class LaneChangeControllerTest(unittest.TestCase):
         self.assertEqual(adjusted.steering, 70)
         self.assertIn("lane_change_stabilize", adjusted.reason)
 
+    def test_avoidance_stabilization_rejects_countersteer_after_return(self):
+        self.controller = LaneChangeController(
+            LaneChangeConfig(
+                mode="external",
+                stabilizing_steering_min=55,
+                steering_cap=150,
+                stable_required_frames=5,
+                stable_lateral_error=0.14,
+                stable_near_lateral_error=0.20,
+            )
+        )
+        self.controller.state = "stabilizing_lane2"
+        self.controller._return_profile = "avoidance"
+        unsettled = replace(
+            lane(),
+            center_x=476.0,
+            lateral_error_px=76.0,
+            lateral_error_norm=0.19,
+            near_center_x=417.0,
+            near_lateral_error_px=17.0,
+            near_lateral_error_norm=0.043,
+            heading_error=-0.34,
+        )
+
+        result = self.controller.update(unsettled, 150.0, 800.0, 0.0, True)
+        adjusted = self.controller.apply_control_adjustments(
+            ControlCommand(speed=255, steering=-67, reason="lane"),
+            result,
+        )
+
+        self.assertEqual(result.state, "stabilizing_lane2")
+        self.assertEqual(adjusted.steering, 55)
+        self.assertIn("lane_change_stabilize", adjusted.reason)
+
     def test_unreliable_avoidance_stabilization_uses_bounded_path_feedback(self):
         self.controller = LaneChangeController(
             LaneChangeConfig(

@@ -529,12 +529,22 @@ class LaneChangeController:
         )
         minimum = max(0, int(self.config.stabilizing_steering_min))
         steering = int(command.steering)
-        if steering != 0:
+        correction = near if abs(near) > abs(lateral) else lateral
+        if (
+            result.state == "stabilizing_lane2"
+            and self._return_profile == "avoidance"
+        ):
+            # During obstacle recovery, the first priority is settling on the
+            # target-lane center. A far-path curve heading can briefly point the
+            # opposite way immediately after the lane-change trajectory finishes.
+            direction = -1 if correction < 0.0 else 1
+            if steering * direction < 0:
+                steering = 0
+        elif steering != 0:
             direction = -1 if steering < 0 else 1
         else:
             # Let the normal lane follower choose the direction whenever it has
             # a signal. The position errors are only a zero-command fallback.
-            correction = near if abs(near) > abs(lateral) else lateral
             direction = -1 if correction < 0.0 else 1
         if abs(steering) < minimum:
             steering = direction * minimum
