@@ -467,6 +467,42 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertTrue(fusion.observation.range_confirmed)
         self.assertIsNone(fusion.observation.front_mm)
 
+    def test_dual_domain_current_path_commits_without_physical_bounds(self):
+        fusion = planner(
+            visual_confirm_frames=1,
+            min_current_path_overlap_ratio=0.35,
+            visual_commit_enabled=True,
+            visual_commit_confidence=0.90,
+            visual_commit_frame_y_ratio=0.40,
+        )
+        change = controller()
+        current = obstacle_mask(130, 151, 45, 70)
+        side_only = UltrasonicSnapshot(
+            sr=500,
+            sl=500,
+            fresh_keys=("SR", "SL"),
+            age_seconds=0.0,
+        )
+
+        event = fusion.update(
+            [current],
+            SHAPE,
+            CENTERLINE,
+            lane(),
+            change,
+            side_only,
+            1.0,
+            True,
+            frame_obstacle_masks=[current],
+            frame_paths=projected_paths(),
+            obstacle_confidence=0.96,
+        )
+
+        self.assertIn("lane2 -> lane1", event)
+        self.assertTrue(fusion.observation.visual_commit_confirmed)
+        self.assertTrue(fusion.observation.range_confirmed)
+        self.assertIsNone(fusion.observation.front_mm)
+
     def test_range_backed_visual_fallback_ignores_target_lane_obstacle(self):
         fusion = planner(
             visual_trigger_y_ratio=0.30,

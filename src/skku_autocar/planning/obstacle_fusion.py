@@ -362,6 +362,7 @@ class ObstacleFusionPlanner:
             >= max(1, int(self.config.source_clear_confirm_frames))
         )
         visual_commit_confirmed = self._visual_commit_confirmed(
+            bev_assessment,
             frame_assessment,
             frame_obstacle_masks,
             visual_confidence,
@@ -559,6 +560,7 @@ class ObstacleFusionPlanner:
 
     def _visual_commit_confirmed(
         self,
+        bev_assessment: PathAssessment,
         frame_assessment: PathAssessment,
         frame_obstacle_masks: Sequence[Any],
         visual_confidence: float,
@@ -575,8 +577,16 @@ class ObstacleFusionPlanner:
         if frame_assessment.physical_lane_known:
             if frame_assessment.physical_target_blocked:
                 return False
-        elif not allow_projected_current or frame_assessment.target_blocked:
-            return False
+        else:
+            dual_domain_current = (
+                bev_assessment.current_detected
+                and not bev_assessment.target_blocked
+                and not frame_assessment.target_blocked
+            )
+            if not allow_projected_current and not dual_domain_current:
+                return False
+            if frame_assessment.target_blocked:
+                return False
         if visual_confidence < max(
             float(self.config.visual_action_confidence),
             float(self.config.visual_commit_confidence),
