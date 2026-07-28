@@ -747,7 +747,7 @@ class PaperParkingController:
             self._last_parallel_timestamp = observation.timestamp
             if (
                 observation.dist_c_mm is None
-                or observation.dist_d_mm is None
+                and observation.dist_d_mm is None
             ):
                 self._parallel_cd_missing_scans += 1
             else:
@@ -881,6 +881,18 @@ class PaperParkingController:
         observation: RearLidarObservation,
         reason: str,
     ) -> ControlCommand:
+        if (
+            observation.dist_c_mm is not None
+            and observation.dist_d_mm is not None
+        ):
+            self._parallel_exit_requested = False
+            self._parallel_exit_reason = ""
+            self._reverse_motion_started = True
+            return self._start_cd_alignment(
+                observation,
+                "%s_cd_visible" % reason,
+            )
+
         if not observation.pair.valid:
             self._set_debug(
                 "%s_waiting_for_live_ab" % reason
