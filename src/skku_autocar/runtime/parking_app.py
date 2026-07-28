@@ -71,6 +71,7 @@ class TelemetryRecorder:
                 "right_vehicle",
                 "right_vehicle_raw",
                 "right_cluster_points",
+                "right_vehicle_min_y_back_mm",
                 "right_seen_scans",
                 "right_missing_scans",
                 "right_track_id",
@@ -106,6 +107,8 @@ class TelemetryRecorder:
                 "center_observation_scans",
                 "dist_c_mm",
                 "dist_d_mm",
+                "c_y_back_mm",
+                "d_y_back_mm",
                 "distance_bias_cd_mm",
                 "cd_balance_ratio",
                 "cd_balance_error",
@@ -180,6 +183,9 @@ class TelemetryRecorder:
                 ),
                 "right_cluster_points": (
                     observation.right_vehicle_cluster_points
+                ),
+                "right_vehicle_min_y_back_mm": _optional(
+                    observation.right_vehicle_min_y_back_mm
                 ),
                 "right_seen_scans": (
                     observation.right_vehicle_seen_scans
@@ -284,6 +290,8 @@ class TelemetryRecorder:
                 ),
                 "dist_c_mm": _optional(observation.dist_c_mm),
                 "dist_d_mm": _optional(observation.dist_d_mm),
+                "c_y_back_mm": _optional(observation.c_y_back_mm),
+                "d_y_back_mm": _optional(observation.d_y_back_mm),
                 "distance_bias_cd_mm": _optional(
                     debug.distance_bias_cd_mm
                 ),
@@ -1049,11 +1057,12 @@ def _show_debug(
             observation.right_vehicle_raw,
             observation.right_vehicle_track_id,
         ),
-        "rightCluster points=%d seen=%d missing=%d"
+        "rightCluster points=%d seen=%d missing=%d minY=%smm"
         % (
             observation.right_vehicle_cluster_points,
             observation.right_vehicle_seen_scans,
             observation.right_vehicle_missing_scans,
+            _fmt(observation.right_vehicle_min_y_back_mm, 0),
         ),
         "pair=%s fused=%d clusters=%d candidates=%d (%s)"
         % (
@@ -1162,10 +1171,12 @@ def _show_debug(
             debug.pair_reacquiring,
             debug.center_observation_scans,
         ),
-        "C=%s D=%s ratio=%s err=%s span=%s stable=%d/%d"
+        "C=%s@y%s D=%s@y%s ratio=%s err=%s span=%s stable=%d/%d"
         % (
             _fmt(observation.dist_c_mm, 0),
+            _fmt(observation.c_y_back_mm, 0),
             _fmt(observation.dist_d_mm, 0),
+            _fmt(observation.d_y_back_mm, 0),
             _fmt(debug.cd_balance_ratio, 3),
             _fmt(debug.cd_balance_error, 3),
             _fmt(debug.cd_balance_span, 3),

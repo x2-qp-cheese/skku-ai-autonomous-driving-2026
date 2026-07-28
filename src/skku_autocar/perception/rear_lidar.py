@@ -62,6 +62,7 @@ class RearLidarObservation:
     right_vehicle_present: bool = False
     right_vehicle_raw: bool = False
     right_vehicle_cluster_points: int = 0
+    right_vehicle_min_y_back_mm: Optional[float] = None
     right_vehicle_seen_scans: int = 0
     right_vehicle_missing_scans: int = 0
     right_vehicle_track_id: int = 0
@@ -71,6 +72,8 @@ class RearLidarObservation:
     pair: TangentPair = TangentPair()
     dist_c_mm: Optional[float] = None
     dist_d_mm: Optional[float] = None
+    c_y_back_mm: Optional[float] = None
+    d_y_back_mm: Optional[float] = None
     left_side_line: SideLineEstimate = SideLineEstimate()
     right_side_line: SideLineEstimate = SideLineEstimate()
     slot_heading_deg: Optional[float] = None
@@ -147,12 +150,12 @@ class RearLidarPerception:
                 reason="no_points_in_paper_fov",
             )
 
-        dist_c = self._paper_sector_min(
+        point_c = self._paper_sector_closest(
             points,
             -self.config.side_angle_max_deg,
             -self.config.side_angle_min_deg,
         )
-        dist_d = self._paper_sector_min(
+        point_d = self._paper_sector_closest(
             points,
             self.config.side_angle_min_deg,
             self.config.side_angle_max_deg,
@@ -200,6 +203,11 @@ class RearLidarPerception:
                 if right_cluster is not None
                 else 0
             ),
+            right_vehicle_min_y_back_mm=(
+                min(point.y_back_mm for point in right_cluster.points)
+                if right_cluster is not None
+                else None
+            ),
             right_vehicle_seen_scans=self._right_seen_scans,
             right_vehicle_missing_scans=self._right_missing_scans,
             right_vehicle_track_id=self._right_track_id,
@@ -207,8 +215,18 @@ class RearLidarPerception:
             near=near,
             pair_source_scans=len(self._pair_scan_buffer),
             pair=pair,
-            dist_c_mm=dist_c,
-            dist_d_mm=dist_d,
+            dist_c_mm=(
+                point_c.distance_mm if point_c is not None else None
+            ),
+            dist_d_mm=(
+                point_d.distance_mm if point_d is not None else None
+            ),
+            c_y_back_mm=(
+                point_c.y_back_mm if point_c is not None else None
+            ),
+            d_y_back_mm=(
+                point_d.y_back_mm if point_d is not None else None
+            ),
             left_side_line=left_side_line,
             right_side_line=right_side_line,
             slot_heading_deg=slot_heading,
@@ -517,20 +535,24 @@ class RearLidarPerception:
             cluster.center_y_mm - previous_center[1],
         )
 
-    def _paper_sector_min(
+    def _paper_sector_closest(
         self,
         points: Sequence[RearPoint],
         angle_min_deg: float,
         angle_max_deg: float,
-    ) -> Optional[float]:
-        distances = [
-            point.distance_mm
+    ) -> Optional[RearPoint]:
+        candidates = [
+            point
             for point in points
             if angle_min_deg <= point.angle_deg <= angle_max_deg
             and point.distance_mm
             < self.config.side_distance_limit_mm
         ]
-        return min(distances) if distances else None
+        return (
+            min(candidates, key=lambda point: point.distance_mm)
+            if candidates
+            else None
+        )
 
     def _side_line_estimate(
         self,

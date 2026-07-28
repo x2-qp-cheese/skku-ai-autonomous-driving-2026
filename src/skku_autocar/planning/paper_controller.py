@@ -96,16 +96,12 @@ class PaperParkingController:
         self._last_heading_timestamp: Optional[float] = None
         self._last_cd_steering = 0.0
         self._cd_steering_initialized = False
-        self._finish_missing_scans = 0
         self._now = 0.0
         self._parked_started_at = 0.0
-        self._exit_side_seen_scans = 0
-        self._exit_both_sides_seen = False
-        self._exit_clear_scans = 0
-        self._exit_turn_started_at = 0.0
-        self._exit_turn_ready_scans = 0
-        self._exit_turn_pair_missing_scans = 0
-        self._exit_last_bisector_deg: Optional[float] = None
+        self._exit_phase_started_at = 0.0
+        self._first_vehicle_track_id = 0
+        self._last_first_vehicle_min_y: Optional[float] = None
+        self._first_vehicle_end_prealign = False
 
     def start(self) -> None:
         self._detected_vehicle_count = 0
@@ -138,9 +134,17 @@ class PaperParkingController:
                     "paper_parking_complete_hold:%.2f/%.2fs"
                     % (elapsed, self.config.park_hold_s)
                 )
-            if not observation.valid:
-                return self._stop("exit_waiting_for_rear_lidar")
-            return self._start_exit_forward(observation)
+            return self._start_exit_forward(now)
+        if self.state == ParkingState.EXIT_FORWARD:
+            return self._exit_forward(now)
+        if self.state == ParkingState.EXIT_TURN_RIGHT:
+            return self._exit_turn_right(now)
+        if self.state == ParkingState.EXIT_STRAIGHT:
+            return self._drive(
+                self.config.exit_speed,
+                0,
+                "exit_straight_to_out",
+            )
         if not observation.valid:
             return self._stop("waiting_for_rear_lidar")
 
@@ -168,16 +172,6 @@ class PaperParkingController:
             return self._reverse_straight(observation)
         if self.state == ParkingState.RECOVERY_FORWARD:
             return self._recovery_forward(observation, now)
-        if self.state == ParkingState.EXIT_FORWARD:
-            return self._exit_forward(observation)
-        if self.state == ParkingState.EXIT_TURN_RIGHT:
-            return self._exit_turn_right(observation, now)
-        if self.state == ParkingState.EXIT_STRAIGHT:
-            return self._drive(
-                self.config.exit_speed,
-                0,
-                "exit_straight_to_out",
-            )
         return self._stop("unknown_state")
 
     def _search_first_car(
@@ -186,6 +180,12 @@ class PaperParkingController:
     ) -> ControlCommand:
         if observation.right_vehicle_present:
             self._detected_vehicle_count = 1
+            self._first_vehicle_track_id = (
+                observation.right_vehicle_track_id
+            )
+            self._last_first_vehicle_min_y = (
+                observation.right_vehicle_min_y_back_mm
+            )
             self.state = ParkingState.SEARCH_OPEN_SPACE
             return self._forward("paper_first_vehicle_counted")
         return self._forward("paper_search_first_vehicle")
@@ -194,6 +194,32 @@ class PaperParkingController:
         self,
         observation: RearLidarObservation,
     ) -> ControlCommand:
+        current_min_y = observation.right_vehicle_min_y_back_mm
+        if (
+            self._is_new_scan
+            and observation.right_vehicle_present
+            and observation.right_vehicle_raw
+            and observation.right_vehicle_track_id
+            == self._first_vehicle_track_id
+            and current_min_y is not None
+        ):
+            trigger_y = self.config.first_vehicle_end_trigger_y_mm
+            crossed_end_trigger = (
+                self._last_first_vehicle_min_y is not None
+                and self._last_first_vehicle_min_y <= trigger_y
+                and current_min_y > trigger_y
+            )
+            self._last_first_vehicle_min_y = current_min_y
+            if crossed_end_trigger:
+                self._realigning_after_dropout = False
+                self._prealign_near_seen = observation.prealign_near
+                self._prealign_ready_scans = 0
+                self._last_prealign_center_angle = None
+                self._reset_pair_tracking(observation, seed=False)
+                self._first_vehicle_end_prealign = True
+                self.state = ParkingState.PREALIGN_LEFT
+                return self._prealign_left(observation)
+
         if not observation.right_vehicle_present:
             self.state = ParkingState.SEARCH_SECOND_CAR
             return self._forward("paper_between_detected_vehicles")
@@ -212,6 +238,7 @@ class PaperParkingController:
         self._prealign_ready_scans = 0
         self._last_prealign_center_angle = None
         self._reset_pair_tracking(observation)
+        self._first_vehicle_end_prealign = False
         self.state = ParkingState.PREALIGN_LEFT
         if not observation.pair.valid:
             return self._drive(
@@ -234,6 +261,25 @@ class PaperParkingController:
         observation: RearLidarObservation,
     ) -> ControlCommand:
         pair, pair_held = self._control_pair(observation)
+        if self._first_vehicle_end_prealign:
+            pair_ready = (
+                pair.valid
+                and not pair_held
+                and len(self._pair_samples)
+                >= self.config.pair_filter_scans
+            )
+            if not pair_ready:
+                self._prealign_ready_scans = 0
+                return self._drive(
+                    self.config.parallel_forward_speed,
+                    self._paper_to_actuator(
+                        -self.config.paper_max_steering
+                    ),
+                    "first_vehicle_end_left_acquiring_ab",
+                )
+            self._first_vehicle_end_prealign = False
+            self._detected_vehicle_count = 2
+
         if not pair.valid:
             self._prealign_ready_scans = 0
             return self._drive(
@@ -728,7 +774,6 @@ class PaperParkingController:
                 center_observation_scans=self._center_scan_count,
                 reason="cd_balance_centered",
             )
-            self._finish_missing_scans = 0
             return self._drive(
                 self.config.inside_reverse_speed,
                 0,
@@ -1021,40 +1066,27 @@ class PaperParkingController:
                     "cd_balance_drift_realign",
                 )
 
-        side_missing = (
-            observation.dist_c_mm is None
-            or observation.dist_d_mm is None
-        )
-        if self._is_new_scan:
-            if side_missing:
-                self._finish_missing_scans += 1
-            else:
-                self._finish_missing_scans = 0
         if (
-            self._finish_missing_scans
-            >= self.config.finish_missing_confirm_scans
+            observation.c_y_back_mm is not None
+            and observation.d_y_back_mm is not None
+            and observation.c_y_back_mm > 0.0
+            and observation.d_y_back_mm > 0.0
         ):
-            if (
-                self._last_slot_heading is None
-                or abs(self._last_slot_heading)
-                > self.config.parallel_heading_tolerance_deg
-            ):
-                return self._stop(
-                    "side_ended_but_vehicle_not_parallel"
-                )
             self.state = ParkingState.PARKED
             self._parked_started_at = self._now
             return self._stop(
-                "paper_dist_c_or_dist_d_none_finish confirmed=%d"
-                % self._finish_missing_scans
+                "paper_both_cd_crossed_y0_finish C_y=%+.0f D_y=%+.0f"
+                % (
+                    observation.c_y_back_mm,
+                    observation.d_y_back_mm,
+                )
             )
         return self._drive(
             self.config.inside_reverse_speed,
             0,
             (
                 "paper_centered_reverse heading=%s span=%s "
-                "until_side_none "
-                "missing=%d/%d"
+                "until_both_cd_cross_y0 C_y=%s D_y=%s"
             )
             % (
                 (
@@ -1067,157 +1099,62 @@ class PaperParkingController:
                     if heading_span != float("inf")
                     else "None"
                 ),
-                self._finish_missing_scans,
-                self.config.finish_missing_confirm_scans,
+                (
+                    "%.0f" % observation.c_y_back_mm
+                    if observation.c_y_back_mm is not None
+                    else "None"
+                ),
+                (
+                    "%.0f" % observation.d_y_back_mm
+                    if observation.d_y_back_mm is not None
+                    else "None"
+                ),
             ),
         )
 
     def _start_exit_forward(
         self,
-        observation: RearLidarObservation,
+        now: float,
     ) -> ControlCommand:
         self.state = ParkingState.EXIT_FORWARD
-        self._exit_side_seen_scans = 0
-        self._exit_both_sides_seen = False
-        self._exit_clear_scans = 0
-        self._exit_turn_ready_scans = 0
-        self._exit_turn_pair_missing_scans = 0
-        self._exit_last_bisector_deg = None
-        return self._exit_forward(observation)
+        self._exit_phase_started_at = now
+        return self._exit_forward(now)
 
     def _exit_forward(
         self,
-        observation: RearLidarObservation,
+        now: float,
     ) -> ControlCommand:
-        both_sides = (
-            observation.dist_c_mm is not None
-            and observation.dist_d_mm is not None
-        )
-        both_clear = (
-            observation.dist_c_mm is None
-            and observation.dist_d_mm is None
-        )
-        if self._is_new_scan:
-            if not self._exit_both_sides_seen:
-                if both_sides:
-                    self._exit_side_seen_scans += 1
-                else:
-                    self._exit_side_seen_scans = 0
-                if (
-                    self._exit_side_seen_scans
-                    >= self.config.exit_side_seen_confirm_scans
-                ):
-                    self._exit_both_sides_seen = True
-            if self._exit_both_sides_seen:
-                if both_clear:
-                    self._exit_clear_scans += 1
-                else:
-                    self._exit_clear_scans = 0
-
-        if (
-            self._exit_both_sides_seen
-            and self._exit_clear_scans
-            >= self.config.exit_clear_confirm_scans
-        ):
+        elapsed = now - self._exit_phase_started_at
+        if elapsed >= self.config.exit_forward_s:
             self.state = ParkingState.EXIT_TURN_RIGHT
-            self._exit_turn_started_at = self._now
-            self._exit_turn_ready_scans = 0
-            self._exit_turn_pair_missing_scans = 0
-            self._exit_last_bisector_deg = None
-            return self._exit_turn_right(observation, self._now)
+            self._exit_phase_started_at = now
+            return self._exit_turn_right(now)
 
         return self._drive(
             self.config.exit_speed,
             0,
-            (
-                "exit_forward sideSeen=%d/%d latched=%s "
-                "clear=%d/%d C=%s D=%s"
-            )
-            % (
-                self._exit_side_seen_scans,
-                self.config.exit_side_seen_confirm_scans,
-                self._exit_both_sides_seen,
-                self._exit_clear_scans,
-                self.config.exit_clear_confirm_scans,
-                (
-                    "%.0f" % observation.dist_c_mm
-                    if observation.dist_c_mm is not None
-                    else "None"
-                ),
-                (
-                    "%.0f" % observation.dist_d_mm
-                    if observation.dist_d_mm is not None
-                    else "None"
-                ),
-            ),
+            "exit_forward_timed:%.2f/%.2fs"
+            % (elapsed, self.config.exit_forward_s),
         )
 
     def _exit_turn_right(
         self,
-        observation: RearLidarObservation,
         now: float,
     ) -> ControlCommand:
-        pair = observation.pair
-        if self._is_new_scan:
-            if pair.valid:
-                self._exit_last_bisector_deg = (
-                    pair.angle_bisector_deg
-                )
-                self._exit_turn_pair_missing_scans = 0
-                if (
-                    pair.angle_bisector_deg
-                    >= self.config.exit_turn_target_angle_deg
-                ):
-                    self._exit_turn_ready_scans += 1
-                else:
-                    self._exit_turn_ready_scans = 0
-            else:
-                self._exit_turn_pair_missing_scans += 1
-                self._exit_turn_ready_scans = 0
-
-        if (
-            self._exit_turn_ready_scans
-            >= self.config.exit_turn_confirm_scans
-        ):
+        elapsed = now - self._exit_phase_started_at
+        if elapsed >= self.config.exit_turn_right_s:
             self.state = ParkingState.EXIT_STRAIGHT
             return self._drive(
                 self.config.exit_speed,
                 0,
-                "exit_90deg_confirmed_straight_to_out",
-            )
-
-        elapsed = now - self._exit_turn_started_at
-        if elapsed >= self.config.exit_turn_timeout_s:
-            return self._stop(
-                "exit_turn_timeout_no_90deg_confirmation"
-            )
-        if (
-            self._exit_turn_pair_missing_scans
-            > self.config.exit_turn_pair_hold_scans
-        ):
-            return self._stop(
-                "exit_turn_waiting_for_two_vehicle_angle"
+                "exit_right_turn_complete_straight_to_out",
             )
 
         return self._drive(
             self.config.exit_speed,
             self.config.exit_turn_steering,
-            (
-                "exit_turn_right bisector=%s target>=%.1f "
-                "ready=%d/%d missing=%d/%d"
-            )
-            % (
-                (
-                    "%.1f" % self._exit_last_bisector_deg
-                    if self._exit_last_bisector_deg is not None
-                    else "None"
-                ),
-                self.config.exit_turn_target_angle_deg,
-                self._exit_turn_ready_scans,
-                self.config.exit_turn_confirm_scans,
-                self._exit_turn_pair_missing_scans,
-                self.config.exit_turn_pair_hold_scans,
-            ),
+            "exit_turn_right_timed:%.2f/%.2fs"
+            % (elapsed, self.config.exit_turn_right_s),
         )
 
     def _start_recovery(
@@ -1299,26 +1236,24 @@ class PaperParkingController:
         self._last_heading_timestamp = None
         self._last_cd_steering = 0.0
         self._cd_steering_initialized = False
-        self._finish_missing_scans = 0
         self._parked_started_at = 0.0
-        self._exit_side_seen_scans = 0
-        self._exit_both_sides_seen = False
-        self._exit_clear_scans = 0
-        self._exit_turn_started_at = 0.0
-        self._exit_turn_ready_scans = 0
-        self._exit_turn_pair_missing_scans = 0
-        self._exit_last_bisector_deg = None
+        self._exit_phase_started_at = 0.0
+        self._first_vehicle_track_id = 0
+        self._last_first_vehicle_min_y = None
+        self._first_vehicle_end_prealign = False
 
     def _reset_pair_tracking(
         self,
         observation: RearLidarObservation,
+        *,
+        seed: bool = True,
     ) -> None:
         self._pair_samples.clear()
         self._pair_missing_scans = 0
         self._pair_outlier_rejected = False
         self._pair_reacquiring = False
         self._last_pair_timestamp = observation.timestamp
-        if observation.pair.valid:
+        if seed and observation.pair.valid:
             self._pair_samples.append(observation.pair)
             self.control_pair = observation.pair
         else:
