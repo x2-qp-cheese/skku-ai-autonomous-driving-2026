@@ -45,8 +45,8 @@
     "finish_missing_confirm_scans": 3,
     "paper_max_steering": 7.0,
     "actuator_max_steering": 150,
-    "actuator_steering_offset": -30,
-    "distance_bias_scale_mm": 600.0,
+    "actuator_steering_offset": -29,
+    "distance_bias_scale_mm": 1400.0,
     "dist_bias_cd_threshold_mm": 250.0,
     "recovery_forward_s": 3.0,
     "command_rate_hz": 20.0
