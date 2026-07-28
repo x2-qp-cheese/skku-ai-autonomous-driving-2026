@@ -19,7 +19,7 @@ class TimedExitTest(unittest.TestCase):
             PaperControllerConfig(),
             actuator_steering_offset=-28,
             center_observation_scans=4,
-            parallel_heading_tolerance_deg=9.0,
+            parallel_heading_tolerance_deg=7.0,
             recovery_forward_s=3.0,
         )
         controller = PaperParkingController(config)

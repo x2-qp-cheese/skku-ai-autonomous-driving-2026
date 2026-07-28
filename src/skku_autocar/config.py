@@ -98,8 +98,8 @@ class PaperControllerConfig:
     cd_steering_max_step: float = 1.0
     cd_balance_steering_weight: float = 0.45
     parallel_heading_trigger_deg: float = 14.0
-    parallel_heading_exit_deg: float = 9.0
-    parallel_heading_tolerance_deg: float = 9.0
+    parallel_heading_exit_deg: float = 7.0
+    parallel_heading_tolerance_deg: float = 7.0
     parallel_heading_full_steer_deg: float = 25.0
     parallel_heading_confirm_scans: int = 5
     parallel_heading_missing_scans: int = 3
