@@ -238,9 +238,15 @@ class LidarCsvReplay:
 class RplidarScanner:
     """Background reader exposing only the latest complete RPLidar scan."""
 
-    def __init__(self, port: str, max_buf_meas: int = 500):
+    def __init__(
+        self,
+        port: str,
+        max_buf_meas: int = 3000,
+        scan_type: str = "normal",
+    ):
         self.port = port
         self.max_buf_meas = max_buf_meas
+        self.scan_type = scan_type
         self._lock = threading.Lock()
         self._latest: Optional[LidarScan] = None
         self._error: Optional[Exception] = None
@@ -303,7 +309,8 @@ class RplidarScanner:
                 device.clean_input()
 
                 for raw_scan in device.iter_scans(
-                    max_buf_meas=self.max_buf_meas
+                    scan_type=self.scan_type,
+                    max_buf_meas=self.max_buf_meas,
                 ):
                     if self._stop_event.is_set():
                         break

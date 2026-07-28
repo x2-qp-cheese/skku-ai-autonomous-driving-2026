@@ -27,6 +27,22 @@ from ..types import ControlCommand, ParkingState
 
 LOG = logging.getLogger("skku_paper_parking")
 
+# Figure 3 of the paper.  These are reference rays for the debug view,
+# not extra perception thresholds.
+PAPER_REFERENCE_ANGLES_DEG = (
+    -110.0,
+    -90.0,
+    -60.0,
+    -45.0,
+    -30.0,
+    0.0,
+    30.0,
+    45.0,
+    60.0,
+    90.0,
+    110.0,
+)
+
 
 class TelemetryRecorder:
     """Record every value needed to inspect the paper equations."""
@@ -44,10 +60,22 @@ class TelemetryRecorder:
                 "steering",
                 "steering_offset",
                 "reason",
+                "raw_points",
                 "valid_points",
+                "left_fov_points",
+                "right_fov_points",
+                "tangent_clusters",
+                "tangent_candidates",
                 "detected_vehicle_count",
                 "right_vehicle",
+                "right_vehicle_raw",
+                "right_cluster_points",
+                "right_seen_scans",
+                "right_missing_scans",
+                "right_track_id",
+                "is_prealign_near",
                 "is_near",
+                "pair_source_scans",
                 "pair_valid",
                 "angle_a_deg",
                 "angle_b_deg",
@@ -85,14 +113,48 @@ class TelemetryRecorder:
                     controller.config.actuator_steering_offset
                 ),
                 "reason": command.reason,
+                "raw_points": observation.raw_point_count,
                 "valid_points": len(observation.points),
+                "left_fov_points": (
+                    observation.left_fov_point_count
+                ),
+                "right_fov_points": (
+                    observation.right_fov_point_count
+                ),
+                "tangent_clusters": (
+                    observation.tangent_cluster_count
+                ),
+                "tangent_candidates": (
+                    observation.tangent_candidate_count
+                ),
                 "detected_vehicle_count": (
                     debug.detected_vehicle_count
                 ),
                 "right_vehicle": int(
                     observation.right_vehicle_present
                 ),
+                "right_vehicle_raw": int(
+                    observation.right_vehicle_raw
+                ),
+                "right_cluster_points": (
+                    observation.right_vehicle_cluster_points
+                ),
+                "right_seen_scans": (
+                    observation.right_vehicle_seen_scans
+                ),
+                "right_missing_scans": (
+                    observation.right_vehicle_missing_scans
+                ),
+                "right_track_id": (
+                    observation.right_vehicle_track_id
+                ),
+                "is_prealign_near": int(
+                    observation.prealign_near
+                ),
                 "is_near": int(observation.near),
+                "pair_source_scans": (
+                    observation.pair_source_scans
+                ),
                 "pair_valid": int(pair.valid),
                 "angle_a_deg": _optional(
                     pair.angle_a_deg if pair.valid else None
@@ -135,6 +197,7 @@ def run(args: argparse.Namespace) -> int:
     vehicle: Optional[SerialVehicle] = None
     raw_recorder: Optional[LidarCsvRecorder] = None
     telemetry: Optional[TelemetryRecorder] = None
+    debug_writer = None
     window_enabled = config.runtime.debug_window and not args.no_window
     motor_enabled = config.runtime.motor_enabled and not args.no_motor
 
@@ -147,7 +210,11 @@ def run(args: argparse.Namespace) -> int:
             raise RuntimeError(
                 "RPLidar port not found; pass --lidar-port explicitly"
             )
-        scanner = RplidarScanner(lidar_port)
+        scanner = RplidarScanner(
+            lidar_port,
+            max_buf_meas=config.lidar.input_buffer_limit_bytes,
+            scan_type=config.lidar.scan_type,
+        )
         scanner.start()
         LOG.info("rear LiDAR: %s", lidar_port)
 
@@ -175,6 +242,25 @@ def run(args: argparse.Namespace) -> int:
         raw_recorder = LidarCsvRecorder(
             record_dir / (stamp + "_lidar.csv")
         )
+    if window_enabled and config.runtime.record_debug_video:
+        import cv2
+
+        debug_path = record_dir / (stamp + "_debug.mp4")
+        debug_writer = cv2.VideoWriter(
+            str(debug_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            config.controller.command_rate_hz,
+            (1600, 900),
+        )
+        if not debug_writer.isOpened():
+            LOG.warning(
+                "debug video writer could not open: %s",
+                debug_path,
+            )
+            debug_writer.release()
+            debug_writer = None
+        else:
+            LOG.info("debug video: %s", debug_path)
 
     start = time.monotonic()
     last_command_at = 0.0
@@ -209,10 +295,24 @@ def run(args: argparse.Namespace) -> int:
                     reason="stale_lidar_scan",
                 )
 
-            command = controller.update(
-                observation,
-                loop_started,
-            )
+            if args.straight_only:
+                if controller.state == ParkingState.IDLE:
+                    command = ControlCommand.stop(
+                        "press_SPACE_to_start_straight_only"
+                    )
+                else:
+                    command = ControlCommand(
+                        speed=config.controller.forward_speed,
+                        steering=(
+                            config.controller.actuator_steering_offset
+                        ),
+                        reason="straight_only_lidar_observation",
+                    )
+            else:
+                command = controller.update(
+                    observation,
+                    loop_started,
+                )
             last_command = command
 
             if loop_started - last_command_at >= period:
@@ -234,6 +334,8 @@ def run(args: argparse.Namespace) -> int:
                     command,
                     motor_enabled,
                     scanner.error if scanner is not None else None,
+                    debug_writer,
+                    args.straight_only,
                 )
                 if key in (ord("q"), 27):
                     break
@@ -272,6 +374,8 @@ def run(args: argparse.Namespace) -> int:
             raw_recorder.close()
         if telemetry is not None:
             telemetry.close()
+        if debug_writer is not None:
+            debug_writer.release()
         if window_enabled:
             import cv2
 
@@ -292,6 +396,8 @@ def _show_debug(
     command: ControlCommand,
     motor_enabled: bool,
     lidar_error: Optional[Exception],
+    debug_writer=None,
+    straight_only: bool = False,
 ) -> int:
     import cv2
     import numpy as np
@@ -353,17 +459,12 @@ def _show_debug(
         1,
     )
 
-    for angle in (
-        -config.lidar.rear_fov_deg,
-        -100.0,
-        -90.0,
-        -70.0,
-        0.0,
-        70.0,
-        90.0,
-        100.0,
-        config.lidar.rear_fov_deg,
-    ):
+    paper_angles = tuple(
+        angle
+        for angle in PAPER_REFERENCE_ANGLES_DEG
+        if abs(angle) <= config.lidar.rear_fov_deg + 1e-6
+    )
+    for angle in paper_angles:
         endpoint = _polar_pixel(
             origin,
             config.runtime.display_range_mm,
@@ -376,48 +477,80 @@ def _show_debug(
         elif abs(angle) == 90.0:
             color = (0, 190, 0)
             thickness = 2
-        elif abs(angle) in (70.0, 100.0):
-            color = (75, 55, 20)
-            thickness = 1
+        elif abs(angle) == 110.0:
+            color = (255, 170, 45)
+            thickness = 2
         else:
-            color = (55, 55, 55)
+            color = (75, 75, 75)
             thickness = 1
         cv2.line(canvas, origin, endpoint, color, thickness)
 
-    rear_label = _polar_pixel(
-        origin,
-        config.runtime.display_range_mm * 0.72,
-        0.0,
-        scale,
-    )
+    for angle in paper_angles:
+        label_point = _polar_pixel(
+            origin,
+            config.runtime.display_range_mm * 0.94,
+            angle,
+            scale,
+        )
+        if angle == 0.0:
+            text = "0 deg / REAR"
+            color = (0, 230, 255)
+            thickness = 2
+        elif angle == -90.0:
+            text = "-90 deg / LEFT"
+            color = (0, 190, 0)
+            thickness = 2
+        elif angle == 90.0:
+            text = "+90 deg / RIGHT"
+            color = (0, 190, 0)
+            thickness = 2
+        elif abs(angle) == 110.0:
+            text = "%+d deg / FOV EDGE" % int(angle)
+            color = (255, 170, 45)
+            thickness = 2
+        else:
+            text = "%+d deg" % int(angle)
+            color = (165, 165, 165)
+            thickness = 1
+        (text_width, text_height), _ = cv2.getTextSize(
+            text,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            thickness,
+        )
+        label_x = max(
+            8,
+            min(
+                1092 - text_width,
+                label_point[0] - text_width // 2,
+            ),
+        )
+        label_y = max(
+            text_height + 6,
+            min(
+                height - 48,
+                label_point[1] + text_height // 2,
+            ),
+        )
+        cv2.putText(
+            canvas,
+            text,
+            (label_x, label_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            color,
+            thickness,
+            cv2.LINE_AA,
+        )
+
     cv2.putText(
         canvas,
-        "0 deg / REAR",
-        (rear_label[0] + 10, rear_label[1]),
+        "FIG.3 ANGLES: 0, +/-30, +/-45, +/-60, +/-90, +/-110 deg",
+        (35, height - 50),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (0, 230, 255),
-        2,
-        cv2.LINE_AA,
-    )
-    cv2.putText(
-        canvas,
-        "-90 deg / LEFT",
-        (35, origin[1] - 12),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.52,
-        (0, 190, 0),
-        2,
-        cv2.LINE_AA,
-    )
-    cv2.putText(
-        canvas,
-        "+90 deg / RIGHT",
-        (origin[0] + 365, origin[1] - 12),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.52,
-        (0, 190, 0),
-        2,
+        0.48,
+        (185, 185, 185),
+        1,
         cv2.LINE_AA,
     )
 
@@ -574,7 +707,11 @@ def _show_debug(
         else None
     )
     lines = [
-        "PAPER ONLY: Rear 2D LiDAR ICCE-Asia 2023",
+        (
+            "MODE: STRAIGHT ONLY - LiDAR observation"
+            if straight_only
+            else "PAPER ONLY: Rear 2D LiDAR ICCE-Asia 2023"
+        ),
         "TIME   %s" % wall_clock,
         "STATE  %s" % controller.state.value,
         "MOTOR  %s" % (
@@ -588,23 +725,43 @@ def _show_debug(
         ),
         "WHY    %s" % command.reason,
         "OBS    %s" % observation.reason,
-        "scanAge=%sms points=%d"
+        "scanAge=%sms raw=%d FOV=%d (L=%d R=%d)"
         % (
             _fmt(scan_age_ms, 0),
+            observation.raw_point_count,
             len(observation.points),
+            observation.left_fov_point_count,
+            observation.right_fov_point_count,
         ),
-        "minRange=%smm is_near(<%.0f)=%s"
+        "minRange=%smm prealign(<%.0f)=%s near(<%.0f)=%s"
         % (
             _fmt(min_distance, 0),
+            config.lidar.prealign_distance_mm,
+            observation.prealign_near,
             config.lidar.near_distance_mm,
             observation.near,
         ),
-        "countedCars=%d right(D sector)=%s"
+        "countedCars=%d vehicleRight=%s raw=%s track=%d"
         % (
             debug.detected_vehicle_count,
             observation.right_vehicle_present,
+            observation.right_vehicle_raw,
+            observation.right_vehicle_track_id,
         ),
-        "pair=%s (%s)" % (pair.valid, pair.reason),
+        "rightCluster points=%d seen=%d missing=%d"
+        % (
+            observation.right_vehicle_cluster_points,
+            observation.right_vehicle_seen_scans,
+            observation.right_vehicle_missing_scans,
+        ),
+        "pair=%s fused=%d clusters=%d candidates=%d (%s)"
+        % (
+            pair.valid,
+            observation.pair_source_scans,
+            observation.tangent_cluster_count,
+            observation.tangent_candidate_count,
+            pair.reason,
+        ),
         "A=%sdeg/%smm  B=%sdeg/%smm"
         % (
             _fmt(
@@ -651,6 +808,14 @@ def _show_debug(
             config.lidar.rear_fov_deg,
             config.lidar.side_distance_limit_mm,
         ),
+        "LiDAR=%s buffer=%dB | A/B <%.0fmm fusion=%d gap>=%.0fdeg"
+        % (
+            config.lidar.scan_type,
+            config.lidar.input_buffer_limit_bytes,
+            config.lidar.tangent_distance_limit_mm,
+            config.lidar.tangent_fusion_scans,
+            config.lidar.tangent_min_angular_gap_deg,
+        ),
         "display=%.0fmm (display only)"
         % config.runtime.display_range_mm,
         "SPACE start/pause | R reset | Q quit",
@@ -677,6 +842,8 @@ def _show_debug(
             cv2.LINE_AA,
         )
 
+    if debug_writer is not None:
+        debug_writer.write(canvas)
     cv2.imshow("SKKU Paper-Only Rear LiDAR Parking", canvas)
     return cv2.waitKey(1) & 0xFF
 
@@ -733,6 +900,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-motor", action="store_true")
     parser.add_argument("--auto-start", action="store_true")
     parser.add_argument("--no-window", action="store_true")
+    parser.add_argument(
+        "--straight-only",
+        action="store_true",
+        help=(
+            "SPACE toggles fixed straight driving; LiDAR cannot change "
+            "speed or steering"
+        ),
+    )
     parser.add_argument(
         "--log-level",
         default="INFO",

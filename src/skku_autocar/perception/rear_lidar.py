@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
-from math import atan2, cos, degrees, radians, sin
+from math import atan2, cos, degrees, hypot, radians, sin
 from typing import Optional, Sequence, Tuple
 
 from ..config import RearLidarConfig
@@ -31,12 +32,32 @@ class TangentPair:
 
 
 @dataclass(frozen=True)
+class PointCluster:
+    points: Tuple[RearPoint, ...]
+    center_x_mm: float
+    center_y_mm: float
+    extent_mm: float
+
+
+@dataclass(frozen=True)
 class RearLidarObservation:
     timestamp: float = 0.0
     valid: bool = False
     points: Tuple[RearPoint, ...] = ()
+    raw_point_count: int = 0
+    left_fov_point_count: int = 0
+    right_fov_point_count: int = 0
+    tangent_cluster_count: int = 0
+    tangent_candidate_count: int = 0
     right_vehicle_present: bool = False
+    right_vehicle_raw: bool = False
+    right_vehicle_cluster_points: int = 0
+    right_vehicle_seen_scans: int = 0
+    right_vehicle_missing_scans: int = 0
+    right_vehicle_track_id: int = 0
+    prealign_near: bool = False
     near: bool = False
+    pair_source_scans: int = 0
     pair: TangentPair = TangentPair()
     dist_c_mm: Optional[float] = None
     dist_d_mm: Optional[float] = None
@@ -47,15 +68,27 @@ class RearLidarPerception:
     """Extract only the LiDAR variables explicitly used by the paper.
 
     Paper coordinates are rear=0 degrees, left=-90 degrees, right=+90
-    degrees.  No vehicle-shape classifier, scan confirmation, tracking,
-    smoothing, or held detections are applied.
+    degrees.  Recent rotations are fused only for the sparse A/B tangencies;
+    current-scan points remain the source of near and C/D measurements.
     """
 
     def __init__(self, config: RearLidarConfig):
         self.config = config
+        self.reset()
 
     def reset(self) -> None:
-        return None
+        self._right_vehicle_present = False
+        self._right_seen_scans = 0
+        self._right_missing_scans = 0
+        self._right_track_id = 0
+        self._right_track_center: Optional[Tuple[float, float]] = None
+        self._last_tracking_scan_timestamp: Optional[float] = None
+        self._pair_scan_buffer = deque(
+            maxlen=self.config.tangent_fusion_scans
+        )
+        self._last_pair_scan_timestamp: Optional[float] = None
+        self._last_tangent_cluster_count = 0
+        self._last_tangent_candidate_count = 0
 
     def observe(self, scan: Optional[LidarScan]) -> RearLidarObservation:
         if scan is None:
@@ -71,9 +104,33 @@ class RearLidarPerception:
                 key=lambda point: point.angle_deg,
             )
         )
+        if scan.timestamp != self._last_pair_scan_timestamp:
+            self._pair_scan_buffer.append(points)
+            self._last_pair_scan_timestamp = scan.timestamp
+        fused_pair_points = tuple(
+            point
+            for buffered_scan in self._pair_scan_buffer
+            for point in buffered_scan
+        )
         if not points:
+            if scan.timestamp != self._last_tracking_scan_timestamp:
+                self._update_right_vehicle_track(None)
+                self._last_tracking_scan_timestamp = scan.timestamp
             return RearLidarObservation(
                 timestamp=scan.timestamp,
+                raw_point_count=len(scan.points),
+                right_vehicle_present=self._right_vehicle_present,
+                right_vehicle_seen_scans=self._right_seen_scans,
+                right_vehicle_missing_scans=self._right_missing_scans,
+                right_vehicle_track_id=self._right_track_id,
+                pair_source_scans=len(self._pair_scan_buffer),
+                pair=self._paper_tangent_pair(fused_pair_points),
+                tangent_cluster_count=(
+                    self._last_tangent_cluster_count
+                ),
+                tangent_candidate_count=(
+                    self._last_tangent_candidate_count
+                ),
                 reason="no_points_in_paper_fov",
             )
 
@@ -87,9 +144,18 @@ class RearLidarPerception:
             self.config.side_angle_min_deg,
             self.config.side_angle_max_deg,
         )
-        pair = self._paper_tangent_pair(points)
+        pair = self._paper_tangent_pair(fused_pair_points)
+        right_cluster = self._select_right_vehicle_cluster(points)
+        right_raw = right_cluster is not None
+        if scan.timestamp != self._last_tracking_scan_timestamp:
+            self._update_right_vehicle_track(right_cluster)
+            self._last_tracking_scan_timestamp = scan.timestamp
         near = any(
             point.distance_mm < self.config.near_distance_mm
+            for point in points
+        )
+        prealign_near = any(
+            point.distance_mm < self.config.prealign_distance_mm
             for point in points
         )
 
@@ -97,11 +163,30 @@ class RearLidarPerception:
             timestamp=scan.timestamp,
             valid=True,
             points=points,
-            # Section 3.1 does not define a detector.  The only right-hand
-            # region defined by the paper is Dist_D (+70 to +100 degrees,
-            # values below 2000 mm), so it is used without extra thresholds.
-            right_vehicle_present=dist_d is not None,
+            raw_point_count=len(scan.points),
+            left_fov_point_count=sum(
+                point.angle_deg < 0.0 for point in points
+            ),
+            right_fov_point_count=sum(
+                point.angle_deg > 0.0 for point in points
+            ),
+            tangent_cluster_count=self._last_tangent_cluster_count,
+            tangent_candidate_count=(
+                self._last_tangent_candidate_count
+            ),
+            right_vehicle_present=self._right_vehicle_present,
+            right_vehicle_raw=right_raw,
+            right_vehicle_cluster_points=(
+                len(right_cluster.points)
+                if right_cluster is not None
+                else 0
+            ),
+            right_vehicle_seen_scans=self._right_seen_scans,
+            right_vehicle_missing_scans=self._right_missing_scans,
+            right_vehicle_track_id=self._right_track_id,
+            prealign_near=prealign_near,
             near=near,
+            pair_source_scans=len(self._pair_scan_buffer),
             pair=pair,
             dist_c_mm=dist_c,
             dist_d_mm=dist_d,
@@ -132,20 +217,83 @@ class RearLidarPerception:
         self,
         points: Sequence[RearPoint],
     ) -> TangentPair:
-        """Use the two raw points touching the free sector around rear=0.
+        """Use the inner endpoints of two clusters bounding a right gap.
 
-        The paper illustrates these tangent points but does not specify a
-        clustering or vehicle-classification method.  Taking the closest
-        angular point on each side of the rear axis is the direct geometric
-        interpretation and introduces no extra detection constants.
+        A/B in Figure 7 are the two vehicle tangencies around the parking
+        space.  They are not required to have opposite signs in LiDAR
+        coordinates: before entry, both parked vehicles and their gap are on
+        the vehicle's right.  Among adjacent vehicle-like clusters, select
+        the widest angular free sector whose bisector still points to the
+        configured right-side parking area.
         """
 
-        left = [point for point in points if point.angle_deg < 0.0]
-        right = [point for point in points if point.angle_deg > 0.0]
-        if not left or not right:
-            return TangentPair()
-        tangent_a = max(left, key=lambda point: point.angle_deg)
-        tangent_b = min(right, key=lambda point: point.angle_deg)
+        close_points = [
+            point
+            for point in points
+            if (
+                point.distance_mm
+                < self.config.tangent_distance_limit_mm
+            )
+        ]
+        clusters = sorted(
+            self._qualified_clusters(
+                close_points,
+                min_extent_mm=(
+                    self.config.tangent_cluster_min_extent_mm
+                ),
+            ),
+            key=lambda cluster: min(
+                point.angle_deg for point in cluster.points
+            ),
+        )
+        self._last_tangent_cluster_count = len(clusters)
+        self._last_tangent_candidate_count = 0
+        if len(clusters) < 2:
+            return TangentPair(reason="two_vehicle_clusters_not_visible")
+
+        candidates = []
+        for lower, upper in zip(clusters, clusters[1:]):
+            tangent_a = max(
+                lower.points,
+                key=lambda point: point.angle_deg,
+            )
+            tangent_b = min(
+                upper.points,
+                key=lambda point: point.angle_deg,
+            )
+            bisector = (
+                tangent_a.angle_deg + tangent_b.angle_deg
+            ) / 2.0
+            if bisector < 0.0:
+                continue
+            angular_gap = (
+                tangent_b.angle_deg - tangent_a.angle_deg
+            )
+            if (
+                angular_gap
+                < self.config.tangent_min_angular_gap_deg
+            ):
+                continue
+            free_width = hypot(
+                tangent_a.x_right_mm - tangent_b.x_right_mm,
+                tangent_a.y_back_mm - tangent_b.y_back_mm,
+            )
+            candidates.append(
+                (
+                    angular_gap,
+                    free_width,
+                    tangent_a,
+                    tangent_b,
+                )
+            )
+        self._last_tangent_candidate_count = len(candidates)
+        if not candidates:
+            return TangentPair(reason="right_parking_gap_not_visible")
+
+        _, _, tangent_a, tangent_b = max(
+            candidates,
+            key=lambda item: (item[0], item[1]),
+        )
         return TangentPair(
             valid=True,
             angle_a_deg=tangent_a.angle_deg,
@@ -156,7 +304,185 @@ class RearLidarPerception:
                 tangent_a.angle_deg + tangent_b.angle_deg
             )
             / 2.0,
-            reason="figure7_tangent_pair",
+            reason="figure7_right_gap_cluster_tangents",
+        )
+
+    def _select_right_vehicle_cluster(
+        self,
+        points: Sequence[RearPoint],
+    ) -> Optional[PointCluster]:
+        """Track a vehicle cluster across the complete right paper FOV.
+
+        Dist_D ends at +100 degrees, but the paper sensor view extends to
+        +110 degrees.  A vehicle is therefore not allowed to disappear merely
+        because its points cross the +100 degree Dist_D boundary.
+        """
+
+        candidates = self._qualified_clusters(
+            point
+            for point in points
+            if (
+                self.config.side_angle_min_deg
+                <= point.angle_deg
+                <= self.config.rear_fov_deg
+                and point.distance_mm
+                < self.config.side_distance_limit_mm
+            )
+        )
+        if not candidates:
+            return None
+
+        if self._right_track_center is not None:
+            compatible = [
+                cluster
+                for cluster in candidates
+                if self._cluster_shift_mm(
+                    cluster,
+                    self._right_track_center,
+                )
+                <= self.config.vehicle_track_max_shift_mm
+            ]
+            if not compatible:
+                return None
+            return min(
+                compatible,
+                key=lambda cluster: self._cluster_shift_mm(
+                    cluster,
+                    self._right_track_center,
+                ),
+            )
+
+        return max(
+            candidates,
+            key=lambda cluster: (
+                len(cluster.points),
+                -hypot(cluster.center_x_mm, cluster.center_y_mm),
+            ),
+        )
+
+    def _update_right_vehicle_track(
+        self,
+        cluster: Optional[PointCluster],
+    ) -> None:
+        if cluster is not None:
+            self._right_seen_scans += 1
+            self._right_missing_scans = 0
+            self._right_track_center = (
+                cluster.center_x_mm,
+                cluster.center_y_mm,
+            )
+            if (
+                not self._right_vehicle_present
+                and self._right_seen_scans
+                >= self.config.vehicle_confirm_scans
+            ):
+                self._right_vehicle_present = True
+                self._right_track_id += 1
+            return
+
+        self._right_seen_scans = 0
+        self._right_missing_scans += 1
+        if not self._right_vehicle_present:
+            self._right_track_center = None
+        if (
+            self._right_vehicle_present
+            and self._right_missing_scans
+            >= self.config.gap_confirm_scans
+        ):
+            self._right_vehicle_present = False
+            self._right_track_center = None
+
+    def _qualified_clusters(
+        self,
+        points: Sequence[RearPoint],
+        *,
+        min_extent_mm: Optional[float] = None,
+    ) -> Tuple[PointCluster, ...]:
+        minimum_extent = (
+            self.config.vehicle_cluster_min_extent_mm
+            if min_extent_mm is None
+            else min_extent_mm
+        )
+        return tuple(
+            cluster
+            for cluster in self._euclidean_clusters(tuple(points))
+            if (
+                len(cluster.points)
+                >= self.config.vehicle_min_cluster_points
+                and minimum_extent
+                <= cluster.extent_mm
+                <= self.config.vehicle_cluster_max_extent_mm
+            )
+        )
+
+    def _euclidean_clusters(
+        self,
+        points: Sequence[RearPoint],
+    ) -> Tuple[PointCluster, ...]:
+        ordered = sorted(points, key=lambda point: point.angle_deg)
+        if not ordered:
+            return ()
+
+        grouped = []
+        current = [ordered[0]]
+        for point in ordered[1:]:
+            previous = current[-1]
+            angular_gap_mm = min(
+                previous.distance_mm,
+                point.distance_mm,
+            ) * radians(abs(point.angle_deg - previous.angle_deg))
+            allowed_gap = min(
+                self.config.vehicle_cluster_max_gap_mm,
+                max(
+                    self.config.vehicle_cluster_base_gap_mm,
+                    angular_gap_mm
+                    * self.config.vehicle_cluster_gap_factor,
+                ),
+            )
+            physical_gap = hypot(
+                point.x_right_mm - previous.x_right_mm,
+                point.y_back_mm - previous.y_back_mm,
+            )
+            if physical_gap <= allowed_gap:
+                current.append(point)
+            else:
+                grouped.append(self._make_cluster(current))
+                current = [point]
+        grouped.append(self._make_cluster(current))
+        return tuple(grouped)
+
+    @staticmethod
+    def _make_cluster(points: Sequence[RearPoint]) -> PointCluster:
+        cluster_points = tuple(points)
+        center_x = sum(point.x_right_mm for point in cluster_points) / len(
+            cluster_points
+        )
+        center_y = sum(point.y_back_mm for point in cluster_points) / len(
+            cluster_points
+        )
+        extent = max(
+            hypot(
+                first.x_right_mm - second.x_right_mm,
+                first.y_back_mm - second.y_back_mm,
+            )
+            for first in cluster_points
+            for second in cluster_points
+        )
+        return PointCluster(
+            points=cluster_points,
+            center_x_mm=center_x,
+            center_y_mm=center_y,
+            extent_mm=extent,
+        )
+
+    @staticmethod
+    def _cluster_shift_mm(
+        cluster: PointCluster,
+        previous_center: Tuple[float, float],
+    ) -> float:
+        return hypot(
+            cluster.center_x_mm - previous_center[0],
+            cluster.center_y_mm - previous_center[1],
         )
 
     def _paper_sector_min(

@@ -29,16 +29,22 @@ class PaperParkingController:
         self.debug = PaperParkingDebug()
         self._detected_vehicle_count = 0
         self._recovery_started_at = 0.0
+        self._reverse_motion_started = False
+        self._prealign_target_scans = 0
 
     def start(self) -> None:
         self._detected_vehicle_count = 0
         self._recovery_started_at = 0.0
+        self._reverse_motion_started = False
+        self._prealign_target_scans = 0
         self.state = ParkingState.SEARCH_FIRST_CAR
         self._set_debug("paper_search_first_vehicle")
 
     def reset(self) -> None:
         self._detected_vehicle_count = 0
         self._recovery_started_at = 0.0
+        self._reverse_motion_started = False
+        self._prealign_target_scans = 0
         self.state = ParkingState.IDLE
         self._set_debug("idle")
 
@@ -99,39 +105,74 @@ class PaperParkingController:
             return self._forward("paper_search_second_vehicle")
 
         self._detected_vehicle_count = 2
-        if observation.near:
-            self.state = ParkingState.PREALIGN_LEFT
-            return self._drive(
-                self.config.forward_speed,
-                self._paper_to_actuator(
-                    -self.config.paper_max_steering
-                ),
-                "figure9_is_near_left_forward",
+        self._prealign_target_scans = 0
+        self.state = ParkingState.PREALIGN_LEFT
+        if not observation.pair.valid:
+            return self._stop(
+                "figure7_second_vehicle_waiting_for_valid_ab"
             )
-
-        self.state = ParkingState.REVERSE_ALIGN
-        return self._reverse_align(observation)
+        return self._drive(
+            self.config.forward_speed,
+            self._paper_to_actuator(
+                -self.config.paper_max_steering
+            ),
+            "figure7_second_vehicle_left_forward",
+        )
 
     def _prealign_left(
         self,
         observation: RearLidarObservation,
     ) -> ControlCommand:
-        if observation.near:
-            return self._drive(
-                self.config.forward_speed,
-                self._paper_to_actuator(
-                    -self.config.paper_max_steering
-                ),
-                "figure9_left_forward_while_is_near",
+        pair = observation.pair
+        if not pair.valid:
+            self._prealign_target_scans = 0
+            return self._stop("figure7_waiting_for_valid_ab")
+
+        prospective_steering, _, _ = self._paper_steering(pair)
+        if (
+            pair.angle_bisector_deg
+            <= self.config.prealign_bisector_target_deg
+            and prospective_steering > 0.0
+        ):
+            self._prealign_target_scans += 1
+        else:
+            self._prealign_target_scans = 0
+
+        if (
+            self._prealign_target_scans
+            >= self.config.prealign_confirm_scans
+        ):
+            self.state = ParkingState.REVERSE_ALIGN
+            return self._reverse_align(observation)
+
+        return self._drive(
+            self.config.forward_speed,
+            self._paper_to_actuator(
+                -self.config.paper_max_steering
+            ),
+            (
+                "figure7_t_entry_left "
+                "bisector=%.1f target<=%.1f "
+                "nextEq5=%+.2f confirm=%d/%d"
             )
-        self.state = ParkingState.REVERSE_ALIGN
-        return self._reverse_align(observation)
+            % (
+                pair.angle_bisector_deg,
+                self.config.prealign_bisector_target_deg,
+                prospective_steering,
+                self._prealign_target_scans,
+                self.config.prealign_confirm_scans,
+            ),
+        )
 
     def _reverse_align(
         self,
         observation: RearLidarObservation,
     ) -> ControlCommand:
         if observation.near:
+            if not self._reverse_motion_started:
+                return self._stop(
+                    "near_before_valid_reverse_motion"
+                )
             self.state = ParkingState.CENTER_CHECK
             return self._stop("figure9_near_stop_and_check_dist_cd")
 
@@ -152,6 +193,7 @@ class PaperParkingController:
             distance_bias_ab_mm=bias_ab,
             reason="equation_5_reverse",
         )
+        self._reverse_motion_started = True
         return ControlCommand(
             speed=self.config.reverse_speed,
             steering=self._apply_steering_offset(
@@ -232,6 +274,7 @@ class PaperParkingController:
         reason: str,
     ) -> ControlCommand:
         self.state = ParkingState.RECOVERY_FORWARD
+        self._reverse_motion_started = False
         self._recovery_started_at = now
         self.debug = PaperParkingDebug(
             state=self.state,
