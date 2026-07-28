@@ -564,6 +564,7 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
         estimator = BevCorridorLaneEstimator(
             BevCorridorConfig(
                 lane_width_px=60.0,
+                control_full_path=True,
                 path_smooth_alpha=0.36,
                 path_max_step_px=28.0,
                 vehicle_center_x_offset_ratio=0.0,
@@ -592,6 +593,40 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
             np.interp(lane.near_target_y, ys, xs),
             delta=0.01,
         )
+
+    def test_point_control_target_is_independent_from_stabilized_path(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lane_width_px=60.0,
+                center_smooth_alpha=1.0,
+                heading_smooth_alpha=1.0,
+                control_full_path=False,
+                path_smooth_alpha=0.10,
+                path_max_step_px=8.0,
+                max_center_jump_px=200.0,
+                max_heading_jump=2.0,
+                vehicle_center_x_offset_ratio=0.0,
+            )
+        )
+        estimator.estimate(
+            BevClassMasks(
+                center=[slanted_line_mask(55.0, 0.10)],
+                center_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+        lane = estimator.estimate(
+            BevClassMasks(
+                center=[slanted_line_mask(90.0, 0.35)],
+                center_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+        ys = np.asarray([point[1] for point in lane.path_points])
+        xs = np.asarray([point[0] for point in lane.path_points])
+        path_target = float(np.interp(lane.target_y, ys, xs))
+
+        self.assertGreater(abs(lane.center_x - path_target), 5.0)
 
     def test_spatial_path_guard_removes_v_shaped_splice(self):
         estimator = BevCorridorLaneEstimator(

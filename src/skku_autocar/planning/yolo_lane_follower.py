@@ -132,7 +132,7 @@ class YoloLaneFollower:
 
         raw_curve_strength = self._curve_strength_from(lane)
         curve_strength = self._smooth_curve_strength(raw_curve_strength)
-        centering_error = self._centering_error(lane)
+        centering_error = lane.lateral_error_norm
         recovery_strength = self._center_recovery_strength(centering_error)
         center_lock_active = self._center_lock_active(centering_error)
 
@@ -1100,13 +1100,6 @@ class YoloLaneFollower:
         if not self.config.center_lock_enabled:
             return False
         return abs(lateral_error) >= self.config.center_lock_error_threshold
-
-    @staticmethod
-    def _centering_error(lane: LaneGeometry) -> float:
-        near = lane.near_lateral_error_norm
-        if near is not None and abs(near) > abs(lane.lateral_error_norm):
-            return near
-        return lane.lateral_error_norm
 
     def _apply_center_lock(self, steering: float, lateral_error: float, active: bool) -> float:
         if not active:

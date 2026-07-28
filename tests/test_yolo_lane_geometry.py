@@ -921,7 +921,7 @@ class YoloLaneGeometryTest(unittest.TestCase):
 
         self.assertEqual(command.steering, -80)
 
-    def test_near_error_keeps_center_lock_active(self):
+    def test_point_control_uses_lookahead_error_for_center_lock(self):
         follower = YoloLaneFollower(
             YoloLaneFollowerConfig(
                 kp_lateral=0.0,
@@ -947,10 +947,10 @@ class YoloLaneGeometryTest(unittest.TestCase):
 
         command = follower.plan(lane)
 
-        self.assertEqual(command.steering, -75)
-        self.assertIn("center_lock", command.reason)
+        self.assertEqual(command.steering, 0)
+        self.assertNotIn("center_lock", command.reason)
 
-    def test_near_error_can_override_opposite_far_error_for_centering(self):
+    def test_point_control_does_not_let_near_error_reverse_lookahead(self):
         follower = YoloLaneFollower(
             YoloLaneFollowerConfig(
                 kp_lateral=100.0,
@@ -976,7 +976,7 @@ class YoloLaneGeometryTest(unittest.TestCase):
 
         command = follower.plan(lane)
 
-        self.assertEqual(command.steering, -75)
+        self.assertEqual(command.steering, 4)
 
     def test_release_rate_limit_slows_unwinding_same_direction(self):
         follower = YoloLaneFollower(
@@ -1150,6 +1150,15 @@ class YoloLaneGeometryTest(unittest.TestCase):
         self.assertAlmostEqual(config.path_curve_guard_near_error, 0.07)
         self.assertAlmostEqual(config.path_curve_guard_release_error, 0.21)
         self.assertAlmostEqual(config.path_curve_guard_steering_limit, 108.0)
+
+    def test_path_tracking_flag_controls_both_target_and_follower(self):
+        point_args = parse_args([])
+        path_args = parse_args(["--path-tracking"])
+
+        self.assertFalse(build_bev_corridor_config(point_args).control_full_path)
+        self.assertFalse(build_follower_config(point_args).path_tracking)
+        self.assertTrue(build_bev_corridor_config(path_args).control_full_path)
+        self.assertTrue(build_follower_config(path_args).path_tracking)
 
     def test_crosswalk_cache_defaults_hold_preliminary_run_geometry(self):
         args = parse_args([])
