@@ -33,6 +33,10 @@ class LaneChangeConfig:
     target_capture_frames: int = 2
     allow_virtual_stabilize: bool = False
     smooth_avoidance: bool = False
+    spatial_transition_lead: float = 0.10
+    trajectory_heading_gain: float = 1.6
+    unreliable_hold_seconds: float = 0.25
+    max_transition_seconds: float = 4.0
     return_duration_scale: float = 1.0
     return_steering_cap: int = 0
     return_stabilizing_steering_cap: int = 0
@@ -48,6 +52,9 @@ class LaneChangeResult:
     progress: float = 0.0
     stable_frames: int = 0
     lane_reliable: bool = True
+    unreliable_age_seconds: float = 0.0
+    neutral_steering_reason: str = ""
+    directional_assist_released: bool = False
 
 
 class LaneChangeController:
@@ -76,6 +83,8 @@ class LaneChangeController:
         self._last_output_steering: Optional[int] = None
         self._steering_slew_releasing = False
         self._paused_at: Optional[float] = None
+        self._unreliable_started_at: Optional[float] = None
+        self._last_reliable_at: Optional[float] = None
 
     def reset(self) -> None:
         self.state = "lane2"
@@ -93,11 +102,17 @@ class LaneChangeController:
         self._last_output_steering = None
         self._steering_slew_releasing = False
         self._paused_at = None
+        self._unreliable_started_at = None
+        self._last_reliable_at = None
 
     def pause(self, now: float) -> None:
         """Freeze transition timers while another mission owns path priority."""
         if self._paused_at is None:
             self._paused_at = float(now)
+        # Crosswalk priority is an intentional mission pause, not a failed
+        # geometry sample. Start a fresh unreliable grace period after resume.
+        self._unreliable_started_at = None
+        self._last_reliable_at = None
 
     def resume(self, now: float) -> None:
         if self._paused_at is None:
@@ -121,6 +136,51 @@ class LaneChangeController:
             float(offset_px),
             float(bev_width_px),
         )
+
+    def apply_frozen_trajectory(
+        self,
+        lane: LaneGeometry,
+        bev_width_px: float,
+    ) -> LaneGeometry:
+        """Rebuild the currently paused target from fresh base-lane geometry."""
+        width = self._effective_lane_width(0.0)
+        if width <= 0.0:
+            return lane
+        state = self.state
+        now = (
+            float(self._paused_at)
+            if self._paused_at is not None
+            else float(self._phase_started_at or 0.0)
+        )
+        if state == "changing_to_lane1":
+            progress = self._progress(now)
+            return self._transition_lane_target(
+                lane,
+                0.0,
+                -width,
+                progress,
+                bev_width_px,
+                (
+                    self.config.smooth_avoidance
+                    and self._request_profile == "avoidance"
+                ),
+            )
+        if state in ("stabilizing_lane1", "lane1"):
+            return self._shift_lane_if_needed(lane, -width, bev_width_px)
+        if state == "changing_to_lane2":
+            progress = self._progress(now)
+            return self._transition_lane_target(
+                lane,
+                -width,
+                0.0,
+                progress,
+                bev_width_px,
+                (
+                    self.config.smooth_avoidance
+                    and self._return_profile == "avoidance"
+                ),
+            )
+        return lane
 
     def request(self, source: str = "external") -> bool:
         """Arm a lane change from any detector/trigger.
@@ -147,6 +207,8 @@ class LaneChangeController:
         self._return_profile = "normal"
         self._clear_stability()
         self._locked_lane_width_px = None
+        self._last_reliable_shifted_lane = None
+        self._unreliable_started_at = None
         return True
 
     @property
@@ -193,6 +255,7 @@ class LaneChangeController:
 
         if self._run_started_at is None:
             self._run_started_at = now
+        self._update_reliability_clock(now, lane_reliable)
 
         if (
             self.config.mode == "timed"
@@ -221,14 +284,17 @@ class LaneChangeController:
         offset_ratio = 0.0
         direction = 0
         progress = 0.0
+        transition_start_px = 0.0
+        transition_end_px = 0.0
+        spatial_transition = False
         if self.state == "changing_to_lane1":
             direction = -1
             if self._uses_target_arrival(self.state):
-                # Avoidance targets the complete adjacent-lane geometry from
-                # the first control frame. Arrival is decided from measured
-                # target error, not elapsed transition time.
-                progress = 1.0
-                offset_ratio = -1.0
+                progress = self._progress(now) if self.config.smooth_avoidance else 1.0
+                offset_ratio = -self._smoothstep(progress)
+                transition_start_px = 0.0
+                transition_end_px = -self._effective_lane_width(lane_width_px)
+                spatial_transition = self.config.smooth_avoidance
             else:
                 progress = self._progress(now)
                 offset_ratio = -self._smoothstep(progress)
@@ -256,8 +322,11 @@ class LaneChangeController:
         elif self.state == "changing_to_lane2":
             direction = 1
             if self._uses_target_arrival(self.state):
-                progress = 1.0
-                offset_ratio = 0.0
+                progress = self._progress(now) if self.config.smooth_avoidance else 1.0
+                offset_ratio = -(1.0 - self._smoothstep(progress))
+                transition_start_px = -self._effective_lane_width(lane_width_px)
+                transition_end_px = 0.0
+                spatial_transition = self.config.smooth_avoidance
             else:
                 progress = self._progress(now)
                 offset_ratio = -(1.0 - self._smoothstep(progress))
@@ -274,6 +343,10 @@ class LaneChangeController:
             offset_px,
             bev_width_px,
             lane_reliable,
+            transition_start_px=transition_start_px,
+            transition_end_px=transition_end_px,
+            progress=progress,
+            spatial_transition=spatial_transition,
         )
         if not lane_reliable and self._uses_target_arrival(self.state):
             self._target_capture_frames = 0
@@ -281,6 +354,7 @@ class LaneChangeController:
             self.state == "changing_to_lane1"
             and self._uses_target_arrival(self.state)
             and lane_reliable
+            and progress >= 1.0
             and self._target_captured(shifted, -1)
         ):
             direction = 0
@@ -289,6 +363,7 @@ class LaneChangeController:
             self.state == "changing_to_lane2"
             and self._uses_target_arrival(self.state)
             and lane_reliable
+            and progress >= 1.0
             and self._target_captured(shifted, 1)
         ):
             direction = 0
@@ -311,6 +386,18 @@ class LaneChangeController:
             "changing_to_lane2",
             "stabilizing_lane2",
         )
+        unreliable_age = self._unreliable_age(now, lane_reliable)
+        neutral_steering_reason = self._neutral_steering_reason(
+            lane_reliable,
+            unreliable_age,
+        )
+        assist_released = self._transition_timed_out(now)
+        if not lane_reliable or assist_released:
+            # Never force the old transition direction from a cached path. The
+            # bounded lane-follower command may bridge a short dropout. A long
+            # but still reliable transition also falls back to path feedback
+            # instead of holding a directional steering minimum forever.
+            direction = 0
         return LaneChangeResult(
             lane=shifted,
             state=self.state,
@@ -320,6 +407,9 @@ class LaneChangeController:
             progress=progress,
             stable_frames=self._stable_frames,
             lane_reliable=lane_reliable,
+            unreliable_age_seconds=unreliable_age,
+            neutral_steering_reason=neutral_steering_reason,
+            directional_assist_released=assist_released,
         )
 
     def apply_control_adjustments(
@@ -365,6 +455,20 @@ class LaneChangeController:
         command: ControlCommand,
         result: LaneChangeResult,
     ) -> ControlCommand:
+        if result.neutral_steering_reason and not command.brake:
+            self._last_output_steering = 0
+            self._steering_slew_releasing = False
+            reason = (
+                "%s:%s" % (command.reason, result.neutral_steering_reason)
+                if command.reason
+                else result.neutral_steering_reason
+            )
+            return ControlCommand(
+                speed=command.speed,
+                steering=0,
+                brake=False,
+                reason=reason,
+            )
         adjusted = self._apply_steering_assist_base(command, result)
         if adjusted.brake:
             self._last_output_steering = None
@@ -446,7 +550,10 @@ class LaneChangeController:
     ) -> ControlCommand:
         if command.brake:
             return command
-        if not result.lane_reliable and self._hold_unreliable_target_active():
+        if (
+            not result.lane_reliable
+            and self._hold_unreliable_target_active(result.state)
+        ):
             adjusted = command
             if (
                 (
@@ -459,6 +566,7 @@ class LaneChangeController:
                     adjusted,
                     result,
                 )
+            adjusted = self._release_unreliable_steering(adjusted, result)
             return self._cap_unreliable_steering(adjusted)
         if self._uses_avoidance_profile(result.state):
             return self._apply_stabilizing_steering(command, result)
@@ -484,6 +592,7 @@ class LaneChangeController:
         if (
             result.lane_reliable
             and self._uses_target_arrival(result.state)
+            and result.progress >= 1.0
             and self._target_approach_reached(result.lane, direction)
         ):
             steering = command.steering
@@ -607,6 +716,34 @@ class LaneChangeController:
             reason=reason,
         )
 
+    def _release_unreliable_steering(
+        self,
+        command: ControlCommand,
+        result: LaneChangeResult,
+    ) -> ControlCommand:
+        """Continuously unwind cached-path steering during the short grace."""
+        hold = max(0.0, float(self.config.unreliable_hold_seconds))
+        if hold <= 1e-6:
+            scale = 0.0
+        else:
+            scale = self._clip_float(
+                1.0 - float(result.unreliable_age_seconds) / hold,
+                0.0,
+                1.0,
+            )
+        steering = int(round(float(command.steering) * scale))
+        reason = (
+            "%s:lane_change_unreliable_release" % command.reason
+            if command.reason
+            else "lane_change_unreliable_release"
+        )
+        return ControlCommand(
+            speed=command.speed,
+            steering=steering,
+            brake=False,
+            reason=reason,
+        )
+
     def _progress(self, now: float) -> float:
         duration = max(0.05, self.config.transition_seconds)
         if (
@@ -662,8 +799,6 @@ class LaneChangeController:
         )
 
     def _uses_target_arrival(self, state: str) -> bool:
-        if self.config.smooth_avoidance:
-            return False
         if state == "changing_to_lane1":
             return self._request_profile == "avoidance"
         if state == "changing_to_lane2":
@@ -740,11 +875,25 @@ class LaneChangeController:
         offset_px: float,
         bev_width_px: float,
         lane_reliable: bool,
+        transition_start_px: float = 0.0,
+        transition_end_px: float = 0.0,
+        progress: float = 0.0,
+        spatial_transition: bool = False,
     ) -> tuple:
         if not lane.found:
             return lane, 0.0
         if lane_reliable:
-            shifted = self._shift_lane_if_needed(lane, offset_px, bev_width_px)
+            if spatial_transition:
+                shifted = self._transition_lane_target(
+                    lane,
+                    transition_start_px,
+                    transition_end_px,
+                    progress,
+                    bev_width_px,
+                    True,
+                )
+            else:
+                shifted = self._shift_lane_if_needed(lane, offset_px, bev_width_px)
             self._last_reliable_shifted_lane = shifted
             applied = shifted.center_x - lane.center_x
             return shifted, applied
@@ -753,8 +902,11 @@ class LaneChangeController:
             return held, 0.0
         return lane, 0.0
 
-    def _hold_unreliable_target_active(self) -> bool:
-        return self.state in (
+    def _hold_unreliable_target_active(
+        self,
+        state: Optional[str] = None,
+    ) -> bool:
+        return (self.state if state is None else state) in (
             "changing_to_lane1",
             "stabilizing_lane1",
             "lane1",
@@ -782,9 +934,263 @@ class LaneChangeController:
             return lane
         return self._shift_lane(lane, offset_px, bev_width_px)
 
+    def _transition_lane_target(
+        self,
+        lane: LaneGeometry,
+        start_offset_px: float,
+        end_offset_px: float,
+        progress: float,
+        bev_width_px: float,
+        spatial: bool,
+    ) -> LaneGeometry:
+        if not spatial or len(lane.path_points) < 3:
+            ratio = self._smoothstep(
+                self._clip_float(float(progress), 0.0, 1.0)
+            )
+            offset = start_offset_px + (
+                end_offset_px - start_offset_px
+            ) * ratio
+            return self._shift_lane_if_needed(lane, offset, bev_width_px)
+        return self._shift_lane_spatial(
+            lane,
+            start_offset_px,
+            end_offset_px,
+            progress,
+            bev_width_px,
+        )
+
+    def _shift_lane_spatial(
+        self,
+        lane: LaneGeometry,
+        start_offset_px: float,
+        end_offset_px: float,
+        progress: float,
+        bev_width_px: float,
+    ) -> LaneGeometry:
+        """Apply a near-anchored S trajectory instead of teleporting the path."""
+        target_y = float(lane.target_y)
+        near_y = (
+            float(lane.near_target_y)
+            if lane.near_target_y is not None
+            else (
+                float(lane.height) * 0.88
+                if float(lane.height) > 0.0
+                else max(float(y) for _, y in lane.path_points)
+            )
+        )
+        span = max(1.0, near_y - target_y)
+        lead = self._clip_float(
+            float(self.config.spatial_transition_lead),
+            0.0,
+            1.0,
+        )
+        temporal = self._clip_float(float(progress), 0.0, 1.0)
+        transformed = []
+        for raw_x, raw_y in lane.path_points:
+            x = float(raw_x)
+            y = float(raw_y)
+            forward = self._clip_float((near_y - y) / span, 0.0, 1.0)
+            phase = self._clip_float(
+                temporal + lead * self._smoothstep(forward),
+                0.0,
+                1.0,
+            )
+            blend = self._smoothstep(phase)
+            offset = start_offset_px + (
+                end_offset_px - start_offset_px
+            ) * blend
+            transformed.append((x + offset, y))
+
+        center_x = self._path_x_at(
+            transformed,
+            target_y,
+            lane.center_x,
+        )
+        near_center_x = self._path_x_at(
+            transformed,
+            near_y,
+            (
+                lane.near_center_x
+                if lane.near_center_x is not None
+                else lane.center_x
+            ),
+        )
+        half_width = max(1.0, float(bev_width_px) / 2.0)
+        lateral_error_px = center_x - lane.vehicle_center_x
+        near_lateral_error_px = near_center_x - lane.vehicle_center_x
+        return replace(
+            lane,
+            center_x=center_x,
+            lateral_error_px=lateral_error_px,
+            lateral_error_norm=self._clip_float(
+                lateral_error_px / half_width,
+                -1.0,
+                1.0,
+            ),
+            heading_error=self._trajectory_heading(
+                lane,
+                transformed,
+                target_y,
+                near_y,
+            ),
+            near_center_x=near_center_x,
+            near_target_y=near_y,
+            near_lateral_error_px=near_lateral_error_px,
+            near_lateral_error_norm=self._clip_float(
+                near_lateral_error_px / half_width,
+                -1.0,
+                1.0,
+            ),
+            path_points=tuple(transformed),
+            reason="%s:lane_change_scurve" % lane.reason,
+        )
+
+    def _trajectory_heading(
+        self,
+        lane: LaneGeometry,
+        transformed: list,
+        target_y: float,
+        near_y: float,
+    ) -> float:
+        base_slope = self._path_slope(
+            list(lane.path_points),
+            target_y,
+            near_y,
+        )
+        transformed_slope = self._path_slope(
+            transformed,
+            target_y,
+            near_y,
+        )
+        if base_slope is None or transformed_slope is None:
+            return float(lane.heading_error)
+        heading = float(lane.heading_error) - float(
+            self.config.trajectory_heading_gain
+        ) * (transformed_slope - base_slope)
+        return self._clip_float(heading, -1.0, 1.0)
+
+    @staticmethod
+    def _path_slope(
+        points: list,
+        target_y: float,
+        near_y: float,
+    ) -> Optional[float]:
+        selected = [
+            (float(x), float(y))
+            for x, y in points
+            if target_y <= float(y) <= near_y
+        ]
+        if len(selected) < 3:
+            selected = [(float(x), float(y)) for x, y in points]
+        if len(selected) < 2:
+            return None
+        mean_y = sum(y for _, y in selected) / len(selected)
+        mean_x = sum(x for x, _ in selected) / len(selected)
+        variance = sum((y - mean_y) ** 2 for _, y in selected)
+        if variance <= 1e-6:
+            return None
+        covariance = sum(
+            (y - mean_y) * (x - mean_x)
+            for x, y in selected
+        )
+        return covariance / variance
+
+    @staticmethod
+    def _path_x_at(
+        points: list,
+        target_y: float,
+        fallback: float,
+    ) -> float:
+        ordered = sorted(
+            ((float(x), float(y)) for x, y in points),
+            key=lambda point: point[1],
+        )
+        if not ordered:
+            return float(fallback)
+        if target_y <= ordered[0][1]:
+            return ordered[0][0]
+        if target_y >= ordered[-1][1]:
+            return ordered[-1][0]
+        for (x0, y0), (x1, y1) in zip(ordered, ordered[1:]):
+            if y0 <= target_y <= y1:
+                if abs(y1 - y0) <= 1e-6:
+                    return x1
+                ratio = (target_y - y0) / (y1 - y0)
+                return x0 + ratio * (x1 - x0)
+        return float(fallback)
+
+    def _update_reliability_clock(
+        self,
+        now: float,
+        lane_reliable: bool,
+    ) -> None:
+        if lane_reliable:
+            if self._unreliable_started_at is not None:
+                dropout = max(
+                    0.0,
+                    float(now) - self._unreliable_started_at,
+                )
+                if (
+                    self._phase_started_at is not None
+                    and self.state in (
+                        "changing_to_lane1",
+                        "changing_to_lane2",
+                    )
+                ):
+                    self._phase_started_at += dropout
+            self._unreliable_started_at = None
+            self._last_reliable_at = float(now)
+            return
+        if self._unreliable_started_at is None:
+            self._unreliable_started_at = (
+                float(self._last_reliable_at)
+                if self._last_reliable_at is not None
+                else float(now)
+            )
+
+    def _unreliable_age(
+        self,
+        now: float,
+        lane_reliable: bool,
+    ) -> float:
+        if lane_reliable or self._unreliable_started_at is None:
+            return 0.0
+        return max(0.0, float(now) - self._unreliable_started_at)
+
+    def _neutral_steering_reason(
+        self,
+        lane_reliable: bool,
+        unreliable_age: float,
+    ) -> str:
+        safety_state = self.state in (
+            "armed",
+            "changing_to_lane1",
+            "stabilizing_lane1",
+            "lane1",
+            "changing_to_lane2",
+            "stabilizing_lane2",
+        )
+        hold = max(0.0, float(self.config.unreliable_hold_seconds))
+        if safety_state and not lane_reliable and unreliable_age >= hold:
+            return "lane_change_stale_geometry_neutral"
+        return ""
+
+    def _transition_timed_out(self, now: float) -> bool:
+        maximum = max(0.0, float(self.config.max_transition_seconds))
+        return (
+            maximum > 0.0
+            and self.state in ("changing_to_lane1", "changing_to_lane2")
+            and self._phase_started_at is not None
+            and float(now) - self._phase_started_at >= maximum
+        )
+
     @staticmethod
     def _smoothstep(value: float) -> float:
         return value * value * (3.0 - 2.0 * value)
+
+    @staticmethod
+    def _clip_float(value: float, low: float, high: float) -> float:
+        return max(low, min(high, float(value)))
 
     @staticmethod
     def _clip(value: int, low: int, high: int) -> int:

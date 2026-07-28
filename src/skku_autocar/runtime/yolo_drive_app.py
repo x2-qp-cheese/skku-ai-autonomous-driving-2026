@@ -450,6 +450,7 @@ def build_follower_config(args: argparse.Namespace) -> YoloLaneFollowerConfig:
         path_curve_guard_release_error=args.path_curve_guard_release_error,
         path_curve_guard_steering_limit=args.path_curve_guard_steering_limit,
         path_heading_lead_gain=args.path_heading_lead_gain,
+        path_heading_lead_coherent_gain=args.path_heading_lead_coherent_gain,
         path_heading_lead_span=args.path_heading_lead_span,
         path_heading_lead_max_steering=args.path_heading_lead_max_steering,
         path_integral_gain=args.path_integral_gain,
@@ -487,7 +488,7 @@ def log_effective_config(
             follower_config.steering_release_rate_limit,
         )
     LOG.info(
-        "control mode=%s speed=%d min_curve=%d max=%d max_steer=%d path_gain=%.1f/%.1f/%.1f path_weight=%.2f..%.2f path_alpha=%.2f/%.2f path_recovery=%.2f/min%.0f path_reversal=%.2f/min%.0f/%d/near%.3f..%.3f path_conflict=%.3f/%.2f/head%.2f path_guard=%.2f/%.2f..%.2f/max%.0f heading_lead=%.1f/%.2f/max%.1f integral=%.1f/max%.2f center_lock=%s lane_lost_release=%d/frame",
+        "control mode=%s speed=%d min_curve=%d max=%d max_steer=%d path_gain=%.1f/%.1f/%.1f path_weight=%.2f..%.2f path_alpha=%.2f/%.2f path_recovery=%.2f/min%.0f path_reversal=%.2f/min%.0f/%d/near%.3f..%.3f path_conflict=%.3f/%.2f/head%.2f path_guard=%.2f/%.2f..%.2f/max%.0f heading_lead=%.1f..%.1f/%.2f/max%.1f integral=%.1f/max%.2f center_lock=%s lane_lost_release=%d/frame",
         (
             "whole_path"
             if follower_config.path_tracking
@@ -519,6 +520,7 @@ def log_effective_config(
         follower_config.path_curve_guard_release_error,
         follower_config.path_curve_guard_steering_limit,
         follower_config.path_heading_lead_gain,
+        follower_config.path_heading_lead_coherent_gain,
         follower_config.path_heading_lead_span,
         follower_config.path_heading_lead_max_steering,
         follower_config.path_integral_gain,
@@ -527,8 +529,9 @@ def log_effective_config(
         lane_lost_release,
     )
     LOG.info(
-        "safety fixed_speed=%s virtual_max_steer=%d virtual_speed_cap=%d virtual_warmup=%d virtual_blend=%.2f virtual_step=%d virtual_center_lock_scale=%.2f virtual_min_reliable=%d virtual_bootstrap_speed_cap=%d lane_lost_speed_cap=%d",
+        "safety fixed_speed=%s brake_policy=%s virtual_max_steer=%d virtual_speed_cap=%d virtual_warmup=%d virtual_blend=%.2f virtual_step=%d virtual_center_lock_scale=%.2f virtual_min_reliable=%d virtual_bootstrap_speed_cap=%d lane_lost_speed_cap=%d",
         args.fixed_speed,
+        args.fixed_speed_brake_policy,
         args.virtual_lane_max_steering,
         args.virtual_lane_speed_cap,
         args.virtual_lane_warmup_frames,
@@ -559,6 +562,7 @@ class CommandSafetyFilter:
     def __init__(self, args: argparse.Namespace):
         self.fixed_speed = args.fixed_speed == "on"
         self.fixed_speed_value = args.speed
+        self.fixed_speed_brake_policy = args.fixed_speed_brake_policy
         self.virtual_lane_max_steering = args.virtual_lane_max_steering
         self.virtual_lane_speed_cap = args.virtual_lane_speed_cap
         self.virtual_lane_warmup_frames = args.virtual_lane_warmup_frames
@@ -612,6 +616,21 @@ class CommandSafetyFilter:
     def finalize(self, command: ControlCommand, running: bool) -> ControlCommand:
         if not running:
             return command
+        if (
+            self.fixed_speed
+            and command.brake
+            and self.fixed_speed_brake_policy == "red-light-only"
+            and not self._reason_has(command.reason, "traffic_light")
+        ):
+            command = ControlCommand(
+                speed=self.fixed_speed_value,
+                steering=command.steering,
+                brake=False,
+                reason=self._append_reason(
+                    command.reason,
+                    "fixed_speed_non_mission_brake_release",
+                ),
+            )
         return self._force_fixed_speed(command)
 
     def _guard_virtual_command(self, command: ControlCommand) -> ControlCommand:
@@ -873,6 +892,16 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         choices=("on", "off"),
         default="on",
         help="force every non-brake driving command to --speed after steering safety filters",
+    )
+    parser.add_argument(
+        "--fixed-speed-brake-policy",
+        choices=("legacy", "red-light-only"),
+        default="red-light-only",
+        help=(
+            "with fixed speed, legacy preserves every brake; red-light-only "
+            "releases non-mission lane/virtual stops but preserves the required "
+            "traffic-light red-contact stop"
+        ),
     )
     parser.add_argument("--max-speed", type=int, default=255)
     parser.add_argument("--min-curve-speed", type=int, default=255)
@@ -1300,6 +1329,12 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         type=float,
         default=YoloLaneFollowerConfig.path_heading_lead_gain,
         help="steering feed-forward from path heading that appears before near-field lateral displacement",
+    )
+    parser.add_argument(
+        "--path-heading-lead-coherent-gain",
+        type=float,
+        default=YoloLaneFollowerConfig.path_heading_lead_coherent_gain,
+        help="maximum heading lead gain used only when reliable near/far/heading signs agree",
     )
     parser.add_argument(
         "--path-heading-lead-span",

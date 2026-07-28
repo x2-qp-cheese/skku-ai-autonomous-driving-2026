@@ -53,6 +53,34 @@ def lane_for_target_error(lateral_error_norm=0.0, heading=0.0, lane_width_px=150
     )
 
 
+def lane_with_path(center_x=400.0, heading=0.0):
+    vehicle_center_x = 400.0
+    half_width = 400.0
+    target_y = 160.0
+    near_y = 440.0
+    error_px = center_x - vehicle_center_x
+    return LaneGeometry(
+        found=True,
+        center_x=center_x,
+        vehicle_center_x=vehicle_center_x,
+        target_y=target_y,
+        lateral_error_px=error_px,
+        lateral_error_norm=error_px / half_width,
+        heading_error=heading,
+        confidence=1.0,
+        reason="corridor_tier1",
+        height=500.0,
+        near_center_x=center_x,
+        near_target_y=near_y,
+        near_lateral_error_px=error_px,
+        near_lateral_error_norm=error_px / half_width,
+        path_points=tuple(
+            (center_x, float(y))
+            for y in (100, 160, 230, 300, 370, 440, 490)
+        ),
+    )
+
+
 class LaneChangeControllerTest(unittest.TestCase):
     def setUp(self):
         self.controller = LaneChangeController(
@@ -495,6 +523,70 @@ class LaneChangeControllerTest(unittest.TestCase):
         self.assertEqual(adjusted.steering, 62)
         self.assertIn("lane_change_capture_feedback", adjusted.reason)
 
+    def test_capture_point_three_releases_wrong_way_assist_before_stabilizing(self):
+        self.controller = LaneChangeController(
+            LaneChangeConfig(
+                mode="external",
+                transition_seconds=0.10,
+                target_lane_width_px=160.0,
+                target_capture_error=0.30,
+                target_capture_frames=2,
+                stable_lateral_error=0.18,
+                stable_near_lateral_error=0.24,
+                stable_required_frames=4,
+                smooth_avoidance=True,
+                steering_min=80,
+                stabilizing_steering_min=0,
+            )
+        )
+        self.controller.request_avoidance("obstacle_fusion")
+        self.controller.update(
+            lane_with_path(),
+            160.0,
+            800.0,
+            0.0,
+            True,
+        )
+
+        first_capture = self.controller.update(
+            lane_with_path(center_x=447.6),
+            160.0,
+            800.0,
+            0.20,
+            True,
+        )
+        second_capture = self.controller.update(
+            lane_with_path(center_x=468.8),
+            160.0,
+            800.0,
+            0.30,
+            True,
+        )
+        crossed_target = self.controller.update(
+            lane_with_path(center_x=579.2),
+            160.0,
+            800.0,
+            0.40,
+            True,
+        )
+        adjusted = self.controller.apply_steering_assist(
+            ControlCommand(speed=255, steering=2, reason="path"),
+            crossed_target,
+        )
+
+        self.assertEqual(first_capture.state, "changing_to_lane1")
+        self.assertAlmostEqual(
+            first_capture.lane.near_lateral_error_norm or 0.0,
+            -0.281,
+            places=3,
+        )
+        self.assertEqual(second_capture.state, "stabilizing_lane1")
+        self.assertEqual(second_capture.direction, 0)
+        self.assertEqual(crossed_target.state, "stabilizing_lane1")
+        self.assertEqual(crossed_target.stable_frames, 1)
+        self.assertEqual(adjusted.steering, 2)
+        self.assertFalse(adjusted.brake)
+
     def test_avoidance_waits_for_reliable_geometry_before_starting(self):
         self.controller = LaneChangeController(
             LaneChangeConfig(mode="external")
@@ -685,8 +777,9 @@ class LaneChangeControllerTest(unittest.TestCase):
             ControlCommand(speed=255, steering=-40, reason="lane"),
             changing,
         )
+        self.controller.update(lane(), 150.0, 800.0, 1.1, True)
         finished = self.controller.update(
-            lane_for_shifted_lane1(), 150.0, 800.0, 1.1, True
+            lane(), 150.0, 800.0, 1.2, True
         )
 
         self.assertEqual(started.state, "changing_to_lane2")
@@ -746,7 +839,20 @@ class LaneChangeControllerTest(unittest.TestCase):
             ControlCommand(speed=255, steering=-150, reason="lane"),
             changing2,
         )
-        stabilizing = self.controller.update(lane(), 150.0, 800.0, 1.2, True)
+        self.controller.update(
+            lane_for_target_error(lateral_error_norm=0.05),
+            150.0,
+            800.0,
+            1.2,
+            True,
+        )
+        stabilizing = self.controller.update(
+            lane_for_target_error(lateral_error_norm=0.05),
+            150.0,
+            800.0,
+            1.3,
+            True,
+        )
         output3 = self.controller.apply_steering_assist(
             ControlCommand(speed=255, steering=80, reason="lane"),
             stabilizing,
@@ -868,7 +974,7 @@ class LaneChangeControllerTest(unittest.TestCase):
         self.assertEqual(captured.state, "stabilizing_lane1")
         self.assertEqual(stabilizing.state, "stabilizing_lane1")
         self.assertFalse(stabilizing.lane_reliable)
-        self.assertEqual(adjusted.steering, 40)
+        self.assertEqual(adjusted.steering, 24)
         self.assertIn("lane_change_unreliable", adjusted.reason)
 
     def test_target_capture_requires_consecutive_frames(self):
@@ -1033,6 +1139,246 @@ class LaneChangeControllerTest(unittest.TestCase):
         self.assertTrue(accepted)
         self.assertEqual(self.controller.return_source, "obstacle_clear")
         self.assertEqual(returning.state, "changing_to_lane2")
+
+    def test_avoidance_starts_with_near_anchored_spatial_s_curve(self):
+        controller = LaneChangeController(
+            LaneChangeConfig(
+                mode="external",
+                transition_seconds=1.0,
+                target_lane_width_px=160.0,
+                smooth_avoidance=True,
+                spatial_transition_lead=0.25,
+            )
+        )
+        controller.request_avoidance("obstacle")
+
+        start = controller.update(
+            lane_with_path(),
+            160.0,
+            800.0,
+            0.0,
+            True,
+        )
+        quarter = controller.update(
+            lane_with_path(),
+            160.0,
+            800.0,
+            0.25,
+            True,
+        )
+        halfway = controller.update(
+            lane_with_path(),
+            160.0,
+            800.0,
+            0.50,
+            True,
+        )
+
+        self.assertEqual(start.state, "changing_to_lane1")
+        self.assertAlmostEqual(start.lane.center_x, 375.0)
+        self.assertAlmostEqual(start.lane.near_center_x or 0.0, 400.0)
+        self.assertAlmostEqual(quarter.lane.center_x, 320.0)
+        self.assertAlmostEqual(quarter.lane.near_center_x or 0.0, 375.0)
+        self.assertAlmostEqual(halfway.lane.center_x, 265.0)
+        self.assertAlmostEqual(halfway.lane.near_center_x or 0.0, 320.0)
+        self.assertGreater(start.lane.center_x, 240.0)
+        self.assertLess(start.lane.heading_error, 0.0)
+        self.assertIn("lane_change_scurve", start.lane.reason)
+
+    def test_avoidance_return_is_spatial_mirror_of_outbound(self):
+        config = LaneChangeConfig(
+            mode="external",
+            transition_seconds=1.0,
+            target_lane_width_px=160.0,
+            smooth_avoidance=True,
+            spatial_transition_lead=0.25,
+        )
+        outbound = LaneChangeController(config)
+        outbound.request_avoidance("obstacle")
+        left = outbound.update(
+            lane_with_path(),
+            160.0,
+            800.0,
+            0.0,
+            True,
+        )
+
+        returning = LaneChangeController(config)
+        returning.state = "lane1"
+        returning.request_avoidance_return("obstacle")
+        lane1_base = lane_with_path(center_x=560.0)
+        returning.update(lane1_base, 160.0, 800.0, 0.0, True)
+        right = returning.update(
+            lane1_base,
+            160.0,
+            800.0,
+            0.0,
+            True,
+        )
+
+        self.assertAlmostEqual(left.lane.center_x - 400.0, -25.0)
+        self.assertAlmostEqual(right.lane.center_x - 400.0, 25.0)
+        self.assertAlmostEqual(left.lane.near_center_x or 0.0, 400.0)
+        self.assertAlmostEqual(right.lane.near_center_x or 0.0, 400.0)
+        self.assertAlmostEqual(
+            left.lane.heading_error,
+            -right.lane.heading_error,
+        )
+
+    def test_spatial_trajectory_geometry_is_self_consistent_and_bounded(self):
+        controller = LaneChangeController(
+            LaneChangeConfig(
+                mode="external",
+                transition_seconds=0.85,
+                target_lane_width_px=160.0,
+                smooth_avoidance=True,
+                spatial_transition_lead=0.25,
+            )
+        )
+        controller.request_avoidance("obstacle")
+        centers = []
+        previous = None
+        max_path_slope = 0.0
+        for frame in range(13):
+            result = controller.update(
+                lane_with_path(),
+                160.0,
+                800.0,
+                frame / 12.0,
+                True,
+            )
+            centers.append(result.lane.center_x)
+            path = list(result.lane.path_points)
+            self.assertAlmostEqual(
+                result.lane.center_x,
+                controller._path_x_at(
+                    path,
+                    result.lane.target_y,
+                    0.0,
+                ),
+            )
+            self.assertAlmostEqual(
+                result.lane.near_center_x or 0.0,
+                controller._path_x_at(
+                    path,
+                    result.lane.near_target_y or 0.0,
+                    0.0,
+                ),
+            )
+            for (x0, y0), (x1, y1) in zip(path, path[1:]):
+                max_path_slope = max(
+                    max_path_slope,
+                    abs((x1 - x0) / (y1 - y0)),
+                )
+            if previous is not None:
+                self.assertLessEqual(
+                    abs(result.lane.center_x - previous),
+                    35.0,
+                )
+            previous = result.lane.center_x
+
+        self.assertTrue(
+            all(a >= b for a, b in zip(centers, centers[1:]))
+        )
+        self.assertLess(max_path_slope, 0.50)
+
+    def test_unreliable_transition_releases_steering_then_keeps_speed_255(self):
+        controller = LaneChangeController(
+            LaneChangeConfig(
+                mode="external",
+                transition_seconds=0.85,
+                target_lane_width_px=160.0,
+                smooth_avoidance=True,
+                unreliable_hold_seconds=0.25,
+                unreliable_steering_cap=90,
+            )
+        )
+        controller.request_avoidance("obstacle")
+        reliable = controller.update(
+            lane_with_path(),
+            160.0,
+            800.0,
+            0.0,
+            True,
+        )
+        short_dropout = controller.update(
+            replace(lane_with_path(), reason="coast:heading_jump"),
+            160.0,
+            800.0,
+            0.10,
+            True,
+            lane_reliable=False,
+        )
+        released = controller.apply_steering_assist(
+            ControlCommand(speed=255, steering=-100, reason="path"),
+            short_dropout,
+        )
+        long_dropout = controller.update(
+            replace(lane_with_path(), reason="virtual_hold:heading_jump"),
+            160.0,
+            800.0,
+            0.26,
+            True,
+            lane_reliable=False,
+        )
+        neutral = controller.apply_steering_assist(
+            ControlCommand(speed=255, steering=-100, reason="path"),
+            long_dropout,
+        )
+        recovered = controller.update(
+            lane_with_path(),
+            160.0,
+            800.0,
+            0.36,
+            True,
+            lane_reliable=True,
+        )
+
+        self.assertEqual(short_dropout.direction, 0)
+        self.assertAlmostEqual(
+            short_dropout.lane.center_x,
+            reliable.lane.center_x,
+        )
+        self.assertEqual(released.speed, 255)
+        self.assertEqual(released.steering, -60)
+        self.assertFalse(released.brake)
+        self.assertEqual(neutral.speed, 255)
+        self.assertEqual(neutral.steering, 0)
+        self.assertFalse(neutral.brake)
+        self.assertIn("stale_geometry_neutral", neutral.reason)
+        self.assertAlmostEqual(recovered.progress, 0.0)
+        self.assertFalse(recovered.neutral_steering_reason)
+
+    def test_transition_timeout_releases_directional_minimum_without_braking(self):
+        controller = LaneChangeController(
+            LaneChangeConfig(
+                mode="external",
+                transition_seconds=0.10,
+                target_lane_width_px=160.0,
+                smooth_avoidance=True,
+                max_transition_seconds=0.50,
+                steering_min=80,
+            )
+        )
+        controller.request_avoidance("obstacle")
+        controller.update(lane_with_path(), 160.0, 800.0, 0.0, True)
+        timed_out = controller.update(
+            lane_with_path(),
+            160.0,
+            800.0,
+            0.60,
+            True,
+        )
+        adjusted = controller.apply_steering_assist(
+            ControlCommand(speed=255, steering=30, reason="path"),
+            timed_out,
+        )
+
+        self.assertTrue(timed_out.directional_assist_released)
+        self.assertEqual(timed_out.direction, 0)
+        self.assertEqual(adjusted.speed, 255)
+        self.assertEqual(adjusted.steering, 30)
+        self.assertFalse(adjusted.brake)
 
     def test_crosswalk_pause_does_not_advance_transition_clock(self):
         self.update(0.0)

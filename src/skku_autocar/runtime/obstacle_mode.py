@@ -64,7 +64,6 @@ class ObstacleDriveMode:
         self._result: Optional[LaneChangeResult] = None
         self._last_output_lane: Optional[LaneGeometry] = None
         self._last_reliable_output_lane: Optional[LaneGeometry] = None
-        self._crosswalk_offset_px: Optional[float] = None
         self._frame = ObstacleFrameResult(lane=_empty_lane())
 
     @property
@@ -137,7 +136,6 @@ class ObstacleDriveMode:
         if not running:
             self._last_output_lane = None
             self._last_reliable_output_lane = None
-            self._crosswalk_offset_px = None
 
         lane_reliable = lane_change_geometry_reliable(mask_result, lane)
         map_snapshot = self._local_map.update(
@@ -173,7 +171,6 @@ class ObstacleDriveMode:
                 map_snapshot,
             )
         self._lane_change.resume(now)
-        self._crosswalk_offset_px = None
 
         frame_paths = build_obstacle_frame_paths(
             self._transformer,
@@ -217,11 +214,13 @@ class ObstacleDriveMode:
             running,
             lane_reliable=lane_reliable,
         )
-        if result.offset_px and self._corridor_estimator.last_centerline_bev:
-            self._corridor_estimator.last_centerline_bev = [
-                (x + result.offset_px, y)
-                for x, y in self._corridor_estimator.last_centerline_bev
-            ]
+        if result.lane.path_points:
+            # A lane-change target is a near-anchored spatial trajectory. Copy
+            # the complete transformed path; applying one scalar offset here
+            # would turn it back into the abrupt parallel target we rejected.
+            self._corridor_estimator.last_centerline_bev = list(
+                result.lane.path_points
+            )
 
         active_transition = result.state not in ("off", "lane2", "completed")
         self._result = result
@@ -252,16 +251,9 @@ class ObstacleDriveMode:
         map_snapshot: LocalOccupancySnapshot,
     ) -> LaneGeometry:
         """Pause lane-change state while preserving the current path shape."""
-        if self._crosswalk_offset_px is None:
-            self._crosswalk_offset_px = (
-                float(self._result.offset_px)
-                if self._result is not None
-                else 0.0
-            )
         bev_width = float(bev_shape[1]) if len(bev_shape) > 1 else 1.0
-        current = self._lane_change.apply_fixed_offset(
+        current = self._lane_change.apply_frozen_trajectory(
             lane,
-            self._crosswalk_offset_px,
             bev_width,
         )
         reason = current.reason.split(":crosswalk_priority_hold", 1)[0]
@@ -273,7 +265,7 @@ class ObstacleDriveMode:
         self._result = LaneChangeResult(
             lane=held,
             state="crosswalk_hold",
-            offset_px=self._crosswalk_offset_px,
+            offset_px=held.center_x - lane.center_x,
             active=False,
             lane_reliable=False,
         )
@@ -414,7 +406,11 @@ def build_lane_change_config(args: argparse.Namespace) -> LaneChangeConfig:
         target_capture_error=args.lane_change_target_capture_error,
         target_capture_frames=args.lane_change_target_capture_frames,
         allow_virtual_stabilize=args.lane_change_allow_virtual_stabilize == "on",
-        smooth_avoidance=False,
+        smooth_avoidance=True,
+        spatial_transition_lead=args.lane_change_spatial_lead,
+        trajectory_heading_gain=args.bev_heading_gain,
+        unreliable_hold_seconds=args.lane_change_unreliable_hold_seconds,
+        max_transition_seconds=args.lane_change_max_transition_seconds,
         return_duration_scale=args.lane_change_return_duration_scale,
         return_steering_cap=args.lane_change_return_steering_cap,
         return_stabilizing_steering_cap=(
@@ -668,6 +664,9 @@ def add_obstacle_arguments(parser: argparse.ArgumentParser) -> None:
         ("--lane-change-target-width-px", float, 160.0),
         ("--lane-change-target-approach-error", float, 0.20),
         ("--lane-change-target-capture-frames", int, LaneChangeConfig.target_capture_frames),
+        ("--lane-change-spatial-lead", float, LaneChangeConfig.spatial_transition_lead),
+        ("--lane-change-unreliable-hold-seconds", float, LaneChangeConfig.unreliable_hold_seconds),
+        ("--lane-change-max-transition-seconds", float, LaneChangeConfig.max_transition_seconds),
         ("--lane-change-return-duration-scale", float, 1.35),
         ("--lane-change-return-steering-cap", int, 115),
         ("--lane-change-return-stabilizing-steering-cap", int, 90),

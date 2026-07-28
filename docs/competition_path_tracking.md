@@ -17,8 +17,10 @@ error derivative, then applies asymmetric steering smoothing:
 ```text
 e_path = weighted_mean((path_x - vehicle_x) / half_bev_width)
 lead   = confidence * max(0, abs(heading) - abs(near_error)) / lead_span
-u_ff   = clamp(K_lead * heading * lead, -36, 36)
-u_raw  = K_path * e_path + K_heading * heading + K_d * delta(e_path) + u_ff
+K_lead = 170, rising toward 195 only for coherent tier-1 curves
+P_head = smoothstep((abs(far) / abs(near) - 1.25) / 0.75) during an S sign split
+u_ff   = clamp(K_lead * heading * lead, -32, 32) * P_head
+u_raw  = K_path * e_path + K_heading * heading * P_head + K_d * delta(e_path) + u_ff
 u      = EMA(u_applied_previous, u_raw)
 ```
 
@@ -30,9 +32,22 @@ available camera-only BEV geometry. It is not copied external source code.
 Curve entry does not depend on a lap timer, a crosswalk-exit direction, or a
 track coordinate. The controller measures when the complete path direction
 starts turning before the near-field lateral displacement has grown. That
-confidence-scaled lead contributes at most 36 steering units. A steering sign
-reversal uses the fast response coefficient, so a real S-curve transition is
-not mistaken for a slow steering release.
+confidence-scaled lead contributes at most 32 steering units. The base gain is
+170. It approaches 195 only when a high-confidence tier-1 path has coherent
+near, far and heading signs; conflict, coast, virtual, crosswalk and lane-change
+paths stay at 170. A steering sign reversal is not given its minimum opposite
+command until the near path supports the new direction beyond the 0.025 noise
+guard, and the final reversal is limited to 80 units per processed frame.
+When near and far path signs disagree in an S transition, heading preview is
+phased in only as the far displacement grows from 1.25 to 2.0 times the
+still-opposite near displacement. This dimensionless, left/right-symmetric rule
+prevents the far preview from changing steering direction two frames before the
+path beside the vehicle, without a binary gate.
+
+Straight center recovery is also continuous. The former controller switched a
+60-unit minimum on at near error `0.07`; it now smoothsteps from the ordinary
+command at `0.07` to the full minimum at `0.14`. Thus a one-pixel perception
+change around the threshold cannot create a large steering pulse.
 
 ## Path-shape stabilization
 
@@ -44,9 +59,10 @@ anchors.
 
 Each anchor uses bounded-innovation EMA filtering. Far anchors use stronger
 filtering because small segmentation changes create large preview changes;
-anchors near the vehicle respond faster so curve entry is not delayed. A
-measurement can move one anchor by at most `80 px` per processed frame before
-filtering. Center error, near error, heading and steering are all derived from
+anchors near the vehicle respond faster so curve entry is not delayed. The
+competition launcher uses path smoothing `0.65`; a measurement can move one
+anchor by at most `55 px` per processed frame before filtering. Center error,
+near error, heading and steering are all derived from
 this one stabilized path rather than from separate, potentially conflicting
 filters. The competition launcher therefore uses heading smoothing `1.0`: the
 path is already filtered and its heading must not pass through a second lagging
@@ -102,9 +118,9 @@ technical basis.
   current-lane path. Advance that vehicle-relative cache by the measured BEV
   motion of the zebra mask instead of freezing the entry pose. Reacquire a valid
   current path immediately; do not wait behind a stale heading-jump gate.
-- Crosswalk ownership: pause lane-change timers and preserve only the already
-  established parallel lane offset. The obstacle layer no longer keeps a second
-  frozen path cache.
+- Crosswalk ownership: pause lane-change timers and reconstruct the already
+  established S-trajectory progress over each fresh base-lane path. The
+  obstacle layer no longer keeps a second frozen scalar-offset cache.
 - Obstacle: assign each instance exclusively to the closer path, with overlap and
   pixel-distance hysteresis. A current-lane obstacle that merely touches the
   projected destination corridor cannot mark both lanes blocked. Adjacent-lane
@@ -113,16 +129,21 @@ technical basis.
   and make its heading inconsistent.
 - Emergency stop: obstacle emergency braking is disabled by the competition
   launcher. The traffic-light controller remains the only normal mission brake.
-- Speed: every non-brake command is finalized at `255`.
+- Speed: every moving command is finalized at `255`. With
+  `fixed-speed-brake-policy=red-light-only`, lane loss and virtual bootstrap
+  cannot introduce a brake; the required traffic-light red-contact stop remains
+  intact.
 
 ## Control ownership
 
 The runtime has one owner for each decision. The BEV corridor owns the 24-point
-base path. The lane-change controller may translate that complete path, but it
-does not add a second steering boost or steering minimum. The path follower is
-the only component that converts geometry to steering. When obstacle avoidance
-geometry is unreliable, the final steering is bounded to `[-90, 90]` in every
-active state, including lane-1 hold and stabilization.
+base path. During obstacle avoidance, the lane-change controller turns it into
+a near-anchored spatial S path and may apply a bounded directional minimum
+before target capture. The path follower converts that geometry to steering,
+and the lane-change layer applies a 35-unit actuator-facing slew. When obstacle
+geometry becomes unreliable, directional forcing is released immediately,
+cached steering unwinds over 0.25 seconds, and then the command becomes neutral
+without braking.
 
 The obstacle layer cannot advance its planner during a crosswalk. The traffic
 light may stop the final command, and no other mission logic may brake it. After
@@ -139,15 +160,29 @@ YOLO masks -> fresh bounded BEV path or motion-adjusted fallback
            -> synchronize applied steering back to the follower
 ```
 
-The competition launcher fixes the obstacle lane translation to `150 px`.
-Using a single configured width prevents the obstacle planner and lane-change
-controller from reasoning about different destination corridors.
+The competition launcher fixes the obstacle lane translation to `160 px`.
+Avoidance uses a `0.85 s` temporal smoothstep with spatial lead `0.10`, so the
+near path begins at the current vehicle path while the forward path bends into
+the adjacent lane. Target capture requires progress 1.0 plus two reliable
+frames within normalized near error 0.30. That only transfers steering
+ownership to stabilization; final lane completion still requires reliable far
+and near errors within 0.18 and 0.24 for four consecutive frames. Using one
+configured width prevents the obstacle planner and lane-change controller from
+reasoning about different destination corridors.
 
 ## Center-offset validation
 
 The competition centerline bias remains `0.50`, the geometric midpoint between
 the detected center marking and outer boundary. It was not shifted inward to
 hide curve lag.
+
+On the successful `20260714_103213` qualifier geometry, the hard recovery
+controller had steering total variation `1772`, maximum one-frame change `46`
+and p95 change `11`. Continuous recovery reduced these to `1453`, `31`, and
+`8`. Adding the continuous S preview phase starts the tested S reversal at the
+same frame as the historical successful command; the reconstructed final
+sequence has total variation about `1470` and maximum change `36`. This remains
+an open-loop comparison, not a substitute for the preparation-track test.
 
 Six user-provided runs were sampled at an effective 10 fps:
 `20260714_103213`, `20260725_142621`, `20260725_144632`,

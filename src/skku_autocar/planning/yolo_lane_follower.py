@@ -57,13 +57,14 @@ class YoloLaneFollowerConfig:
     path_center_recovery_min_steering: float = 60.0
     path_center_recovery_alpha: float = 0.90
     path_center_recovery_rate_limit: int = 120
-    # S-curves need the old steering direction removed in one control frame,
-    # while small sign noise must continue through the ordinary path filter.
+    # S-curves need the old steering direction removed promptly, while every
+    # reversal remains bounded for full-speed driving and small sign noise
+    # continues through the ordinary path filter.
     path_reversal_alpha: float = 0.90
     path_reversal_min_steering: float = 25.0
     path_reversal_min_geometry: float = 0.08
     path_reversal_output_min_steering: float = 60.0
-    path_reversal_rate_limit: int = 220
+    path_reversal_rate_limit: int = 80
     # When an S-curve preview changes sign before the near-field centerline has
     # crossed the vehicle, unwind the old turn first. The new turn is blended in
     # as the near error approaches the center instead of being forced at once.
@@ -85,6 +86,7 @@ class YoloLaneFollowerConfig:
     # lateral error is still small. Convert that geometric lead into continuous
     # steering feed-forward instead of waiting until the car has drifted.
     path_heading_lead_gain: float = 180.0
+    path_heading_lead_coherent_gain: float = 195.0
     path_heading_lead_span: float = 0.15
     path_heading_lead_max_steering: float = 36.0
     # A bounded integral term removes persistent mechanical/camera centering
@@ -177,10 +179,26 @@ class YoloLaneFollower:
         path_error = self._weighted_path_error(lane)
         derivative = self._derivative(path_error, self._last_path_error)
         heading_lead = self._path_heading_lead_strength(lane, path_error)
+        near_error = (
+            float(lane.near_lateral_error_norm)
+            if lane.near_lateral_error_norm is not None
+            else float(path_error)
+        )
+        heading_lead_gain = self._path_heading_lead_gain(
+            lane,
+            path_error,
+            near_error,
+            heading_lead,
+        )
+        heading_preview_permission = self._path_heading_preview_permission(
+            lane,
+            near_error,
+        )
         heading_feedforward = (
-            self.config.path_heading_lead_gain
+            heading_lead_gain
             * float(lane.heading_error)
             * heading_lead
+            * heading_preview_permission
         )
         heading_lead_limit = max(
             0.0,
@@ -198,25 +216,26 @@ class YoloLaneFollower:
         )
         raw_steering = (
             self.config.path_lateral_gain * path_error
-            + self.config.path_heading_gain * lane.heading_error
+            + (
+                self.config.path_heading_gain
+                * lane.heading_error
+                * heading_preview_permission
+            )
             + self.config.path_derivative_gain * derivative
             + heading_feedforward
             + integral_steering
         )
-        near_error = (
-            float(lane.near_lateral_error_norm)
-            if lane.near_lateral_error_norm is not None
-            else float(path_error)
-        )
-        center_recovery = self._path_center_recovery_active(
+        center_recovery_strength = self._path_center_recovery_strength(
             lane,
             near_error,
             heading_lead,
         )
+        center_recovery = center_recovery_strength > 0.0
         if center_recovery:
             raw_steering = self._apply_path_center_recovery(
                 raw_steering,
                 near_error,
+                center_recovery_strength,
             )
         near_conflict_strength = self._path_near_conflict_strength(
             lane,
@@ -265,6 +284,23 @@ class YoloLaneFollower:
             path_error,
             raw_steering,
         )
+        # The far path and heading can reverse one frame before the near path
+        # reaches the vehicle center in an S. Let the ordinary rate limiter
+        # unwind that final old-sign error; the +/−minimum is only safe once the
+        # near field supports the requested turn beyond the noise guard.
+        reversal_near_threshold = max(
+            0.0,
+            float(self.config.path_reversal_near_guard_error),
+        )
+        near_supports_reversal = (
+            raw_steering * float(near_error) >= 0.0
+            and abs(float(near_error)) >= reversal_near_threshold
+        )
+        coherent_reversal = (
+            direction_reversal
+            and not near_conflict
+            and near_supports_reversal
+        )
 
         alpha = self._path_steering_alpha(
             raw_steering,
@@ -272,13 +308,15 @@ class YoloLaneFollower:
             heading_lead,
         )
         if center_recovery:
+            recovery_alpha = self._clip_float(
+                float(self.config.path_center_recovery_alpha),
+                0.0,
+                1.0,
+            )
             alpha = max(
                 alpha,
-                self._clip_float(
-                    float(self.config.path_center_recovery_alpha),
-                    0.0,
-                    1.0,
-                ),
+                alpha
+                + center_recovery_strength * (recovery_alpha - alpha),
             )
         if direction_reversal:
             alpha = max(
@@ -312,7 +350,7 @@ class YoloLaneFollower:
             float(self._last_steering)
             + alpha * (raw_steering - float(self._last_steering))
         )
-        if direction_reversal:
+        if coherent_reversal:
             reversal_direction = 1.0 if raw_steering >= 0.0 else -1.0
             reversal_minimum = max(
                 0.0,
@@ -331,13 +369,18 @@ class YoloLaneFollower:
             0.0,
             minimum_rate_limit=max(
                 (
-                    int(self.config.path_center_recovery_rate_limit)
+                    int(
+                        round(
+                            float(self.config.path_center_recovery_rate_limit)
+                            * center_recovery_strength
+                        )
+                    )
                     if center_recovery
                     else 0
                 ),
                 (
                     int(self.config.path_reversal_rate_limit)
-                    if direction_reversal or near_conflict
+                    if coherent_reversal
                     else 0
                 ),
                 (
@@ -374,9 +417,13 @@ class YoloLaneFollower:
         self._last_heading_error = lane.heading_error
         self._last_path_error = path_error
         self._path_heading_lead = heading_lead
+        preview_transition = (
+            heading_preview_permission < 1.0
+            and float(lane.heading_error) * float(near_error) < 0.0
+        )
         self._path_state = (
             "curve_transition"
-            if reversal_near_guard > 0.0
+            if reversal_near_guard > 0.0 or preview_transition
             else self._classify_path_state(
                 path_error,
                 lane.heading_error,
@@ -393,39 +440,54 @@ class YoloLaneFollower:
         self._lane_lost_frames = 0
         return command
 
-    def _path_center_recovery_active(
+    def _path_center_recovery_strength(
         self,
         lane: LaneGeometry,
         near_error: float,
         heading_lead: float,
-    ) -> bool:
+    ) -> float:
         reason = str(lane.reason)
         if not reason.startswith("corridor_tier1"):
-            return False
+            return 0.0
         if any(
             token in reason
             for token in ("lane_change", "crosswalk", "coast", "virtual")
         ):
-            return False
-        return (
-            float(lane.confidence) >= 0.75
-            and abs(float(near_error))
-            >= max(
-                0.0,
-                float(self.config.path_center_recovery_error_threshold),
-            )
-            and abs(float(lane.heading_error))
-            <= max(
+            return 0.0
+        threshold = max(
+            0.0,
+            float(self.config.path_center_recovery_error_threshold),
+        )
+        if (
+            float(lane.confidence) < 0.75
+            or abs(float(lane.heading_error))
+            > max(
                 0.0,
                 float(self.config.path_center_recovery_heading_limit),
             )
-            and float(heading_lead) < 0.20
+            or float(heading_lead) >= 0.20
+        ):
+            return 0.0
+
+        # A hard minimum-steering switch at ``threshold`` made a 0.054→0.072
+        # near-error change produce a 34-unit steering jump in a successful
+        # replay, even though the fitted path moved only 5 px.  Blend the
+        # recovery over one threshold-width so perception noise cannot toggle
+        # a discontinuous command, while a vehicle that is a full 2*threshold
+        # off-center still receives the configured minimum immediately.
+        span = max(threshold, 0.02)
+        ratio = self._clip_float(
+            (abs(float(near_error)) - threshold) / span,
+            0.0,
+            1.0,
         )
+        return ratio * ratio * (3.0 - 2.0 * ratio)
 
     def _apply_path_center_recovery(
         self,
         steering: float,
         near_error: float,
+        strength: float,
     ) -> float:
         minimum = max(
             0.0,
@@ -434,7 +496,9 @@ class YoloLaneFollower:
         direction = 1.0 if near_error >= 0.0 else -1.0
         if steering * direction > 0.0 and abs(steering) >= minimum:
             return steering
-        return direction * minimum
+        recovery_target = direction * minimum
+        blend = self._clip_float(float(strength), 0.0, 1.0)
+        return steering + blend * (recovery_target - steering)
 
     def _path_direction_reversal_active(
         self,
@@ -501,9 +565,11 @@ class YoloLaneFollower:
             or raw_steering * previous >= 0.0
             or raw_steering * float(near_error) >= 0.0
             or abs(heading) < minimum_geometry
-            or abs(far_error) < minimum_geometry
             or raw_steering * heading <= 0.0
-            or heading * far_error <= 0.0
+            or (
+                abs(far_error) >= minimum_geometry
+                and heading * far_error <= 0.0
+            )
         ):
             return 0.0
 
@@ -595,9 +661,9 @@ class YoloLaneFollower:
             3.0 - 2.0 * curve_ratio
         )
 
-        # Keep the sensitive near-field correction on straights. As heading
-        # grows, continuously hand over to the wider curve displacement band
-        # instead of disabling correction at one heading threshold.
+        # Small near errors must not delay a genuine curve entry. Once the car
+        # has crossed far enough toward the boundary, continuously hand control
+        # back to the near field even when the far heading is still large.
         return (
             (1.0 - heading_ratio) * error_strength
             + heading_ratio * curve_strength
@@ -755,6 +821,83 @@ class YoloLaneFollower:
         lead = max(0.0, abs(heading) - abs(reference)) / span
         confidence = self._clip_float(float(lane.confidence), 0.0, 1.0)
         return self._clip_float(lead * alignment * confidence, 0.0, 1.0)
+
+    def _path_heading_lead_gain(
+        self,
+        lane: LaneGeometry,
+        path_error: float,
+        near_error: float,
+        heading_lead: float,
+    ) -> float:
+        """Boost only a high-confidence curve whose near/far signs agree."""
+        base = float(self.config.path_heading_lead_gain)
+        maximum = max(
+            base,
+            float(self.config.path_heading_lead_coherent_gain),
+        )
+        reason = str(lane.reason)
+        heading = float(lane.heading_error)
+        far_error = float(lane.lateral_error_norm)
+        if (
+            not reason.startswith("corridor_tier1")
+            or any(
+                token in reason
+                for token in ("lane_change", "crosswalk", "coast", "virtual")
+            )
+            or float(lane.confidence) < 0.85
+            or abs(heading) <= 0.015
+            or abs(far_error) <= 0.015
+            or heading * far_error <= 0.0
+            or (
+                abs(float(near_error)) > 0.06
+                and heading * float(near_error) <= 0.0
+            )
+        ):
+            return base
+        strength = self._clip_float(
+            (float(heading_lead) - 0.25) / 0.40,
+            0.0,
+            1.0,
+        )
+        strength = strength * strength * (3.0 - 2.0 * strength)
+        return base + (maximum - base) * strength
+
+    def _path_heading_preview_permission(
+        self,
+        lane: LaneGeometry,
+        near_error: float,
+    ) -> float:
+        """Continuously phase an S-turn when near and far geometry disagree."""
+        reason = str(lane.reason)
+        heading = float(lane.heading_error)
+        far_error = float(lane.lateral_error_norm)
+        near_error = float(near_error)
+        if (
+            not reason.startswith("corridor_tier1")
+            or any(
+                token in reason
+                for token in ("lane_change", "crosswalk", "coast", "virtual")
+            )
+            or float(lane.confidence) < 0.75
+            or abs(near_error) <= 0.015
+            or heading * near_error >= 0.0
+        ):
+            return 1.0
+        if abs(far_error) <= 0.015 or heading * far_error <= 0.0:
+            return 0.0
+
+        # During an S transition the far path changes sign before the path
+        # beside the vehicle.  Let heading preview take over only as the new
+        # far displacement becomes larger than the still-opposite near
+        # displacement.  A smooth 1.25x→2x dominance band avoids both the early
+        # two-frame reversal seen in replay and a new binary steering jump.
+        dominance = abs(far_error) / max(abs(near_error), 1e-6)
+        ratio = self._clip_float(
+            (dominance - 1.25) / 0.75,
+            0.0,
+            1.0,
+        )
+        return ratio * ratio * (3.0 - 2.0 * ratio)
 
     def _path_integral_correction(
         self,

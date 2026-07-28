@@ -136,6 +136,87 @@ class YoloLaneGeometryTest(unittest.TestCase):
 
         self.assertEqual(command.steering, -70)
 
+    def test_path_center_recovery_is_continuous_at_activation_threshold(self):
+        config = YoloLaneFollowerConfig(
+            path_tracking=True,
+            path_lateral_gain=225.0,
+            path_heading_gain=0.0,
+            path_derivative_gain=0.0,
+            path_heading_lead_gain=0.0,
+            path_center_recovery_error_threshold=0.07,
+            path_center_recovery_heading_limit=0.12,
+            path_center_recovery_min_steering=60.0,
+            path_center_recovery_alpha=0.90,
+            path_center_recovery_rate_limit=120,
+            path_steering_rise_alpha=1.0,
+            path_steering_release_alpha=1.0,
+            steering_rate_limit=500,
+            min_steering_rate_limit=500,
+            max_steering=500,
+        )
+        below = YoloLaneFollower(config).plan(
+            lane_geometry(
+                lateral_error_norm=0.069,
+                heading_error=0.0,
+                near_lateral_error_norm=0.069,
+                reason="corridor_tier1",
+            )
+        )
+        above = YoloLaneFollower(config).plan(
+            lane_geometry(
+                lateral_error_norm=0.071,
+                heading_error=0.0,
+                near_lateral_error_norm=0.071,
+                reason="corridor_tier1",
+            )
+        )
+
+        self.assertLessEqual(abs(above.steering - below.steering), 2)
+
+    def test_s_curve_heading_preview_waits_for_far_path_to_dominate_near_path(self):
+        follower = YoloLaneFollower(YoloLaneFollowerConfig())
+        early = lane_geometry(
+            lateral_error_norm=0.075,
+            heading_error=0.22,
+            near_lateral_error_norm=-0.075,
+            reason="corridor_tier1",
+        )
+        established = lane_geometry(
+            lateral_error_norm=0.15,
+            heading_error=0.30,
+            near_lateral_error_norm=-0.075,
+            reason="corridor_tier1",
+        )
+
+        self.assertEqual(
+            follower._path_heading_preview_permission(early, -0.075),
+            0.0,
+        )
+        self.assertEqual(
+            follower._path_heading_preview_permission(established, -0.075),
+            1.0,
+        )
+
+    def test_s_curve_heading_preview_permission_is_continuous_and_symmetric(self):
+        follower = YoloLaneFollower(YoloLaneFollowerConfig())
+        strengths = []
+        for sign in (-1.0, 1.0):
+            lane = lane_geometry(
+                lateral_error_norm=0.121875 * sign,
+                heading_error=0.25 * sign,
+                near_lateral_error_norm=-0.075 * sign,
+                reason="corridor_tier1",
+            )
+            strengths.append(
+                follower._path_heading_preview_permission(
+                    lane,
+                    -0.075 * sign,
+                )
+            )
+
+        self.assertAlmostEqual(strengths[0], 0.5)
+        self.assertAlmostEqual(strengths[1], 0.5)
+
     def test_path_center_recovery_does_not_override_crosswalk_cache(self):
         follower = YoloLaneFollower(
             YoloLaneFollowerConfig(
@@ -272,7 +353,7 @@ class YoloLaneGeometryTest(unittest.TestCase):
         self.assertGreater(command.steering, -120)
         self.assertLess(command.steering, 0)
 
-    def test_path_near_conflict_corrects_large_local_drift_on_curve(self):
+    def test_path_near_conflict_corrects_large_local_drift_on_curve_symmetrically(self):
         follower = YoloLaneFollower(
             YoloLaneFollowerConfig(
                 path_tracking=True,
@@ -282,20 +363,19 @@ class YoloLaneGeometryTest(unittest.TestCase):
                 path_curve_guard_release_error=0.24,
             )
         )
-        lane = lane_geometry(
-            lateral_error_norm=-0.60,
-            heading_error=-0.50,
-            near_lateral_error_norm=0.17,
-            reason="corridor_tier1",
-        )
-
-        strength = follower._path_near_conflict_strength(
-            lane,
-            near_error=0.17,
-            raw_steering=-120.0,
-        )
-
-        self.assertAlmostEqual(strength, 0.50, places=2)
+        for sign in (-1.0, 1.0):
+            lane = lane_geometry(
+                lateral_error_norm=sign * 0.60,
+                heading_error=sign * 0.50,
+                near_lateral_error_norm=-sign * 0.17,
+                reason="corridor_tier1",
+            )
+            strength = follower._path_near_conflict_strength(
+                lane,
+                near_error=-sign * 0.17,
+                raw_steering=sign * 120.0,
+            )
+            self.assertAlmostEqual(strength, 0.50, places=2)
 
     def test_path_near_conflict_preserves_curve_entry_for_small_local_error(self):
         follower = YoloLaneFollower(
@@ -322,7 +402,64 @@ class YoloLaneGeometryTest(unittest.TestCase):
 
         self.assertEqual(strength, 0.0)
 
-    def test_path_near_conflict_does_not_override_crosswalk_or_lane_change(self):
+    def test_path_near_conflict_does_not_force_one_frame_reversal_minimum(self):
+        config = YoloLaneFollowerConfig(
+            path_tracking=True,
+            path_lateral_gain=225.0,
+            path_heading_gain=65.0,
+            path_derivative_gain=18.0,
+            path_near_weight=1.45,
+            path_far_weight=0.55,
+            path_steering_rise_alpha=0.72,
+            path_steering_release_alpha=0.28,
+            path_center_recovery_error_threshold=0.07,
+            path_center_recovery_heading_limit=0.12,
+            path_near_conflict_error_threshold=0.035,
+            path_near_conflict_release_alpha=0.90,
+            path_near_conflict_heading_limit=0.18,
+            path_curve_guard_near_error=0.10,
+            path_curve_guard_release_error=0.24,
+            path_heading_lead_gain=170.0,
+            path_heading_lead_coherent_gain=195.0,
+            path_heading_lead_span=0.16,
+            path_heading_lead_max_steering=32.0,
+            path_reversal_alpha=0.90,
+            path_reversal_min_steering=25.0,
+            path_reversal_min_geometry=0.05,
+            path_reversal_output_min_steering=70.0,
+            path_reversal_rate_limit=220,
+            steering_rate_limit=80,
+            min_steering_rate_limit=35,
+            steering_release_rate_limit=55,
+            max_steering=150,
+        )
+        for sign in (-1, 1):
+            follower = YoloLaneFollower(config)
+            previous = 150 * sign
+            follower.accept_applied_command(
+                ControlCommand(
+                    speed=255,
+                    steering=previous,
+                    reason="previous_curve",
+                )
+            )
+
+            command = follower.plan(
+                lane_geometry(
+                    lateral_error_norm=0.275 * sign,
+                    heading_error=0.725 * sign,
+                    near_lateral_error_norm=-0.229 * sign,
+                    reason="corridor_tier1",
+                )
+            )
+
+            self.assertLessEqual(
+                abs(command.steering - previous),
+                config.steering_rate_limit,
+            )
+            self.assertGreaterEqual(command.steering * sign, 0)
+
+    def test_path_near_conflict_does_not_override_special_path_owners(self):
         follower = YoloLaneFollower(
             YoloLaneFollowerConfig(
                 path_tracking=True,
@@ -331,10 +468,11 @@ class YoloLaneGeometryTest(unittest.TestCase):
                 path_curve_guard_release_error=0.24,
             )
         )
-
         for reason in (
             "corridor_tier1:crosswalk_priority_hold",
-            "corridor_tier1:lane_change",
+            "corridor_tier1:lane_change_scurve",
+            "corridor_tier1:coast",
+            "corridor_tier1:virtual",
         ):
             lane = lane_geometry(
                 lateral_error_norm=-0.60,
@@ -342,12 +480,87 @@ class YoloLaneGeometryTest(unittest.TestCase):
                 near_lateral_error_norm=0.20,
                 reason=reason,
             )
-            strength = follower._path_near_conflict_strength(
-                lane,
-                near_error=0.20,
-                raw_steering=-120.0,
+            self.assertEqual(
+                follower._path_near_conflict_strength(
+                    lane,
+                    near_error=0.20,
+                    raw_steering=-120.0,
+                ),
+                0.0,
             )
-            self.assertEqual(strength, 0.0)
+
+    def test_path_reversal_near_guard_covers_small_far_error_at_s_transition(self):
+        follower = YoloLaneFollower(
+            YoloLaneFollowerConfig(
+                path_tracking=True,
+                path_reversal_min_steering=25.0,
+                path_reversal_min_geometry=0.05,
+                path_reversal_near_guard_error=0.025,
+                path_reversal_near_full_error=0.12,
+            )
+        )
+        follower.accept_applied_command(
+            ControlCommand(speed=255, steering=-87, reason="previous_curve")
+        )
+        transition = lane_geometry(
+            lateral_error_norm=0.010,
+            heading_error=0.180,
+            near_lateral_error_norm=-0.117,
+            reason="corridor_tier1",
+        )
+
+        guarded = follower._path_reversal_near_guard_strength(
+            transition,
+            near_error=-0.117,
+            raw_steering=50.0,
+        )
+        released = follower._path_reversal_near_guard_strength(
+            transition,
+            near_error=-0.022,
+            raw_steering=50.0,
+        )
+
+        self.assertGreater(guarded, 0.95)
+        self.assertEqual(released, 0.0)
+
+    def test_heading_lead_uses_195_only_for_coherent_curve(self):
+        follower = YoloLaneFollower(
+            YoloLaneFollowerConfig(
+                path_heading_lead_gain=170.0,
+                path_heading_lead_coherent_gain=195.0,
+            )
+        )
+        coherent = lane_geometry(
+            lateral_error_norm=-0.12,
+            heading_error=-0.40,
+            near_lateral_error_norm=-0.05,
+            reason="corridor_tier1",
+        )
+        conflict = lane_geometry(
+            lateral_error_norm=-0.12,
+            heading_error=-0.40,
+            near_lateral_error_norm=0.12,
+            reason="corridor_tier1",
+        )
+
+        self.assertEqual(
+            follower._path_heading_lead_gain(
+                coherent,
+                path_error=-0.10,
+                near_error=-0.05,
+                heading_lead=1.0,
+            ),
+            195.0,
+        )
+        self.assertEqual(
+            follower._path_heading_lead_gain(
+                conflict,
+                path_error=-0.10,
+                near_error=0.12,
+                heading_lead=1.0,
+            ),
+            170.0,
+        )
 
     def test_path_reversal_waits_for_near_center_before_opposite_turn(self):
         follower = YoloLaneFollower(
@@ -403,9 +616,18 @@ class YoloLaneGeometryTest(unittest.TestCase):
             )
         )
 
-        self.assertGreater(released.steering, 0)
+        self.assertGreater(released.steering, guarded.steering)
+        crossed = follower.plan(
+            lane_geometry(
+                lateral_error_norm=0.12,
+                heading_error=0.36,
+                near_lateral_error_norm=-0.01,
+                reason="corridor_tier1",
+            )
+        )
+        self.assertGreater(crossed.steering, 0)
 
-    def test_path_reversal_guard_does_not_delay_curve_entry_from_straight(self):
+    def test_path_reversal_guard_phases_sign_split_even_from_straight(self):
         follower = YoloLaneFollower(
             YoloLaneFollowerConfig(
                 path_tracking=True,
@@ -437,7 +659,82 @@ class YoloLaneGeometryTest(unittest.TestCase):
             )
         )
 
-        self.assertGreater(command.steering, 0)
+        self.assertLessEqual(command.steering, 0)
+        self.assertIn("curve_transition", command.reason)
+
+    def test_path_reversal_does_not_jump_to_minimum_before_near_sign_crosses(self):
+        config = YoloLaneFollowerConfig(
+            path_tracking=True,
+            path_lateral_gain=225.0,
+            path_heading_gain=65.0,
+            path_derivative_gain=0.0,
+            path_near_weight=1.0,
+            path_far_weight=1.0,
+            path_heading_lead_gain=170.0,
+            path_heading_lead_span=0.16,
+            path_heading_lead_max_steering=32.0,
+            path_center_recovery_error_threshold=2.0,
+            path_near_conflict_error_threshold=0.035,
+            path_reversal_alpha=0.90,
+            path_reversal_min_steering=25.0,
+            path_reversal_min_geometry=0.05,
+            path_reversal_output_min_steering=70.0,
+            path_reversal_rate_limit=220,
+            path_reversal_near_guard_error=0.025,
+            path_reversal_near_full_error=0.12,
+            steering_rate_limit=80,
+            min_steering_rate_limit=35,
+            steering_release_rate_limit=55,
+            max_steering=150,
+        )
+        for sign in (-1, 1):
+            follower = YoloLaneFollower(config)
+            previous = 80 * sign
+            follower.accept_applied_command(
+                ControlCommand(255, previous, reason="previous_curve")
+            )
+
+            command = follower.plan(
+                lane_geometry(
+                    lateral_error_norm=-0.20 * sign,
+                    heading_error=-0.30 * sign,
+                    near_lateral_error_norm=0.024 * sign,
+                    reason="corridor_tier1",
+                )
+            )
+
+            self.assertLessEqual(
+                abs(command.steering - previous),
+                config.steering_rate_limit,
+            )
+            self.assertGreaterEqual(command.steering * sign, 0)
+
+            near_zero = follower.plan(
+                lane_geometry(
+                    lateral_error_norm=-0.20 * sign,
+                    heading_error=-0.30 * sign,
+                    near_lateral_error_norm=-0.001 * sign,
+                    reason="corridor_tier1",
+                )
+            )
+            self.assertLessEqual(
+                abs(near_zero.steering - command.steering),
+                config.steering_rate_limit,
+            )
+
+            crossed = follower.plan(
+                lane_geometry(
+                    lateral_error_norm=-0.20 * sign,
+                    heading_error=-0.30 * sign,
+                    near_lateral_error_norm=-0.030 * sign,
+                    reason="corridor_tier1",
+                )
+            )
+            self.assertLessEqual(
+                abs(crossed.steering - near_zero.steering),
+                config.steering_rate_limit,
+            )
+            self.assertLess(crossed.steering * sign, 0)
 
     def test_path_curve_guard_caps_inner_cut_while_near_field_is_centered(self):
         follower = YoloLaneFollower(
@@ -1161,6 +1458,7 @@ class YoloLaneGeometryTest(unittest.TestCase):
         bev_config = build_bev_corridor_config(args)
         follower_config = build_follower_config(args)
 
+        self.assertEqual(args.fixed_speed_brake_policy, "red-light-only")
         self.assertAlmostEqual(bev_config.lookahead_y_ratio, 0.45)
         self.assertAlmostEqual(bev_config.centerline_bias, 0.46)
         self.assertAlmostEqual(bev_config.vehicle_center_x_offset_ratio, 0.04)
@@ -1187,7 +1485,7 @@ class YoloLaneGeometryTest(unittest.TestCase):
         lane_change_config = build_lane_change_config(args)
 
         self.assertEqual(lane_change_config.mode, "external")
-        self.assertFalse(lane_change_config.smooth_avoidance)
+        self.assertTrue(lane_change_config.smooth_avoidance)
         self.assertGreater(lane_change_config.return_duration_scale, 1.0)
         self.assertLess(lane_change_config.transition_seconds, 2.0)
         self.assertGreaterEqual(lane_change_config.speed_cap, 85)
@@ -1437,6 +1735,100 @@ class YoloLaneGeometryTest(unittest.TestCase):
 
     def test_drive_priority_never_overrides_brake_with_fixed_speed(self):
         args = parse_args(["--speed", "255", "--fixed-speed", "on"])
+        policy = DrivePriorityController(
+            CommandSafetyFilter(args),
+            traffic_light_enabled=True,
+        )
+        lane = lane_geometry(lateral_error_norm=0.0, heading_error=0.0)
+
+        command = policy.apply(
+            ControlCommand(255, 0, brake=False, reason="lane"),
+            DummyMask("lane-center+right-lane-side"),
+            lane,
+            True,
+            DummyObstacleMode(),
+            DummyTrafficLight(stop=True),
+        )
+
+        self.assertTrue(command.brake)
+        self.assertEqual(command.speed, 0)
+        self.assertEqual(command.reason, "traffic_light:red_contact")
+
+    def test_red_light_only_policy_releases_lane_loss_brake_at_255(self):
+        args = parse_args(
+            [
+                "--speed",
+                "255",
+                "--fixed-speed",
+                "on",
+                "--fixed-speed-brake-policy",
+                "red-light-only",
+            ]
+        )
+        policy = DrivePriorityController(
+            CommandSafetyFilter(args),
+            traffic_light_enabled=False,
+        )
+        lane = lane_geometry(lateral_error_norm=0.0, heading_error=0.0)
+
+        command = policy.apply(
+            ControlCommand.stop("lane_lost:no_sampled_rows"),
+            DummyMask("lane-center+right-lane-side"),
+            lane,
+            True,
+            DummyObstacleMode(),
+            DummyTrafficLight(),
+        )
+
+        self.assertFalse(command.brake)
+        self.assertEqual(command.speed, 255)
+        self.assertEqual(command.steering, 0)
+        self.assertIn("non_mission_brake_release", command.reason)
+
+    def test_red_light_only_policy_releases_virtual_bootstrap_brake(self):
+        args = parse_args(
+            [
+                "--speed",
+                "255",
+                "--fixed-speed",
+                "on",
+                "--fixed-speed-brake-policy",
+                "red-light-only",
+                "--virtual-lane-min-reliable-frames",
+                "1",
+            ]
+        )
+        policy = DrivePriorityController(
+            CommandSafetyFilter(args),
+            traffic_light_enabled=False,
+        )
+        lane = lane_geometry(lateral_error_norm=0.0, heading_error=0.0)
+
+        command = policy.apply(
+            ControlCommand(255, 0, brake=False, reason="lane"),
+            DummyMask("virtual-lane-center+right-lane-side"),
+            lane,
+            True,
+            DummyObstacleMode(),
+            DummyTrafficLight(),
+        )
+
+        self.assertFalse(command.brake)
+        self.assertEqual(command.speed, 255)
+        self.assertIn("virtual_bootstrap", command.reason)
+        self.assertIn("non_mission_brake_release", command.reason)
+
+    def test_red_light_only_policy_preserves_required_signal_stop(self):
+        args = parse_args(
+            [
+                "--speed",
+                "255",
+                "--fixed-speed",
+                "on",
+                "--fixed-speed-brake-policy",
+                "red-light-only",
+            ]
+        )
         policy = DrivePriorityController(
             CommandSafetyFilter(args),
             traffic_light_enabled=True,

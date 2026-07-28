@@ -1518,6 +1518,8 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         mode._last_output_lane = shifted
         mode._last_reliable_output_lane = shifted
         mode._result = replace(mode._result, offset_px=-60.0)
+        mode._lane_change.state = "lane1"
+        mode._lane_change._locked_lane_width_px = 60.0
         estimator.last_crosswalk_visible = True
         current = replace(
             base,

@@ -17,6 +17,7 @@ fi
 exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --speed 255 \
   --fixed-speed on \
+  --fixed-speed-brake-policy red-light-only \
   --max-speed 255 \
   --min-curve-speed 255 \
   --speed-curve-slowdown 0 \
@@ -37,7 +38,7 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-reversal-min-steering 25 \
   --path-reversal-min-geometry 0.05 \
   --path-reversal-output-min-steering 70 \
-  --path-reversal-rate-limit 220 \
+  --path-reversal-rate-limit 80 \
   --path-reversal-near-guard-error 0.025 \
   --path-reversal-near-full-error 0.12 \
   --path-near-conflict-error-threshold 0.035 \
@@ -48,6 +49,7 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-curve-guard-release-error 0.24 \
   --path-curve-guard-steering-limit 105 \
   --path-heading-lead-gain 170 \
+  --path-heading-lead-coherent-gain 195 \
   --path-heading-lead-span 0.16 \
   --path-heading-lead-max-steering 32 \
   --path-integral-gain 45 \
@@ -56,8 +58,8 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --bev-lookahead 0.32 \
   --bev-center-smooth 0.32 \
   --bev-heading-smooth 1.0 \
-  --bev-path-smooth 0.90 \
-  --bev-path-max-step 80 \
+  --bev-path-smooth 0.65 \
+  --bev-path-max-step 55 \
   --vehicle-center-offset 0.045 \
   --corridor-centerline-bias 0.50 \
   --corridor-crosswalk-option a \
@@ -88,14 +90,18 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --obstacle-visual-commit-frame-y 0.40 \
   --obstacle-range-visual-fallback off \
   --lane-change-target-width-px 160 \
+  --lane-change-target-capture-error 0.30 \
   --lane-change-steering-override off \
   --lane-change-steering-min 80 \
   --lane-change-steering-boost 25 \
   --lane-change-steering-cap 150 \
   --lane-change-steering-slew-limit 35 \
-  --lane-change-unreliable-steering-cap 120 \
+  --lane-change-unreliable-steering-cap 90 \
   --lane-change-stabilizing-steering-min 0 \
   --lane-change-transition-seconds 0.85 \
+  --lane-change-spatial-lead 0.10 \
+  --lane-change-unreliable-hold-seconds 0.25 \
+  --lane-change-max-transition-seconds 4.0 \
   --lane-change-return-duration-scale 1.35 \
   --lane-change-return-steering-cap 115 \
   --lane-change-return-stabilizing-steering-cap 90 \
