@@ -82,7 +82,9 @@ class PaperControllerConfig:
     center_observation_scans: int = 4
     side_entry_confirm_scans: int = 3
     cd_direct_reverse_min_distance_mm: float = 600.0
-    park_finish_cd_missing_scans: int = 3
+    park_finish_side_angle_half_width_deg: float = 10.0
+    park_finish_side_max_distance_mm: float = 1500.0
+    park_finish_side_clear_scans: int = 3
     cd_center_confirm_scans: int = 5
     paper_max_steering: float = 7.0
     actuator_max_steering: int = 150
@@ -293,9 +295,21 @@ def _validate(config: AppConfig) -> None:
         raise ValueError(
             "cd_direct_reverse_min_distance_mm must be positive"
         )
-    if controller.park_finish_cd_missing_scans < 1:
+    if not (
+        0.0
+        < controller.park_finish_side_angle_half_width_deg
+        <= 20.0
+    ):
         raise ValueError(
-            "park_finish_cd_missing_scans must be positive"
+            "park_finish_side_angle_half_width_deg must be in (0, 20]"
+        )
+    if controller.park_finish_side_max_distance_mm <= 0.0:
+        raise ValueError(
+            "park_finish_side_max_distance_mm must be positive"
+        )
+    if controller.park_finish_side_clear_scans < 1:
+        raise ValueError(
+            "park_finish_side_clear_scans must be positive"
         )
     if controller.cd_center_confirm_scans < 1:
         raise ValueError("cd_center_confirm_scans must be positive")

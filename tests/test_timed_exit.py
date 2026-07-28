@@ -5,6 +5,7 @@ from skku_autocar.config import PaperControllerConfig, RearLidarConfig
 from skku_autocar.perception.rear_lidar import (
     RearLidarObservation,
     RearLidarPerception,
+    RearPoint,
 )
 from skku_autocar.planning.paper_controller import PaperParkingController
 from skku_autocar.sensors.lidar import LidarPoint, LidarScan
@@ -27,7 +28,7 @@ class TimedExitTest(unittest.TestCase):
         self.assertAlmostEqual(observation.c_y_back_mm, 173.65, places=2)
         self.assertAlmostEqual(observation.d_y_back_mm, 173.65, places=2)
 
-    def test_both_cd_missing_for_confirmed_scans_finishes_parking(self):
+    def test_both_side_90_regions_clear_finishes_parking(self):
         config = PaperControllerConfig()
         controller = PaperParkingController(config)
         controller.state = ParkingState.REVERSE_STRAIGHT
@@ -39,6 +40,10 @@ class TimedExitTest(unittest.TestCase):
                 valid=True,
                 dist_c_mm=650.0,
                 dist_d_mm=850.0,
+                points=(
+                    RearPoint(-90.0, 650.0, -650.0, 0.0, 15),
+                    RearPoint(90.0, 850.0, 850.0, 0.0, 15),
+                ),
             ),
             1.0,
         )
@@ -67,7 +72,7 @@ class TimedExitTest(unittest.TestCase):
         self.assertTrue(command.brake)
         self.assertEqual(
             command.reason,
-            "paper_both_cd_missing_finish:3/3",
+            "paper_both_side_90_clear_finish:3/3",
         )
 
     def test_parked_runs_forward_right_then_straight_without_lidar(self):
