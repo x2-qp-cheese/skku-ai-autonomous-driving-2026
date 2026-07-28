@@ -16,6 +16,9 @@ class ParkingState(str, Enum):
     REVERSE_STRAIGHT = "reverse_straight"
     RECOVERY_FORWARD = "recovery_forward"
     PARKED = "parked"
+    EXIT_FORWARD = "exit_forward"
+    EXIT_TURN_RIGHT = "exit_turn_right"
+    EXIT_STRAIGHT = "exit_straight"
 
 
 @dataclass(frozen=True)

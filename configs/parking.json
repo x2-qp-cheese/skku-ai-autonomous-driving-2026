@@ -39,7 +39,7 @@
     "side_line_max_disagreement_deg": 20.0
   },
   "controller": {
-    "forward_speed": 100,
+    "forward_speed": 50,
     "reverse_speed": -80,
     "inside_reverse_speed": -50,
     "parallel_forward_speed": 35,
@@ -77,6 +77,15 @@
     "parallel_min_improvement_deg": 0.75,
     "dist_bias_cd_threshold_mm": 250.0,
     "recovery_forward_s": 3.0,
+    "park_hold_s": 4.0,
+    "exit_speed": 50,
+    "exit_side_seen_confirm_scans": 3,
+    "exit_clear_confirm_scans": 3,
+    "exit_turn_steering": 150,
+    "exit_turn_target_angle_deg": 90.0,
+    "exit_turn_confirm_scans": 3,
+    "exit_turn_pair_hold_scans": 5,
+    "exit_turn_timeout_s": 6.0,
     "command_rate_hz": 20.0
   },
   "runtime": {

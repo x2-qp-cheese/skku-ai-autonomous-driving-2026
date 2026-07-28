@@ -101,6 +101,15 @@ class PaperControllerConfig:
     parallel_min_improvement_deg: float = 0.75
     dist_bias_cd_threshold_mm: float = 250.0
     recovery_forward_s: float = 3.0
+    park_hold_s: float = 4.0
+    exit_speed: int = 50
+    exit_side_seen_confirm_scans: int = 3
+    exit_clear_confirm_scans: int = 3
+    exit_turn_steering: int = 150
+    exit_turn_target_angle_deg: float = 90.0
+    exit_turn_confirm_scans: int = 3
+    exit_turn_pair_hold_scans: int = 5
+    exit_turn_timeout_s: float = 6.0
     command_rate_hz: float = 20.0
 
 
@@ -346,5 +355,39 @@ def _validate(config: AppConfig) -> None:
         raise ValueError(
             "finish_missing_confirm_scans must be positive"
         )
+    if not 3.0 <= controller.park_hold_s <= 5.0:
+        raise ValueError("park_hold_s must be in [3, 5]")
+    if controller.exit_speed <= 0:
+        raise ValueError("exit_speed must be positive")
+    if controller.exit_side_seen_confirm_scans < 1:
+        raise ValueError(
+            "exit_side_seen_confirm_scans must be positive"
+        )
+    if controller.exit_clear_confirm_scans < 1:
+        raise ValueError(
+            "exit_clear_confirm_scans must be positive"
+        )
+    if not (
+        0
+        < controller.exit_turn_steering
+        <= controller.actuator_max_steering
+    ):
+        raise ValueError(
+            "exit_turn_steering must be in actuator range"
+        )
+    if not 0.0 < controller.exit_turn_target_angle_deg <= 110.0:
+        raise ValueError(
+            "exit_turn_target_angle_deg must be in (0, 110]"
+        )
+    if controller.exit_turn_confirm_scans < 1:
+        raise ValueError(
+            "exit_turn_confirm_scans must be positive"
+        )
+    if controller.exit_turn_pair_hold_scans < 1:
+        raise ValueError(
+            "exit_turn_pair_hold_scans must be positive"
+        )
+    if controller.exit_turn_timeout_s <= 0.0:
+        raise ValueError("exit_turn_timeout_s must be positive")
     if controller.command_rate_hz <= 0.0:
         raise ValueError("command_rate_hz must be positive")
