@@ -22,6 +22,7 @@ class PaperParkingDebug:
     prealign_near_seen: bool = False
     prealign_ready_scans: int = 0
     pair_hold_scans: int = 0
+    realigning_after_dropout: bool = False
     center_observation_scans: int = 0
     reason: str = "idle"
 
@@ -46,6 +47,7 @@ class PaperParkingController:
         )
         self._pair_missing_scans = 0
         self._pair_outlier_rejected = False
+        self._realigning_after_dropout = False
         self._center_scan_count = 0
         self._center_c_samples: Deque[float] = deque(
             maxlen=self.config.center_observation_scans
@@ -134,13 +136,18 @@ class PaperParkingController:
             return self._forward("paper_search_second_vehicle")
 
         self._detected_vehicle_count = 2
+        self._realigning_after_dropout = False
         self._prealign_near_seen = observation.prealign_near
         self._prealign_ready_scans = 0
         self._reset_pair_tracking(observation)
         self.state = ParkingState.PREALIGN_LEFT
         if not observation.pair.valid:
-            return self._stop(
-                "figure7_second_vehicle_waiting_for_valid_ab"
+            return self._drive(
+                self.config.forward_speed,
+                self._paper_to_actuator(
+                    -self.config.paper_max_steering
+                ),
+                "figure7_left_forward_acquiring_valid_ab",
             )
         return self._drive(
             self.config.forward_speed,
@@ -157,8 +164,12 @@ class PaperParkingController:
         pair, pair_held = self._control_pair(observation)
         if not pair.valid:
             self._prealign_ready_scans = 0
-            return self._stop(
-                "figure7_waiting_for_stable_ab "
+            return self._drive(
+                self.config.forward_speed,
+                self._paper_to_actuator(
+                    -self.config.paper_max_steering
+                ),
+                "figure7_left_forward_reacquire_ab "
                 "missing=%d/%d"
                 % (
                     self._pair_missing_scans,
@@ -171,8 +182,11 @@ class PaperParkingController:
             self._prealign_near_seen = True
 
         near_cycle_complete = (
-            self._prealign_near_seen
-            and not observation.prealign_near
+            self._realigning_after_dropout
+            or (
+                self._prealign_near_seen
+                and not observation.prealign_near
+            )
         )
         ready_now = (
             prospective_steering > 0.0
@@ -189,6 +203,7 @@ class PaperParkingController:
             self._prealign_ready_scans
             >= self.config.prealign_clear_confirm_scans
         ):
+            self._realigning_after_dropout = False
             self.state = ParkingState.REVERSE_ALIGN
             return self._reverse_align(observation)
 
@@ -216,22 +231,37 @@ class PaperParkingController:
         observation: RearLidarObservation,
     ) -> ControlCommand:
         if observation.near:
-            if not self._reverse_motion_started:
+            if (
+                self._reverse_motion_started
+                and observation.dist_c_mm is not None
+                and observation.dist_d_mm is not None
+            ):
+                self.state = ParkingState.CENTER_CHECK
+                self._reset_center_observation()
                 return self._stop(
-                    "near_before_valid_reverse_motion"
+                    "figure9_near_with_both_cd_stop_and_check"
                 )
-            self.state = ParkingState.CENTER_CHECK
-            self._reset_center_observation()
-            return self._stop("figure9_near_stop_and_check_dist_cd")
+            return self._start_lidar_realign(
+                observation,
+                "near_without_both_cd_not_inside_gap",
+            )
 
         pair, pair_held = self._control_pair(observation)
         if not pair.valid:
-            return self._stop(
-                "paper_ab_dropout_stop missing=%d/%d"
-                % (
-                    self._pair_missing_scans,
-                    self.config.pair_hold_scans,
+            if (
+                self._reverse_motion_started
+                and observation.dist_c_mm is not None
+                and observation.dist_d_mm is not None
+            ):
+                self.state = ParkingState.CENTER_CHECK
+                self._reset_center_observation()
+                return self._stop(
+                    "ab_left_fov_both_cd_visible_center_check"
                 )
+
+            return self._start_lidar_realign(
+                observation,
+                "ab_dropout_not_inside_gap",
             )
 
         paper_steering, angle_term, distance_term = (
@@ -248,6 +278,9 @@ class PaperParkingController:
             prealign_near_seen=self._prealign_near_seen,
             prealign_ready_scans=self._prealign_ready_scans,
             pair_hold_scans=self._pair_missing_scans,
+            realigning_after_dropout=(
+                self._realigning_after_dropout
+            ),
             reason="equation_5_reverse",
         )
         self._reverse_motion_started = True
@@ -265,6 +298,30 @@ class PaperParkingController:
                 bias_ab,
                 paper_steering,
                 "held" if pair_held else "filtered",
+            ),
+        )
+
+    def _start_lidar_realign(
+        self,
+        observation: RearLidarObservation,
+        reason: str,
+    ) -> ControlCommand:
+        self.state = ParkingState.PREALIGN_LEFT
+        self._reverse_motion_started = False
+        self._realigning_after_dropout = True
+        self._prealign_near_seen = observation.prealign_near
+        self._prealign_ready_scans = 0
+        self._reset_pair_tracking(observation)
+        return self._drive(
+            self.config.forward_speed,
+            self._paper_to_actuator(
+                -self.config.paper_max_steering
+            ),
+            "%s_left_forward C=%s D=%s"
+            % (
+                reason,
+                observation.dist_c_mm is not None,
+                observation.dist_d_mm is not None,
             ),
         )
 
@@ -440,6 +497,7 @@ class PaperParkingController:
         self._last_pair_timestamp: Optional[float] = None
         self._pair_missing_scans = 0
         self._pair_outlier_rejected = False
+        self._realigning_after_dropout = False
         self._reset_center_observation()
         self._finish_missing_scans = 0
 
@@ -623,6 +681,9 @@ class PaperParkingController:
             prealign_near_seen=self._prealign_near_seen,
             prealign_ready_scans=self._prealign_ready_scans,
             pair_hold_scans=self._pair_missing_scans,
+            realigning_after_dropout=(
+                self._realigning_after_dropout
+            ),
             center_observation_scans=self._center_scan_count,
             reason=reason,
         )
