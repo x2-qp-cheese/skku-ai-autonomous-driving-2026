@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from statistics import median
+from typing import Deque, Optional, Tuple
 
 from ..config import PaperControllerConfig
 from ..perception.rear_lidar import RearLidarObservation, TangentPair
@@ -17,26 +19,47 @@ class PaperParkingDebug:
     distance_term: Optional[float] = None
     distance_bias_ab_mm: Optional[float] = None
     distance_bias_cd_mm: Optional[float] = None
+    prealign_near_seen: bool = False
+    prealign_ready_scans: int = 0
+    pair_hold_scans: int = 0
+    center_observation_scans: int = 0
     reason: str = "idle"
 
 
 class PaperParkingController:
-    """Literal implementation of Hong et al., Figure 9."""
+    """Figure-9 controller with scan-confirmed paper measurements."""
 
     def __init__(self, config: PaperControllerConfig):
         self.config = config
         self.state = ParkingState.IDLE
         self.debug = PaperParkingDebug()
+        self.control_pair = TangentPair()
         self._detected_vehicle_count = 0
         self._recovery_started_at = 0.0
         self._reverse_motion_started = False
-        self._prealign_target_scans = 0
+        self._last_lidar_timestamp: Optional[float] = None
+        self._is_new_scan = False
+        self._prealign_near_seen = False
+        self._prealign_ready_scans = 0
+        self._pair_samples: Deque[TangentPair] = deque(
+            maxlen=self.config.pair_filter_scans
+        )
+        self._pair_missing_scans = 0
+        self._pair_outlier_rejected = False
+        self._center_scan_count = 0
+        self._center_c_samples: Deque[float] = deque(
+            maxlen=self.config.center_observation_scans
+        )
+        self._center_d_samples: Deque[float] = deque(
+            maxlen=self.config.center_observation_scans
+        )
+        self._finish_missing_scans = 0
 
     def start(self) -> None:
         self._detected_vehicle_count = 0
         self._recovery_started_at = 0.0
         self._reverse_motion_started = False
-        self._prealign_target_scans = 0
+        self._reset_measurement_state()
         self.state = ParkingState.SEARCH_FIRST_CAR
         self._set_debug("paper_search_first_vehicle")
 
@@ -44,7 +67,7 @@ class PaperParkingController:
         self._detected_vehicle_count = 0
         self._recovery_started_at = 0.0
         self._reverse_motion_started = False
-        self._prealign_target_scans = 0
+        self._reset_measurement_state()
         self.state = ParkingState.IDLE
         self._set_debug("idle")
 
@@ -59,6 +82,12 @@ class PaperParkingController:
             return self._stop("paper_parking_complete")
         if not observation.valid:
             return self._stop("waiting_for_rear_lidar")
+
+        self._is_new_scan = (
+            observation.timestamp != self._last_lidar_timestamp
+        )
+        if self._is_new_scan:
+            self._last_lidar_timestamp = observation.timestamp
 
         if self.state == ParkingState.SEARCH_FIRST_CAR:
             return self._search_first_car(observation)
@@ -105,7 +134,9 @@ class PaperParkingController:
             return self._forward("paper_search_second_vehicle")
 
         self._detected_vehicle_count = 2
-        self._prealign_target_scans = 0
+        self._prealign_near_seen = observation.prealign_near
+        self._prealign_ready_scans = 0
+        self._reset_pair_tracking(observation)
         self.state = ParkingState.PREALIGN_LEFT
         if not observation.pair.valid:
             return self._stop(
@@ -123,24 +154,40 @@ class PaperParkingController:
         self,
         observation: RearLidarObservation,
     ) -> ControlCommand:
-        pair = observation.pair
+        pair, pair_held = self._control_pair(observation)
         if not pair.valid:
-            self._prealign_target_scans = 0
-            return self._stop("figure7_waiting_for_valid_ab")
+            self._prealign_ready_scans = 0
+            return self._stop(
+                "figure7_waiting_for_stable_ab "
+                "missing=%d/%d"
+                % (
+                    self._pair_missing_scans,
+                    self.config.pair_hold_scans,
+                )
+            )
 
         prospective_steering, _, _ = self._paper_steering(pair)
-        if (
-            pair.angle_bisector_deg
-            <= self.config.prealign_bisector_target_deg
-            and prospective_steering > 0.0
-        ):
-            self._prealign_target_scans += 1
-        else:
-            self._prealign_target_scans = 0
+        if self._is_new_scan and observation.prealign_near:
+            self._prealign_near_seen = True
+
+        near_cycle_complete = (
+            self._prealign_near_seen
+            and not observation.prealign_near
+        )
+        ready_now = (
+            prospective_steering > 0.0
+            and near_cycle_complete
+            and not pair_held
+        )
+        if self._is_new_scan:
+            if ready_now:
+                self._prealign_ready_scans += 1
+            else:
+                self._prealign_ready_scans = 0
 
         if (
-            self._prealign_target_scans
-            >= self.config.prealign_confirm_scans
+            self._prealign_ready_scans
+            >= self.config.prealign_clear_confirm_scans
         ):
             self.state = ParkingState.REVERSE_ALIGN
             return self._reverse_align(observation)
@@ -152,15 +199,15 @@ class PaperParkingController:
             ),
             (
                 "figure7_t_entry_left "
-                "bisector=%.1f target<=%.1f "
+                "nearSeen=%s nearNow=%s "
                 "nextEq5=%+.2f confirm=%d/%d"
             )
             % (
-                pair.angle_bisector_deg,
-                self.config.prealign_bisector_target_deg,
+                self._prealign_near_seen,
+                observation.prealign_near,
                 prospective_steering,
-                self._prealign_target_scans,
-                self.config.prealign_confirm_scans,
+                self._prealign_ready_scans,
+                self.config.prealign_clear_confirm_scans,
             ),
         )
 
@@ -174,11 +221,18 @@ class PaperParkingController:
                     "near_before_valid_reverse_motion"
                 )
             self.state = ParkingState.CENTER_CHECK
+            self._reset_center_observation()
             return self._stop("figure9_near_stop_and_check_dist_cd")
 
-        pair = observation.pair
+        pair, pair_held = self._control_pair(observation)
         if not pair.valid:
-            return self._stop("paper_cannot_calculate_steering")
+            return self._stop(
+                "paper_ab_dropout_stop missing=%d/%d"
+                % (
+                    self._pair_missing_scans,
+                    self.config.pair_hold_scans,
+                )
+            )
 
         paper_steering, angle_term, distance_term = (
             self._paper_steering(pair)
@@ -191,6 +245,9 @@ class PaperParkingController:
             angle_term=angle_term,
             distance_term=distance_term,
             distance_bias_ab_mm=bias_ab,
+            prealign_near_seen=self._prealign_near_seen,
+            prealign_ready_scans=self._prealign_ready_scans,
+            pair_hold_scans=self._pair_missing_scans,
             reason="equation_5_reverse",
         )
         self._reverse_motion_started = True
@@ -201,12 +258,13 @@ class PaperParkingController:
             ),
             reason=(
                 "eq5_reverse bisector=%+.1f biasAB=%+.0f "
-                "paperSteer=%+.2f"
+                "paperSteer=%+.2f pair=%s"
             )
             % (
                 pair.angle_bisector_deg,
                 bias_ab,
                 paper_steering,
+                "held" if pair_held else "filtered",
             ),
         )
 
@@ -215,19 +273,57 @@ class PaperParkingController:
         observation: RearLidarObservation,
         now: float,
     ) -> ControlCommand:
-        dist_c = observation.dist_c_mm
-        dist_d = observation.dist_d_mm
+        if self._is_new_scan:
+            self._center_scan_count += 1
+            if observation.dist_c_mm is not None:
+                self._center_c_samples.append(
+                    observation.dist_c_mm
+                )
+            if observation.dist_d_mm is not None:
+                self._center_d_samples.append(
+                    observation.dist_d_mm
+                )
 
-        if dist_c is None and dist_d is None:
+        if (
+            self._center_scan_count
+            < self.config.center_observation_scans
+        ):
+            return self._stop(
+                "paper_collecting_cd scans=%d/%d C=%d D=%d"
+                % (
+                    self._center_scan_count,
+                    self.config.center_observation_scans,
+                    len(self._center_c_samples),
+                    len(self._center_d_samples),
+                )
+            )
+
+        required = max(
+            2,
+            (self.config.center_observation_scans + 1) // 2,
+        )
+        dist_c = (
+            float(median(self._center_c_samples))
+            if len(self._center_c_samples) >= required
+            else None
+        )
+        dist_d = (
+            float(median(self._center_d_samples))
+            if len(self._center_d_samples) >= required
+            else None
+        )
+
+        if dist_c is None or dist_d is None:
+            missing = (
+                "CD"
+                if dist_c is None and dist_d is None
+                else ("C" if dist_c is None else "D")
+            )
             return self._start_recovery(
                 now,
                 None,
-                "paper_both_dist_c_dist_d_none",
+                "paper_cd_not_observed_enough missing=%s" % missing,
             )
-        if dist_c is None or dist_d is None:
-            # The paper defines neither a CD bias nor a transition for this
-            # case at the center-check stage.
-            return self._stop("paper_undefined_exactly_one_cd_none")
 
         bias_cd = dist_c - dist_d
         if abs(bias_cd) < self.config.dist_bias_cd_threshold_mm:
@@ -236,8 +332,13 @@ class PaperParkingController:
                 state=self.state,
                 detected_vehicle_count=self._detected_vehicle_count,
                 distance_bias_cd_mm=bias_cd,
+                prealign_near_seen=self._prealign_near_seen,
+                prealign_ready_scans=self._prealign_ready_scans,
+                pair_hold_scans=self._pair_missing_scans,
+                center_observation_scans=self._center_scan_count,
                 reason="paper_dist_cd_centered",
             )
+            self._finish_missing_scans = 0
             return self._drive(
                 self.config.reverse_speed,
                 0,
@@ -255,16 +356,35 @@ class PaperParkingController:
         self,
         observation: RearLidarObservation,
     ) -> ControlCommand:
-        if (
+        side_missing = (
             observation.dist_c_mm is None
             or observation.dist_d_mm is None
+        )
+        if self._is_new_scan:
+            if side_missing:
+                self._finish_missing_scans += 1
+            else:
+                self._finish_missing_scans = 0
+        if (
+            self._finish_missing_scans
+            >= self.config.finish_missing_confirm_scans
         ):
             self.state = ParkingState.PARKED
-            return self._stop("paper_dist_c_or_dist_d_none_finish")
+            return self._stop(
+                "paper_dist_c_or_dist_d_none_finish confirmed=%d"
+                % self._finish_missing_scans
+            )
         return self._drive(
             self.config.reverse_speed,
             0,
-            "paper_centered_reverse_until_side_none",
+            (
+                "paper_centered_reverse_until_side_none "
+                "missing=%d/%d"
+            )
+            % (
+                self._finish_missing_scans,
+                self.config.finish_missing_confirm_scans,
+            ),
         )
 
     def _start_recovery(
@@ -280,6 +400,10 @@ class PaperParkingController:
             state=self.state,
             detected_vehicle_count=self._detected_vehicle_count,
             distance_bias_cd_mm=bias_cd,
+            prealign_near_seen=self._prealign_near_seen,
+            prealign_ready_scans=self._prealign_ready_scans,
+            pair_hold_scans=self._pair_missing_scans,
+            center_observation_scans=self._center_scan_count,
             reason=reason,
         )
         return self._drive(
@@ -303,7 +427,127 @@ class PaperParkingController:
                 % (elapsed, self.config.recovery_forward_s),
             )
         self.state = ParkingState.REVERSE_ALIGN
+        self._reset_pair_tracking(observation)
         return self._reverse_align(observation)
+
+    def _reset_measurement_state(self) -> None:
+        self._last_lidar_timestamp = None
+        self._is_new_scan = False
+        self._prealign_near_seen = False
+        self._prealign_ready_scans = 0
+        self._pair_samples.clear()
+        self.control_pair = TangentPair()
+        self._last_pair_timestamp: Optional[float] = None
+        self._pair_missing_scans = 0
+        self._pair_outlier_rejected = False
+        self._reset_center_observation()
+        self._finish_missing_scans = 0
+
+    def _reset_pair_tracking(
+        self,
+        observation: RearLidarObservation,
+    ) -> None:
+        self._pair_samples.clear()
+        self._pair_missing_scans = 0
+        self._pair_outlier_rejected = False
+        self._last_pair_timestamp = observation.timestamp
+        if observation.pair.valid:
+            self._pair_samples.append(observation.pair)
+            self.control_pair = observation.pair
+        else:
+            self.control_pair = TangentPair()
+
+    def _control_pair(
+        self,
+        observation: RearLidarObservation,
+    ) -> Tuple[TangentPair, bool]:
+        if observation.timestamp != self._last_pair_timestamp:
+            self._last_pair_timestamp = observation.timestamp
+            self._pair_outlier_rejected = False
+            if (
+                observation.pair.valid
+                and self._pair_is_continuous(observation.pair)
+            ):
+                self._pair_samples.append(observation.pair)
+                self._pair_missing_scans = 0
+            else:
+                self._pair_outlier_rejected = (
+                    observation.pair.valid
+                )
+                self._pair_missing_scans += 1
+
+        if (
+            not self._pair_samples
+            or self._pair_missing_scans
+            > self.config.pair_hold_scans
+        ):
+            self.control_pair = TangentPair(
+                reason="filtered_pair_unavailable"
+            )
+            return self.control_pair, False
+
+        samples = tuple(self._pair_samples)
+        filtered = TangentPair(
+            valid=True,
+            angle_a_deg=float(
+                median(item.angle_a_deg for item in samples)
+            ),
+            angle_b_deg=float(
+                median(item.angle_b_deg for item in samples)
+            ),
+            dist_a_mm=float(
+                median(item.dist_a_mm for item in samples)
+            ),
+            dist_b_mm=float(
+                median(item.dist_b_mm for item in samples)
+            ),
+            angle_bisector_deg=float(
+                median(
+                    item.angle_bisector_deg for item in samples
+                )
+            ),
+            reason=(
+                "rejected_outlier_held_pair"
+                if self._pair_outlier_rejected
+                else (
+                    "held_filtered_pair"
+                    if self._pair_missing_scans
+                    else "median_filtered_pair"
+                )
+            ),
+        )
+        self.control_pair = filtered
+        return filtered, self._pair_missing_scans > 0
+
+    def _pair_is_continuous(
+        self,
+        candidate: TangentPair,
+    ) -> bool:
+        if not self._pair_samples:
+            return True
+
+        previous = self._pair_samples[-1]
+        angle_limit = self.config.pair_max_angle_jump_deg
+        distance_limit = (
+            self.config.pair_max_distance_jump_mm
+        )
+        return (
+            abs(candidate.angle_a_deg - previous.angle_a_deg)
+            <= angle_limit
+            and abs(
+                candidate.angle_b_deg - previous.angle_b_deg
+            )
+            <= angle_limit
+            and abs(candidate.dist_a_mm - previous.dist_a_mm)
+            <= distance_limit
+            and abs(candidate.dist_b_mm - previous.dist_b_mm)
+            <= distance_limit
+        )
+
+    def _reset_center_observation(self) -> None:
+        self._center_scan_count = 0
+        self._center_c_samples.clear()
+        self._center_d_samples.clear()
 
     def _paper_steering(
         self,
@@ -376,5 +620,9 @@ class PaperParkingController:
         self.debug = PaperParkingDebug(
             state=self.state,
             detected_vehicle_count=self._detected_vehicle_count,
+            prealign_near_seen=self._prealign_near_seen,
+            prealign_ready_scans=self._prealign_ready_scans,
+            pair_hold_scans=self._pair_missing_scans,
+            center_observation_scans=self._center_scan_count,
             reason=reason,
         )

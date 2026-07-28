@@ -58,12 +58,15 @@ class PaperControllerConfig:
 
     forward_speed: int = 80
     reverse_speed: int = -80
-    # Figure 7 is the diagonal entry pose for perpendicular (T) parking.
-    # Stop the left-forward setup once the A/B angle bisector reaches this
-    # value instead of continuing until the car is nearly perpendicular to
-    # the two parked vehicles.
-    prealign_bisector_target_deg: float = 55.0
-    prealign_confirm_scans: int = 3
+    # The paper's 600 mm setup threshold assumes its own lateral spacing.
+    # Our prealign_distance_mm is the scaled equivalent.
+    prealign_clear_confirm_scans: int = 3
+    pair_filter_scans: int = 3
+    pair_hold_scans: int = 3
+    pair_max_angle_jump_deg: float = 15.0
+    pair_max_distance_jump_mm: float = 700.0
+    center_observation_scans: int = 4
+    finish_missing_confirm_scans: int = 3
     paper_max_steering: float = 7.0
     actuator_max_steering: int = 150
     actuator_steering_offset: int = 0
@@ -194,11 +197,25 @@ def _validate(config: AppConfig) -> None:
         raise ValueError("forward_speed must be positive")
     if controller.reverse_speed >= 0:
         raise ValueError("reverse_speed must be negative")
-    if not 0.0 < controller.prealign_bisector_target_deg < 90.0:
+    if controller.prealign_clear_confirm_scans < 1:
         raise ValueError(
-            "prealign_bisector_target_deg must be in (0, 90)"
+            "prealign_clear_confirm_scans must be positive"
         )
-    if controller.prealign_confirm_scans < 1:
-        raise ValueError("prealign_confirm_scans must be positive")
+    if controller.pair_filter_scans < 1:
+        raise ValueError("pair_filter_scans must be positive")
+    if controller.pair_hold_scans < 0:
+        raise ValueError("pair_hold_scans cannot be negative")
+    if controller.pair_max_angle_jump_deg <= 0.0:
+        raise ValueError("pair_max_angle_jump_deg must be positive")
+    if controller.pair_max_distance_jump_mm <= 0.0:
+        raise ValueError(
+            "pair_max_distance_jump_mm must be positive"
+        )
+    if controller.center_observation_scans < 1:
+        raise ValueError("center_observation_scans must be positive")
+    if controller.finish_missing_confirm_scans < 1:
+        raise ValueError(
+            "finish_missing_confirm_scans must be positive"
+        )
     if controller.command_rate_hz <= 0.0:
         raise ValueError("command_rate_hz must be positive")

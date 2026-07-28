@@ -5,7 +5,7 @@ import csv
 import logging
 import time
 from dataclasses import replace
-from math import cos, radians, sin
+from math import atan2, cos, degrees, hypot, radians, sin
 from pathlib import Path
 from typing import Optional
 
@@ -14,6 +14,7 @@ from ..control.serial_vehicle import SerialVehicle
 from ..perception.rear_lidar import (
     RearLidarObservation,
     RearLidarPerception,
+    TangentPair,
 )
 from ..planning.paper_controller import PaperParkingController
 from ..sensors.lidar import (
@@ -82,10 +83,23 @@ class TelemetryRecorder:
                 "angle_bisector_deg",
                 "dist_a_mm",
                 "dist_b_mm",
+                "control_pair_valid",
+                "control_angle_a_deg",
+                "control_angle_b_deg",
+                "control_angle_bisector_deg",
+                "control_dist_a_mm",
+                "control_dist_b_mm",
+                "control_gap_width_mm",
+                "control_gap_center_angle_deg",
+                "control_pair_reason",
                 "distance_bias_ab_mm",
                 "angle_term",
                 "distance_term",
                 "paper_steering",
+                "prealign_near_seen",
+                "prealign_ready_scans",
+                "pair_hold_scans",
+                "center_observation_scans",
                 "dist_c_mm",
                 "dist_d_mm",
                 "distance_bias_cd_mm",
@@ -101,6 +115,10 @@ class TelemetryRecorder:
         command: ControlCommand,
     ) -> None:
         pair = observation.pair
+        control_pair = controller.control_pair
+        gap_width, gap_center_angle = _pair_geometry(
+            control_pair
+        )
         debug = controller.debug
         self._writer.writerow(
             {
@@ -171,12 +189,63 @@ class TelemetryRecorder:
                 "dist_b_mm": _optional(
                     pair.dist_b_mm if pair.valid else None
                 ),
+                "control_pair_valid": int(control_pair.valid),
+                "control_angle_a_deg": _optional(
+                    (
+                        control_pair.angle_a_deg
+                        if control_pair.valid
+                        else None
+                    )
+                ),
+                "control_angle_b_deg": _optional(
+                    (
+                        control_pair.angle_b_deg
+                        if control_pair.valid
+                        else None
+                    )
+                ),
+                "control_angle_bisector_deg": _optional(
+                    (
+                        control_pair.angle_bisector_deg
+                        if control_pair.valid
+                        else None
+                    )
+                ),
+                "control_dist_a_mm": _optional(
+                    (
+                        control_pair.dist_a_mm
+                        if control_pair.valid
+                        else None
+                    )
+                ),
+                "control_dist_b_mm": _optional(
+                    (
+                        control_pair.dist_b_mm
+                        if control_pair.valid
+                        else None
+                    )
+                ),
+                "control_gap_width_mm": _optional(gap_width),
+                "control_gap_center_angle_deg": _optional(
+                    gap_center_angle
+                ),
+                "control_pair_reason": control_pair.reason,
                 "distance_bias_ab_mm": _optional(
                     debug.distance_bias_ab_mm
                 ),
                 "angle_term": _optional(debug.angle_term),
                 "distance_term": _optional(debug.distance_term),
                 "paper_steering": _optional(debug.paper_steering),
+                "prealign_near_seen": int(
+                    debug.prealign_near_seen
+                ),
+                "prealign_ready_scans": (
+                    debug.prealign_ready_scans
+                ),
+                "pair_hold_scans": debug.pair_hold_scans,
+                "center_observation_scans": (
+                    debug.center_observation_scans
+                ),
                 "dist_c_mm": _optional(observation.dist_c_mm),
                 "dist_d_mm": _optional(observation.dist_d_mm),
                 "distance_bias_cd_mm": _optional(
@@ -671,6 +740,65 @@ def _show_debug(
             2,
         )
 
+    control_pair = controller.control_pair
+    gap_width: Optional[float] = None
+    gap_center_angle: Optional[float] = None
+    if control_pair.valid:
+        gap_width, gap_center_angle = _pair_geometry(
+            control_pair
+        )
+        control_a = _polar_pixel(
+            origin,
+            control_pair.dist_a_mm,
+            control_pair.angle_a_deg,
+            scale,
+        )
+        control_b = _polar_pixel(
+            origin,
+            control_pair.dist_b_mm,
+            control_pair.angle_b_deg,
+            scale,
+        )
+        entrance_center = (
+            int(round((control_a[0] + control_b[0]) / 2.0)),
+            int(round((control_a[1] + control_b[1]) / 2.0)),
+        )
+        cv2.line(
+            canvas,
+            control_a,
+            control_b,
+            (0, 255, 90),
+            4,
+        )
+        cv2.line(
+            canvas,
+            origin,
+            entrance_center,
+            (0, 255, 90),
+            2,
+        )
+        cv2.circle(
+            canvas,
+            entrance_center,
+            13,
+            (0, 255, 90),
+            3,
+        )
+        cv2.putText(
+            canvas,
+            "CONTROL GAP %.0fmm @ %.1fdeg"
+            % (gap_width, gap_center_angle),
+            (
+                entrance_center[0] + 12,
+                entrance_center[1] - 12,
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            (0, 255, 90),
+            2,
+            cv2.LINE_AA,
+        )
+
     cv2.line(
         canvas,
         (1100, 0),
@@ -791,11 +919,67 @@ def _show_debug(
             ),
             _fmt(debug.distance_bias_ab_mm, 0),
         ),
+        "controlA=%s/%s controlB=%s/%s controlBis=%s"
+        % (
+            _fmt(
+                (
+                    control_pair.angle_a_deg
+                    if control_pair.valid
+                    else None
+                ),
+                1,
+            ),
+            _fmt(
+                (
+                    control_pair.dist_a_mm
+                    if control_pair.valid
+                    else None
+                ),
+                0,
+            ),
+            _fmt(
+                (
+                    control_pair.angle_b_deg
+                    if control_pair.valid
+                    else None
+                ),
+                1,
+            ),
+            _fmt(
+                (
+                    control_pair.dist_b_mm
+                    if control_pair.valid
+                    else None
+                ),
+                0,
+            ),
+            _fmt(
+                (
+                    control_pair.angle_bisector_deg
+                    if control_pair.valid
+                    else None
+                ),
+                1,
+            ),
+        ),
+        "controlGap=%smm center=%sdeg source=%s"
+        % (
+            _fmt(gap_width, 0),
+            _fmt(gap_center_angle, 1),
+            control_pair.reason,
+        ),
         "angleTerm=%s distTerm=%s paperSteer=%s"
         % (
             _fmt(debug.angle_term, 2),
             _fmt(debug.distance_term, 2),
             _fmt(debug.paper_steering, 2),
+        ),
+        "setupNearSeen=%s readyScans=%d pairHold=%d centerScans=%d"
+        % (
+            debug.prealign_near_seen,
+            debug.prealign_ready_scans,
+            debug.pair_hold_scans,
+            debug.center_observation_scans,
         ),
         "DistC=%smm DistD=%smm biasCD=%smm"
         % (
@@ -834,7 +1018,7 @@ def _show_debug(
         cv2.putText(
             canvas,
             text,
-            (text_x, 38 + 42 * index),
+            (text_x, 34 + 37 * index),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.56,
             color,
@@ -855,6 +1039,26 @@ def _polar_pixel(origin, distance_mm, angle_deg, scale):
     return (
         int(round(origin[0] + x_right * scale)),
         int(round(origin[1] + y_back * scale)),
+    )
+
+
+def _pair_geometry(
+    pair: TangentPair,
+) -> tuple[Optional[float], Optional[float]]:
+    if not pair.valid:
+        return None, None
+
+    angle_a = radians(pair.angle_a_deg)
+    angle_b = radians(pair.angle_b_deg)
+    a_x = sin(angle_a) * pair.dist_a_mm
+    a_y = cos(angle_a) * pair.dist_a_mm
+    b_x = sin(angle_b) * pair.dist_b_mm
+    b_y = cos(angle_b) * pair.dist_b_mm
+    center_x = (a_x + b_x) / 2.0
+    center_y = (a_y + b_y) / 2.0
+    return (
+        hypot(a_x - b_x, a_y - b_y),
+        degrees(atan2(center_x, center_y)),
     )
 
 
