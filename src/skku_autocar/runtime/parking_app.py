@@ -102,6 +102,7 @@ class TelemetryRecorder:
                 "prealign_near_seen",
                 "prealign_ready_scans",
                 "pair_hold_scans",
+                "pair_reacquiring",
                 "center_observation_scans",
                 "dist_c_mm",
                 "dist_d_mm",
@@ -275,6 +276,9 @@ class TelemetryRecorder:
                     debug.prealign_ready_scans
                 ),
                 "pair_hold_scans": debug.pair_hold_scans,
+                "pair_reacquiring": int(
+                    debug.pair_reacquiring
+                ),
                 "center_observation_scans": (
                     debug.center_observation_scans
                 ),
@@ -1149,11 +1153,13 @@ def _show_debug(
             config.controller.entry_full_steer_angle_deg,
         ),
         "dropoutRealign=%s" % debug.realigning_after_dropout,
-        "setupNearSeen=%s readyScans=%d pairHold=%d centerScans=%d"
+        "setupNearSeen=%s readyScans=%d pairHold=%d "
+        "reacquire=%s centerScans=%d"
         % (
             debug.prealign_near_seen,
             debug.prealign_ready_scans,
             debug.pair_hold_scans,
+            debug.pair_reacquiring,
             debug.center_observation_scans,
         ),
         "C=%s D=%s ratio=%s err=%s span=%s stable=%d/%d"
