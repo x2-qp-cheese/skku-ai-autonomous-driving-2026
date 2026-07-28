@@ -78,7 +78,7 @@ class LocalOccupancyGridTest(unittest.TestCase):
         self.assertFalse(paused.found)
         self.assertEqual(np.count_nonzero(paused.mask), 0)
 
-    def test_fusion_planner_uses_map_to_select_clear_adjacent_lane(self):
+    def test_fusion_planner_uses_map_to_request_lane_change(self):
         grid = LocalOccupancyGrid(LocalOccupancyConfig(inflation_radius_px=0))
         mapped = grid.update([obstacle()], SHAPE, 1.0, 0.0, True)
         controller = LaneChangeController(
@@ -94,7 +94,6 @@ class LocalOccupancyGridTest(unittest.TestCase):
                 lane_width_px=60.0,
                 visual_confirm_frames=1,
                 visual_trigger_y_ratio=0.20,
-                target_block_y_ratio=0.20,
                 path_half_width_px=22.0,
                 min_path_overlap_ratio=0.10,
             )
@@ -116,7 +115,7 @@ class LocalOccupancyGridTest(unittest.TestCase):
         self.assertIn("lane2 -> lane1", event)
         self.assertEqual(controller.state, "armed")
 
-    def test_fusion_planner_rejects_occupied_adjacent_lane(self):
+    def test_fusion_planner_ignores_non_current_lane_occupancy(self):
         grid = LocalOccupancyGrid(LocalOccupancyConfig(inflation_radius_px=0))
         mapped = grid.update(
             [obstacle(), obstacle(60, 100, 60, 95)],
@@ -134,7 +133,6 @@ class LocalOccupancyGridTest(unittest.TestCase):
                 lane_width_px=60.0,
                 visual_confirm_frames=1,
                 visual_trigger_y_ratio=0.20,
-                target_block_y_ratio=0.20,
                 path_half_width_px=22.0,
                 min_path_overlap_ratio=0.10,
             )
@@ -152,9 +150,8 @@ class LocalOccupancyGridTest(unittest.TestCase):
             obstacle_confidence=mapped.confidence,
         )
 
-        self.assertIsNone(event)
-        self.assertTrue(planner.observation.target_blocked)
-        self.assertEqual(controller.state, "lane2")
+        self.assertIn("lane2 -> lane1", event)
+        self.assertEqual(controller.state, "armed")
 
 
 if __name__ == "__main__":

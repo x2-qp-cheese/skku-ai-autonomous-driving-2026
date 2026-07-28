@@ -18,21 +18,17 @@ class ObstacleFusionConfig:
     # BEV is reliable near the car, while frame-space masks see obstacles before
     # they enter the ground-plane homography. Both assessments are used.
     visual_trigger_y_ratio: float = 0.05
-    target_block_y_ratio: float = 0.65
     frame_visual_trigger_y_ratio: float = 0.18
-    frame_target_block_y_ratio: float = 0.65
     visual_emergency_y_ratio: float = 0.88
     frame_visual_emergency_y_ratio: float = 0.72
     path_half_width_px: float = 65.0
     frame_path_half_width_scale: float = 0.42
     frame_min_path_half_width_px: float = 12.0
     min_path_overlap_ratio: float = 0.15
-    min_current_path_overlap_ratio: float = 0.15
+    min_current_path_overlap_ratio: float = 0.40
     min_physical_lane_overlap_ratio: float = 0.0
-    max_current_path_distance_ratio: float = 0.58
+    max_current_path_distance_ratio: float = 0.48
     frame_boundary_margin_px: float = 4.0
-    path_assignment_margin_px: float = 8.0
-    path_assignment_overlap_margin: float = 0.10
     contact_band_ratio: float = 0.25
     visual_action_confidence: float = 0.75
     visual_commit_enabled: bool = False
@@ -50,23 +46,13 @@ class ObstacleFusionConfig:
     ultrasonic_trigger_mm: float = 2600.0
     ultrasonic_clear_mm: float = 2900.0
     ultrasonic_stop_mm: float = 300.0
-    blocked_stop_mm: float = 300.0
     emergency_stop_enabled: bool = False
     min_front_sensors: int = 2
     range_confirm_frames: int = 1
     range_clear_frames: int = 2
     rearm_clear_frames: int = 3
-    source_clear_confirm_frames: int = 2
     ttc_trigger_seconds: float = 0.0
     min_closing_rate_mm_s: float = 120.0
-    side_clearance_mm: float = 300.0
-
-    # lane-side normally represents the outer solid boundaries. Only a solid
-    # instance lying between the two lane-center trajectories blocks a change;
-    # the valid outer boundaries of the current and destination lanes do not.
-    solid_crossing_margin_px: float = 8.0
-    solid_check_min_y_ratio: float = 0.20
-    solid_min_overlap_ratio: float = 0.05
 
     visual_slowdown_enabled: bool = False
     approach_speed_cap: int = 120
@@ -113,12 +99,8 @@ class ObstacleFusionObservation:
     range_confirmed: bool = False
     visual_commit_confirmed: bool = False
     fused_hazard: bool = False
-    target_blocked: bool = False
-    solid_blocked: bool = False
-    side_clear: bool = False
     emergency: bool = False
     maneuver_active: bool = False
-    clearing_source: bool = False
     path_lane: int = 2
     closest_y_ratio: float = 0.0
     frame_y_ratio: float = 0.0
@@ -138,19 +120,14 @@ class ObstacleFusionObservation:
 class PathOccupancy:
     bottom_y_ratio: float
     current_overlap: float
-    target_overlap: float
     current_distance_px: float = 0.0
-    target_distance_px: float = 0.0
     current_distance_ratio: float = 0.0
-    target_distance_ratio: float = 0.0
     physical_lane_overlap: float = 1.0
 
 
 @dataclass(frozen=True)
 class PathAssessment:
     current_detected: bool = False
-    target_blocked: bool = False
-    physical_target_blocked: bool = False
     range_fallback_candidate: bool = False
     closest_y_ratio: float = 0.0
     physical_lane_overlap: float = 0.0
@@ -163,9 +140,10 @@ class ObstacleFusionPlanner:
 
     Frame-space YOLO masks provide lookahead before an obstacle enters the BEV
     source trapezoid. BEV masks still provide the near-field path association.
-    Ultrasonic range/TTC confirms that the visual object is physically close,
-    while side sonar, target-lane occupancy and solid boundaries veto unsafe
-    changes. The lane-change controller owns full-lane arrival and alignment.
+    Ultrasonic range/TTC confirms that the visual object is physically close.
+    Contest obstacle layouts guarantee that the opposite lane is the escape
+    route, so planning only asks whether the obstacle is on the current driving
+    path. The lane-change controller owns full-lane arrival and alignment.
     """
 
     def __init__(self, config: ObstacleFusionConfig = ObstacleFusionConfig()):
@@ -179,7 +157,6 @@ class ObstacleFusionPlanner:
         self._range_frames = 0
         self._range_clear_frames = 0
         self._rearm_frames = 0
-        self._source_clearing_frames = 0
         self._consumed = False
         self._last_trigger_path_lane: Optional[int] = None
         self._planned_from_lane: Optional[int] = None
@@ -199,7 +176,6 @@ class ObstacleFusionPlanner:
         self._range_frames = 0
         self._range_clear_frames = 0
         self._rearm_frames = 0
-        self._source_clearing_frames = 0
         self._consumed = False
         self._last_trigger_path_lane = None
         self._clear_path_plan()
@@ -220,7 +196,6 @@ class ObstacleFusionPlanner:
         running: bool,
         frame_obstacle_masks: Sequence[Any] = (),
         frame_paths: Optional[FramePathGeometry] = None,
-        solid_masks: Sequence[Any] = (),
         obstacle_confidence: float = 1.0,
     ) -> Optional[str]:
         path_lane = self._desired_lane(lane_change.state)
@@ -251,41 +226,19 @@ class ObstacleFusionPlanner:
             frame_paths,
             path_lane,
         )
+        planning_suppressed = lane_change.state in (
+            "armed",
+            "changing_to_lane1",
+            "changing_to_lane2",
+        )
         raw_path_visual = (
             bev_assessment.current_detected
             or frame_assessment.current_detected
         )
+        if planning_suppressed:
+            raw_path_visual = False
         visual_confidence = max(0.0, min(1.0, float(obstacle_confidence)))
-        physical_current_only = (
-            frame_assessment.physical_lane_known
-            and frame_assessment.current_detected
-            and not frame_assessment.physical_target_blocked
-        )
-        target_blocked = (
-            bev_assessment.target_blocked
-            or frame_assessment.target_blocked
-        )
-        if physical_current_only:
-            # YOLO can split one source-lane vehicle into several masks. Physical
-            # lane boundaries, rather than mask count, decide whether a separate
-            # destination-lane obstacle actually exists.
-            target_blocked = False
-        solid_blocked = self._solid_boundary_blocked(
-            solid_masks,
-            bev_shape,
-            base_centerline,
-            lane,
-            path_lane,
-        )
         maneuver_active = self._lane_change_active(lane_change.state)
-        side_direction = self._destination_side_direction(
-            lane_change.state,
-            path_lane,
-        )
-        side_clear = (
-            self.config.fusion_mode == "yolo"
-            or ultrasonic.side_clear(side_direction, self.config.side_clearance_mm)
-        )
         front_mm = ultrasonic.front_min_mm
         front_count = ultrasonic.front_fresh_count
         obstacle_count = max(
@@ -303,9 +256,6 @@ class ObstacleFusionPlanner:
                     >= max(0.0, float(self.config.visual_action_confidence))
                 ),
                 visual_confidence=visual_confidence,
-                target_blocked=target_blocked,
-                solid_blocked=solid_blocked,
-                side_clear=side_clear,
                 path_lane=path_lane,
                 closest_y_ratio=bev_assessment.closest_y_ratio,
                 frame_y_ratio=frame_assessment.closest_y_ratio,
@@ -317,55 +267,39 @@ class ObstacleFusionPlanner:
             return None
 
         stable_lane = lane_change.state in ("lane2", "completed", "lane1")
+        request_ready_lane = stable_lane or lane_change.state == "stabilizing_lane1"
         self._update_range_state(ultrasonic, now)
-        raw_visual = raw_path_visual or self._range_visual_fallback(
-            raw_path_visual,
-            target_blocked,
-            bev_assessment.range_fallback_candidate
-            or frame_assessment.range_fallback_candidate,
-            obstacle_count,
-            visual_confidence,
-        )
+        raw_visual = False
+        if not planning_suppressed:
+            raw_visual = raw_path_visual or self._range_visual_fallback(
+                raw_path_visual,
+                bev_assessment.range_fallback_candidate
+                or frame_assessment.range_fallback_candidate,
+                obstacle_count,
+                visual_confidence,
+            )
         visual = (
             raw_visual
             and visual_confidence
             >= max(0.0, float(self.config.visual_action_confidence))
         )
         self._update_visual_state(visual)
-        cleared_source_lane = self._update_rearm_state(
+        self._update_rearm_state(
             raw_visual,
             stable_lane,
         )
-        self._update_path_plan(
-            path_lane,
-            stable_lane,
-            target_blocked,
-            solid_blocked,
-        )
+        self._update_path_plan(path_lane, request_ready_lane)
         different_path_event = (
             self._consumed
             and self._last_trigger_path_lane is not None
             and path_lane != self._last_trigger_path_lane
         )
-        # The old obstacle first appears on the destination projection while the
-        # vehicle clears it. Only after that evidence may a projection-only mask
-        # on the new current path represent a distinct obstacle.
-        clearing_source = different_path_event and target_blocked
-        if clearing_source and stable_lane:
-            self._source_clearing_frames += 1
-        elif not different_path_event:
-            self._source_clearing_frames = 0
-        separated_path_event = (
-            different_path_event
-            and not clearing_source
-            and self._source_clearing_frames
-            >= max(1, int(self.config.source_clear_confirm_frames))
-        )
+        current_path_event = different_path_event and raw_path_visual
         visual_commit_confirmed = self._visual_commit_confirmed(
             frame_assessment,
             frame_obstacle_masks,
             visual_confidence,
-            allow_projected_current=separated_path_event,
+            allow_projected_current=current_path_event,
         )
         range_confirmed = (
             self.config.fusion_mode == "yolo"
@@ -373,15 +307,12 @@ class ObstacleFusionPlanner:
             or visual_commit_confirmed
         )
         fused_hazard = self._visual_confirmed and range_confirmed
-        blocked = target_blocked or solid_blocked or not side_clear
         emergency = self._emergency_present(
             raw_visual,
             bev_assessment.closest_y_ratio,
             frame_assessment.closest_y_ratio,
             ultrasonic,
-            fused_hazard,
-            blocked,
-            maneuver_active or clearing_source,
+            maneuver_active,
         )
         self.observation = ObstacleFusionObservation(
             visual_detected=raw_visual,
@@ -391,12 +322,8 @@ class ObstacleFusionPlanner:
             range_confirmed=range_confirmed,
             visual_commit_confirmed=visual_commit_confirmed,
             fused_hazard=fused_hazard,
-            target_blocked=target_blocked,
-            solid_blocked=solid_blocked,
-            side_clear=side_clear,
             emergency=emergency,
             maneuver_active=maneuver_active,
-            clearing_source=clearing_source,
             path_lane=path_lane,
             closest_y_ratio=bev_assessment.closest_y_ratio,
             frame_y_ratio=frame_assessment.closest_y_ratio,
@@ -413,36 +340,16 @@ class ObstacleFusionPlanner:
         )
 
         if (
-            cleared_source_lane == 2
-            and path_lane == 1
-            and lane_change.state == "lane1"
-        ):
-            event = self._request_lane_change(
-                lane_change,
-                now,
-                avoidance=False,
-            )
-            if event is not None:
-                # Keep the return maneuver consumed until it reaches lane 2 and
-                # sees another stable clear gap.
-                self._consumed = True
-                self._last_trigger_path_lane = path_lane
-                self._clear_path_plan()
-                return event
-
-        if (
             fused_hazard
-            and stable_lane
+            and request_ready_lane
             and self._path_plan_ready(path_lane)
-            and (not self._consumed or separated_path_event)
-            and not blocked
+            and (not self._consumed or current_path_event)
             and now - self._last_trigger_at >= max(0.0, self.config.cooldown_seconds)
         ):
             event = self._request_lane_change(lane_change, now)
             if event is not None:
                 self._consumed = True
                 self._last_trigger_path_lane = path_lane
-                self._source_clearing_frames = 0
                 self._clear_path_plan()
                 return event
         return None
@@ -450,14 +357,13 @@ class ObstacleFusionPlanner:
     def _range_visual_fallback(
         self,
         raw_path_visual: bool,
-        target_blocked: bool,
         range_fallback_candidate: bool,
         obstacle_count: int,
         visual_confidence: float,
     ) -> bool:
         if not self.config.range_visual_fallback_enabled:
             return False
-        if raw_path_visual or target_blocked or obstacle_count <= 0:
+        if raw_path_visual or obstacle_count <= 0:
             return False
         if not range_fallback_candidate:
             return False
@@ -513,14 +419,6 @@ class ObstacleFusionPlanner:
             state = "STOP"
         elif obs.maneuver_active:
             state = "COMMITTED"
-        elif obs.clearing_source:
-            state = "CLEARING_SOURCE"
-        elif obs.fused_hazard and obs.solid_blocked:
-            state = "SOLID_BLOCKED"
-        elif obs.fused_hazard and obs.target_blocked:
-            state = "TARGET_BLOCKED"
-        elif obs.fused_hazard and not obs.side_clear:
-            state = "SIDE_BLOCKED"
         elif obs.fused_hazard:
             state = "READY"
         elif obs.visual_confirmed:
@@ -541,7 +439,7 @@ class ObstacleFusionPlanner:
             if obs.planned_target_lane is None
             else "L%d" % obs.planned_target_lane
         )
-        return "L%d %s plan=%s by=%.2f fy=%.2f in=%.2f vc=%s conf=%.2f front=%s q=%d r=%d ttc=%s side=%s" % (
+        return "L%d %s plan=%s by=%.2f fy=%.2f in=%.2f vc=%s conf=%.2f front=%s q=%d r=%d ttc=%s" % (
             obs.path_lane,
             state,
             plan,
@@ -554,7 +452,6 @@ class ObstacleFusionPlanner:
             obs.front_sensor_count,
             obs.range_frames,
             ttc,
-            "clear" if obs.side_clear else "blocked/unknown",
         )
 
     def _visual_commit_confirmed(
@@ -572,10 +469,7 @@ class ObstacleFusionPlanner:
             return False
         if not frame_assessment.current_detected:
             return False
-        if frame_assessment.physical_lane_known:
-            if frame_assessment.physical_target_blocked:
-                return False
-        elif not allow_projected_current or frame_assessment.target_blocked:
+        if not frame_assessment.physical_lane_known and not allow_projected_current:
             return False
         if visual_confidence < max(
             float(self.config.visual_action_confidence),
@@ -616,7 +510,6 @@ class ObstacleFusionPlanner:
             self._consumed = False
             self._last_trigger_path_lane = None
             self._rearm_frames = 0
-            self._source_clearing_frames = 0
             return cleared_source_lane
         return None
 
@@ -624,13 +517,8 @@ class ObstacleFusionPlanner:
         self,
         path_lane: int,
         stable_lane: bool,
-        target_blocked: bool,
-        solid_blocked: bool,
     ) -> None:
         if not stable_lane or not self._visual_confirmed:
-            self._clear_path_plan()
-            return
-        if target_blocked or solid_blocked:
             self._clear_path_plan()
             return
         self._planned_from_lane = path_lane
@@ -721,8 +609,6 @@ class ObstacleFusionPlanner:
         closest_bev_y: float,
         closest_frame_y: float,
         ultrasonic: UltrasonicSnapshot,
-        fused_hazard: bool,
-        blocked: bool,
         avoidance_committed: bool,
     ) -> bool:
         if not self.config.emergency_stop_enabled:
@@ -735,8 +621,8 @@ class ObstacleFusionPlanner:
         if avoidance_committed:
             # Neither front sonar nor frame-path overlap is spatially reliable
             # while crossing lanes or clearing the source obstacle immediately
-            # afterward. Once a destination passes the pre-commit safety gates,
-            # braking here only prevents the lateral escape from completing.
+            # afterward. Braking here only prevents the lateral escape from
+            # completing.
             return False
 
         required = max(1, int(self.config.min_front_sensors))
@@ -745,14 +631,7 @@ class ObstacleFusionPlanner:
 
         close_count = ultrasonic.front_close_count(self.config.ultrasonic_stop_mm)
         range_close = close_count >= 2 or (visual and close_count >= 1)
-        distance = ultrasonic.front_min_mm
-        blocked_close = (
-            fused_hazard
-            and blocked
-            and distance is not None
-            and distance <= max(0.0, self.config.blocked_stop_mm)
-        )
-        return visual_close or range_close or blocked_close
+        return visual_close or range_close
 
     def _measure_bev_paths(
         self,
@@ -769,7 +648,6 @@ class ObstacleFusionPlanner:
             return PathAssessment()
 
         current_offset = self._lane_offset(path_lane)
-        target_offset = self._lane_offset(1 if path_lane == 2 else 2)
         measurements = []
         for mask in obstacle_masks:
             binary = np.asarray(mask) > 0
@@ -780,7 +658,6 @@ class ObstacleFusionPlanner:
                 base_centerline,
                 lane.center_x,
                 current_offset,
-                target_offset,
                 max(1.0, float(self.config.path_half_width_px)),
             )
             if measurement is not None:
@@ -789,7 +666,6 @@ class ObstacleFusionPlanner:
         return self._assess_measurements(
             measurements,
             self.config.visual_trigger_y_ratio,
-            self.config.target_block_y_ratio,
         )
 
     def _measure_frame_paths(
@@ -803,8 +679,7 @@ class ObstacleFusionPlanner:
         if frame_paths is None:
             return PathAssessment()
         current_line = frame_paths.line(path_lane)
-        target_line = frame_paths.line(1 if path_lane == 2 else 2)
-        if len(current_line) < 2 or len(target_line) < 2:
+        if len(current_line) < 2:
             return PathAssessment()
         physical_bounds = frame_paths.physical_bounds(path_lane)
 
@@ -831,18 +706,11 @@ class ObstacleFusionPlanner:
                 current_line,
                 float(binary.shape[1]) / 2.0,
             )
-            target_x = self._center_x_at(
-                contact_ys,
-                target_line,
-                float(binary.shape[1]) / 2.0,
-            )
-            lane_spacing = np.abs(current_x - target_x)
-            safe_lane_spacing = np.maximum(1.0, lane_spacing)
             current_distance = np.abs(contact_xs - current_x)
-            target_distance = np.abs(contact_xs - target_x)
             half_width = np.maximum(
                 max(1.0, self.config.frame_min_path_half_width_px),
-                lane_spacing * max(0.0, self.config.frame_path_half_width_scale),
+                max(1.0, self.config.lane_width_px)
+                * max(0.0, self.config.frame_path_half_width_scale),
             )
             inside_physical_lane = np.ones(len(contact_xs), dtype=bool)
             if physical_bounds is not None:
@@ -875,16 +743,11 @@ class ObstacleFusionPlanner:
                             np.abs(contact_xs - current_x) <= half_width
                         )
                     ),
-                    target_overlap=float(
-                        np.mean(np.abs(contact_xs - target_x) <= half_width)
-                    ),
                     current_distance_px=float(np.mean(current_distance)),
-                    target_distance_px=float(np.mean(target_distance)),
                     current_distance_ratio=float(
-                        np.mean(current_distance / safe_lane_spacing)
-                    ),
-                    target_distance_ratio=float(
-                        np.mean(target_distance / safe_lane_spacing)
+                        np.mean(
+                            current_distance / max(1.0, self.config.lane_width_px)
+                        )
                     ),
                     physical_lane_overlap=float(
                         np.mean(inside_physical_lane)
@@ -895,53 +758,8 @@ class ObstacleFusionPlanner:
         return self._assess_measurements(
             measurements,
             self.config.frame_visual_trigger_y_ratio,
-            self.config.frame_target_block_y_ratio,
             physical_lane_known=physical_bounds is not None,
         )
-
-    def _solid_boundary_blocked(
-        self,
-        solid_masks: Sequence[Any],
-        bev_shape: Tuple[int, int],
-        base_centerline: Sequence[Tuple[float, float]],
-        lane: LaneGeometry,
-        path_lane: int,
-    ) -> bool:
-        import numpy as np
-
-        height, width = bev_shape
-        if height <= 0 or width <= 0 or not solid_masks:
-            return False
-        current_offset = self._lane_offset(path_lane)
-        target_offset = self._lane_offset(1 if path_lane == 2 else 2)
-        crossing_margin = max(0.0, float(self.config.solid_crossing_margin_px))
-        min_y = height * max(0.0, self.config.solid_check_min_y_ratio)
-        minimum_overlap = max(
-            0.0,
-            min(1.0, self.config.solid_min_overlap_ratio),
-        )
-
-        for mask in solid_masks:
-            binary = np.asarray(mask) > 0
-            if binary.shape[:2] != (height, width):
-                continue
-            ys, xs = np.nonzero(binary)
-            keep = ys >= min_y
-            ys = ys[keep].astype(float)
-            xs = xs[keep].astype(float)
-            if len(ys) < 20:
-                continue
-            base_x = self._center_x_at(ys, base_centerline, lane.center_x)
-            current_x = base_x + current_offset
-            target_x = base_x + target_offset
-            crossing_left = np.minimum(current_x, target_x) - crossing_margin
-            crossing_right = np.maximum(current_x, target_x) + crossing_margin
-            overlap = float(
-                np.mean((xs >= crossing_left) & (xs <= crossing_right))
-            )
-            if overlap >= minimum_overlap:
-                return True
-        return False
 
     def _measure_mask(
         self,
@@ -949,7 +767,6 @@ class ObstacleFusionPlanner:
         base_centerline: Sequence[Tuple[float, float]],
         fallback_x: float,
         current_offset: float,
-        target_offset: float,
         half_width: float,
     ) -> Optional[PathOccupancy]:
         import numpy as np
@@ -971,10 +788,8 @@ class ObstacleFusionPlanner:
             return None
         base_x = self._center_x_at(contact_ys, base_centerline, fallback_x)
         current_x = base_x + current_offset
-        target_x = base_x + target_offset
         current_distance = np.abs(contact_xs - current_x)
-        target_distance = np.abs(contact_xs - target_x)
-        lane_spacing = max(1.0, abs(float(current_offset) - float(target_offset)))
+        lane_width = max(1.0, float(self.config.lane_width_px))
         return PathOccupancy(
             bottom_y_ratio=max_y / float(max(1, binary.shape[0] - 1)),
             current_overlap=float(
@@ -982,22 +797,14 @@ class ObstacleFusionPlanner:
                     current_distance <= half_width
                 )
             ),
-            target_overlap=float(
-                np.mean(
-                    target_distance <= half_width
-                )
-            ),
             current_distance_px=float(np.mean(current_distance)),
-            target_distance_px=float(np.mean(target_distance)),
-            current_distance_ratio=float(np.mean(current_distance / lane_spacing)),
-            target_distance_ratio=float(np.mean(target_distance / lane_spacing)),
+            current_distance_ratio=float(np.mean(current_distance / lane_width)),
         )
 
     def _assess_measurements(
         self,
         measurements: Sequence[PathOccupancy],
         current_y_threshold: float,
-        target_y_threshold: float,
         physical_lane_known: bool = False,
     ) -> PathAssessment:
         overlap_min = max(0.0, min(1.0, self.config.min_path_overlap_ratio))
@@ -1019,15 +826,6 @@ class ObstacleFusionPlanner:
                 float(self.config.min_physical_lane_overlap_ratio),
             ),
         )
-        assignment_margin_px = max(
-            0.0,
-            float(self.config.path_assignment_margin_px),
-        )
-        assignment_overlap_margin = max(
-            0.0,
-            float(self.config.path_assignment_overlap_margin),
-        )
-
         def inside_current_path(item: PathOccupancy) -> bool:
             return item.current_distance_ratio <= max_current_distance
 
@@ -1035,25 +833,10 @@ class ObstacleFusionPlanner:
             return item.physical_lane_overlap >= min_physical_overlap
 
         def current_preferred(item: PathOccupancy) -> bool:
-            if physical_lane_known:
-                return inside_physical_lane(item)
             return (
                 item.current_overlap >= current_overlap_min
                 and inside_current_path(item)
-                and not target_preferred(item)
-                and item.current_distance_px
-                <= item.target_distance_px + assignment_margin_px
-            )
-
-        def target_preferred(item: PathOccupancy) -> bool:
-            return (
-                item.target_overlap >= overlap_min
-                and (
-                    item.target_overlap
-                    >= item.current_overlap + assignment_overlap_margin
-                    or item.target_distance_px + assignment_margin_px
-                    < item.current_distance_px
-                )
+                and inside_physical_lane(item)
             )
 
         current = [
@@ -1062,46 +845,14 @@ class ObstacleFusionPlanner:
             if item.bottom_y_ratio >= current_y_threshold
             and current_preferred(item)
         ]
-        target = [
-            item
-            for item in measurements
-            if item.bottom_y_ratio >= target_y_threshold
-            and target_preferred(item)
-        ]
-        target_lookahead = [
-            item
-            for item in measurements
-            if item.bottom_y_ratio >= current_y_threshold
-            and target_preferred(item)
-        ]
-        target_blocked = bool(target or target_lookahead)
-        # A projected target path can cross a wide current-lane mask on a
-        # curve. Treat only a mask with negligible current-lane contact as a
-        # separately occupied destination lane.
-        physical_target_overlap_max = min(
-            0.25,
-            0.5 * min_physical_overlap,
-        )
-        physical_target_blocked = (
-            physical_lane_known
-            and any(
-                item.physical_lane_overlap <= physical_target_overlap_max
-                for item in (*target, *target_lookahead)
-            )
-        )
         range_fallback = any(
             item.bottom_y_ratio >= current_y_threshold
             and inside_current_path(item)
             and inside_physical_lane(item)
-            and item.current_distance_px
-            <= item.target_distance_px + assignment_margin_px
-            and not target_preferred(item)
             for item in measurements
         )
         return PathAssessment(
             current_detected=bool(current),
-            target_blocked=target_blocked,
-            physical_target_blocked=physical_target_blocked,
             range_fallback_candidate=range_fallback,
             closest_y_ratio=max(
                 (item.bottom_y_ratio for item in current),
@@ -1129,7 +880,7 @@ class ObstacleFusionPlanner:
         if lane_change.state in ("lane2", "completed"):
             accepted = lane_change.request_avoidance(source)
             direction = "lane2 -> lane1"
-        elif lane_change.state == "lane1":
+        elif lane_change.state in ("stabilizing_lane1", "lane1"):
             if avoidance:
                 accepted = lane_change.request_avoidance_return(source)
             else:
@@ -1154,7 +905,7 @@ class ObstacleFusionPlanner:
 
     @staticmethod
     def _desired_lane(state: str) -> int:
-        if state in ("changing_to_lane1", "stabilizing_lane1", "lane1"):
+        if state in ("stabilizing_lane1", "lane1"):
             return 1
         return 2
 
@@ -1182,14 +933,6 @@ class ObstacleFusionPlanner:
             "changing_to_lane2",
             "stabilizing_lane2",
         )
-
-    @staticmethod
-    def _destination_side_direction(state: str, path_lane: int) -> int:
-        if state in ("armed", "changing_to_lane1", "stabilizing_lane1"):
-            return -1
-        if state in ("changing_to_lane2", "stabilizing_lane2"):
-            return 1
-        return -1 if path_lane == 2 else 1
 
     @staticmethod
     def _append_reason(reason: str, suffix: str) -> str:

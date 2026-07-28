@@ -917,7 +917,7 @@ class LaneChangeControllerTest(unittest.TestCase):
         self.assertEqual(stabilizing.state, "stabilizing_lane1")
         self.assertFalse(accepted)
 
-    def test_avoidance_return_waits_until_stabilizing_finishes(self):
+    def test_avoidance_return_is_queued_until_stabilizing_lane1_finishes(self):
         self.controller = LaneChangeController(
             LaneChangeConfig(
                 mode="external",
@@ -941,10 +941,60 @@ class LaneChangeControllerTest(unittest.TestCase):
             changing,
         )
 
-        self.assertFalse(accepted)
+        self.assertTrue(accepted)
         self.assertEqual(changing.state, "stabilizing_lane1")
         self.assertEqual(changing.direction, 0)
         self.assertEqual(adjusted.steering, 20)
+
+    def test_queued_avoidance_return_starts_after_lane1_stability(self):
+        self.controller = LaneChangeController(
+            LaneChangeConfig(
+                mode="external",
+                steering_override=False,
+                steering_cap=150,
+                stable_required_frames=2,
+            )
+        )
+        self.controller.state = "stabilizing_lane1"
+        self.assertTrue(
+            self.controller.request_avoidance_return("obstacle_fusion")
+        )
+
+        first = self.controller.update(
+            lane_for_shifted_lane1(),
+            150.0,
+            800.0,
+            1.0,
+            True,
+        )
+        arrived = self.controller.update(
+            lane_for_shifted_lane1(),
+            150.0,
+            800.0,
+            1.1,
+            True,
+        )
+        return_armed = self.controller.update(
+            lane_for_shifted_lane1(),
+            150.0,
+            800.0,
+            1.2,
+            True,
+        )
+        returning = self.controller.update(
+            lane_for_shifted_lane1(),
+            150.0,
+            800.0,
+            1.3,
+            True,
+        )
+
+        self.assertEqual(first.state, "stabilizing_lane1")
+        self.assertEqual(arrived.state, "lane1")
+        self.assertEqual(return_armed.state, "changing_to_lane2")
+        self.assertEqual(return_armed.direction, 0)
+        self.assertEqual(returning.state, "changing_to_lane2")
+        self.assertEqual(returning.direction, 1)
 
     def test_generic_request_uses_same_controller_entrypoint(self):
         self.controller = LaneChangeController(

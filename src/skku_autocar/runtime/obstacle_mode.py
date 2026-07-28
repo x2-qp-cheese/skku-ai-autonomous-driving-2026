@@ -204,7 +204,6 @@ class ObstacleDriveMode:
             running,
             frame_obstacle_masks=class_masks.obstacle,
             frame_paths=frame_paths,
-            solid_masks=bev.side,
             obstacle_confidence=planning_confidence,
         )
         if event:
@@ -341,13 +340,11 @@ class ObstacleDriveMode:
             args.obstacle_speed_cap,
         )
         LOG.info(
-            "obstacle vision bev_y=%.2f/%.2f frame_y=%.2f/%.2f action_conf=%.2f "
+            "obstacle vision bev_y=%.2f frame_y=%.2f action_conf=%.2f "
             "overlap=%.2f physical=%.2f visual_commit=%s/%.2f@%.2f "
-            "confirm=%d front_quorum=%d side=%.0fmm",
+            "confirm=%d front_quorum=%d",
             args.obstacle_visual_trigger_y,
-            args.obstacle_target_block_y,
             args.obstacle_frame_visual_trigger_y,
-            args.obstacle_frame_target_block_y,
             args.obstacle_action_confidence,
             args.obstacle_current_path_min_overlap,
             args.obstacle_physical_lane_min_overlap,
@@ -356,7 +353,6 @@ class ObstacleDriveMode:
             args.obstacle_visual_commit_frame_y,
             args.obstacle_visual_confirm_frames,
             args.obstacle_min_front_sensors,
-            args.obstacle_side_clearance_mm,
         )
 
     def _status_text(self, snapshot: LocalOccupancySnapshot) -> str:
@@ -418,7 +414,7 @@ def build_lane_change_config(args: argparse.Namespace) -> LaneChangeConfig:
         target_capture_error=args.lane_change_target_capture_error,
         target_capture_frames=args.lane_change_target_capture_frames,
         allow_virtual_stabilize=args.lane_change_allow_virtual_stabilize == "on",
-        smooth_avoidance=True,
+        smooth_avoidance=False,
         return_duration_scale=args.lane_change_return_duration_scale,
         return_steering_cap=args.lane_change_return_steering_cap,
         return_stabilizing_steering_cap=(
@@ -548,9 +544,7 @@ def build_obstacle_fusion_config(args: argparse.Namespace) -> ObstacleFusionConf
         fusion_mode=args.obstacle_fusion_mode,
         lane_width_px=resolve_lane_change_target_width_px(args),
         visual_trigger_y_ratio=args.obstacle_visual_trigger_y,
-        target_block_y_ratio=args.obstacle_target_block_y,
         frame_visual_trigger_y_ratio=args.obstacle_frame_visual_trigger_y,
-        frame_target_block_y_ratio=args.obstacle_frame_target_block_y,
         visual_emergency_y_ratio=args.obstacle_visual_emergency_y,
         frame_visual_emergency_y_ratio=args.obstacle_frame_visual_emergency_y,
         path_half_width_px=args.obstacle_path_half_width_px,
@@ -572,18 +566,13 @@ def build_obstacle_fusion_config(args: argparse.Namespace) -> ObstacleFusionConf
         ultrasonic_trigger_mm=args.obstacle_trigger_mm,
         ultrasonic_clear_mm=args.obstacle_clear_mm,
         ultrasonic_stop_mm=args.obstacle_stop_mm,
-        blocked_stop_mm=args.obstacle_blocked_stop_mm,
         emergency_stop_enabled=args.obstacle_emergency_stop == "on",
         min_front_sensors=args.obstacle_min_front_sensors,
         range_confirm_frames=args.obstacle_range_confirm_frames,
         range_clear_frames=args.obstacle_range_clear_frames,
         rearm_clear_frames=args.obstacle_rearm_clear_frames,
-        source_clear_confirm_frames=args.obstacle_source_clear_frames,
         ttc_trigger_seconds=args.obstacle_ttc_seconds,
         min_closing_rate_mm_s=args.obstacle_min_closing_rate,
-        side_clearance_mm=args.obstacle_side_clearance_mm,
-        solid_crossing_margin_px=args.obstacle_solid_crossing_margin_px,
-        solid_min_overlap_ratio=args.obstacle_solid_min_overlap,
         visual_slowdown_enabled=args.obstacle_visual_slowdown == "on",
         approach_speed_cap=args.obstacle_approach_speed_cap,
         speed_cap=args.obstacle_speed_cap,
@@ -676,7 +665,7 @@ def add_obstacle_arguments(parser: argparse.ArgumentParser) -> None:
         ("--lane-change-stable-heading-error", float, LaneChangeConfig.stable_heading_error),
         ("--lane-change-stable-near-error", float, LaneChangeConfig.stable_near_lateral_error),
         ("--lane-change-stable-frames", int, LaneChangeConfig.stable_required_frames),
-        ("--lane-change-target-width-px", float, 120.0),
+        ("--lane-change-target-width-px", float, 160.0),
         ("--lane-change-target-approach-error", float, 0.20),
         ("--lane-change-target-capture-frames", int, LaneChangeConfig.target_capture_frames),
         ("--lane-change-return-duration-scale", float, 1.35),
@@ -704,9 +693,7 @@ def add_obstacle_arguments(parser: argparse.ArgumentParser) -> None:
 
     obstacle_specs = (
         ("--obstacle-visual-trigger-y", float, ObstacleFusionConfig.visual_trigger_y_ratio),
-        ("--obstacle-target-block-y", float, ObstacleFusionConfig.target_block_y_ratio),
         ("--obstacle-frame-visual-trigger-y", float, 0.10),
-        ("--obstacle-frame-target-block-y", float, ObstacleFusionConfig.frame_target_block_y_ratio),
         ("--obstacle-visual-emergency-y", float, ObstacleFusionConfig.visual_emergency_y_ratio),
         ("--obstacle-frame-visual-emergency-y", float, ObstacleFusionConfig.frame_visual_emergency_y_ratio),
         ("--obstacle-path-half-width-px", float, ObstacleFusionConfig.path_half_width_px),
@@ -746,21 +733,12 @@ def add_obstacle_arguments(parser: argparse.ArgumentParser) -> None:
         ("--obstacle-trigger-mm", float, 2600.0),
         ("--obstacle-clear-mm", float, 2900.0),
         ("--obstacle-stop-mm", float, ObstacleFusionConfig.ultrasonic_stop_mm),
-        ("--obstacle-blocked-stop-mm", float, ObstacleFusionConfig.blocked_stop_mm),
         ("--obstacle-min-front-sensors", int, ObstacleFusionConfig.min_front_sensors),
         ("--obstacle-range-confirm-frames", int, ObstacleFusionConfig.range_confirm_frames),
         ("--obstacle-range-clear-frames", int, ObstacleFusionConfig.range_clear_frames),
         ("--obstacle-rearm-clear-frames", int, ObstacleFusionConfig.rearm_clear_frames),
-        (
-            "--obstacle-source-clear-frames",
-            int,
-            ObstacleFusionConfig.source_clear_confirm_frames,
-        ),
         ("--obstacle-ttc-seconds", float, ObstacleFusionConfig.ttc_trigger_seconds),
         ("--obstacle-min-closing-rate", float, ObstacleFusionConfig.min_closing_rate_mm_s),
-        ("--obstacle-side-clearance-mm", float, ObstacleFusionConfig.side_clearance_mm),
-        ("--obstacle-solid-crossing-margin-px", float, ObstacleFusionConfig.solid_crossing_margin_px),
-        ("--obstacle-solid-min-overlap", float, ObstacleFusionConfig.solid_min_overlap_ratio),
         ("--obstacle-approach-speed-cap", int, 255),
         ("--obstacle-speed-cap", int, 255),
         ("--obstacle-cooldown-seconds", float, ObstacleFusionConfig.cooldown_seconds),

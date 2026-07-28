@@ -58,13 +58,6 @@ class UltrasonicSnapshot:
         limit = max(0.0, float(threshold_mm))
         return sum(value <= limit for value in self.fresh_front_values)
 
-    def side_clear(self, direction: int, clearance_mm: float) -> bool:
-        key = "SL" if direction < 0 else "SR"
-        if key not in self.fresh_keys:
-            return False
-        value = self.sl if direction < 0 else self.sr
-        return value == 0 or value >= max(0.0, float(clearance_mm))
-
 
 class UltrasonicFilter:
     """Parse Arduino US lines and expose fresh median-filtered distances.

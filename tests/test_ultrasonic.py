@@ -58,8 +58,6 @@ class UltrasonicFilterTest(unittest.TestCase):
 
         self.assertTrue(snapshot.front_fresh)
         self.assertIsNone(snapshot.front_min_mm)
-        self.assertTrue(snapshot.side_clear(-1, 300))
-        self.assertTrue(snapshot.side_clear(1, 300))
 
     def test_front_quorum_uses_only_fresh_sensor_values(self):
         snapshot = UltrasonicSnapshot(

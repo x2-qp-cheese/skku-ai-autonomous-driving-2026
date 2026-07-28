@@ -40,8 +40,7 @@ class LocalOccupancyGrid:
 
     Ultrasonic measurements are intentionally not projected into arbitrary BEV
     cells because these sensors provide range but no reliable bearing. They are
-    fused later by ``ObstacleFusionPlanner`` as physical range and side-clearance
-    confirmation.
+    fused later by ``ObstacleFusionPlanner`` as front-range confirmation.
     """
 
     def __init__(

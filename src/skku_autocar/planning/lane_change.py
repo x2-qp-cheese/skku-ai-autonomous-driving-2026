@@ -158,12 +158,15 @@ class LaneChangeController:
         return self._arm_return(source, "normal")
 
     def request_avoidance_return(self, source: str = "obstacle") -> bool:
-        """Request a safety-priority return after lane 1 is stable."""
+        """Queue a safety-priority return, executing after lane 1 is stable."""
         return self._arm_return(source, "avoidance")
 
     def _arm_return(self, source: str, profile: str) -> bool:
-        if self.config.mode == "off" or self.state != "lane1":
+        if self.config.mode == "off":
             return False
+        if self.state != "lane1":
+            if profile != "avoidance" or self.state != "stabilizing_lane1":
+                return False
         self._return_requested = True
         self._return_source = source
         self._return_profile = profile
@@ -213,6 +216,8 @@ class LaneChangeController:
             self._lock_lane_width(lane_width_px, self._request_profile)
             self._clear_stability()
 
+        priority_return = self._return_profile == "avoidance"
+
         offset_ratio = 0.0
         direction = 0
         progress = 0.0
@@ -240,7 +245,6 @@ class LaneChangeController:
                 and self._phase_started_at is not None
                 and now - self._phase_started_at >= max(0.0, self.config.hold_seconds)
             )
-            priority_return = self._return_profile == "avoidance"
             return_path_ready = straight or (
                 priority_return and lane.found and lane_reliable
             )
@@ -291,6 +295,9 @@ class LaneChangeController:
             self._finish_transition_or_stabilize("stabilizing_lane2", "completed", now)
         if self.state == "stabilizing_lane1":
             if self._update_stability(shifted, lane_reliable):
+                # A second obstacle may be detected while the vehicle is still
+                # settling into lane 1. Keep that request queued, but never
+                # reverse steering until the measured lane target is stable.
                 self.state = "lane1"
                 self._phase_started_at = now
         elif self.state == "stabilizing_lane2":

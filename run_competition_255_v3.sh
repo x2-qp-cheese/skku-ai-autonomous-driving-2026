@@ -24,8 +24,8 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-lateral-gain 225 \
   --path-heading-gain 65 \
   --path-derivative-gain 18 \
-  --path-near-weight 1.00 \
-  --path-far-weight 1.00 \
+  --path-near-weight 1.45 \
+  --path-far-weight 0.55 \
   --path-steering-rise-alpha 0.72 \
   --path-steering-release-alpha 0.28 \
   --path-center-recovery-error-threshold 0.07 \
@@ -37,10 +37,10 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-reversal-min-steering 25 \
   --path-reversal-min-geometry 0.05 \
   --path-reversal-output-min-steering 70 \
-  --path-reversal-rate-limit 160 \
+  --path-reversal-rate-limit 220 \
   --path-reversal-near-guard-error 0.025 \
   --path-reversal-near-full-error 0.12 \
-  --path-near-conflict-error-threshold 0.06 \
+  --path-near-conflict-error-threshold 0.035 \
   --path-near-conflict-release-alpha 0.90 \
   --path-near-conflict-heading-limit 0.18 \
   --path-curve-guard-heading-threshold 0.25 \
@@ -58,7 +58,7 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --bev-heading-smooth 1.0 \
   --bev-path-smooth 0.90 \
   --bev-path-max-step 80 \
-  --vehicle-center-offset 0.035 \
+  --vehicle-center-offset 0.045 \
   --corridor-centerline-bias 0.50 \
   --corridor-crosswalk-option a \
   --center-lock off \
@@ -76,9 +76,9 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --obstacle-clear-mm 3150 \
   --obstacle-min-front-sensors 2 \
   --obstacle-range-confirm-frames 1 \
+  --obstacle-range-clear-frames 1 \
   --obstacle-visual-confirm-frames 1 \
   --obstacle-rearm-clear-frames 4 \
-  --obstacle-source-clear-frames 2 \
   --obstacle-current-path-min-overlap 0.40 \
   --obstacle-physical-lane-min-overlap 0.65 \
   --obstacle-current-path-max-distance-ratio 0.48 \
@@ -99,9 +99,9 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --lane-change-return-duration-scale 1.35 \
   --lane-change-return-steering-cap 115 \
   --lane-change-return-stabilizing-steering-cap 90 \
-  --lane-change-stable-lateral-error 0.25 \
-  --lane-change-stable-near-error 0.35 \
-  --lane-change-stable-frames 3 \
+  --lane-change-stable-lateral-error 0.18 \
+  --lane-change-stable-near-error 0.24 \
+  --lane-change-stable-frames 4 \
   --light-stop-during-lane-change on \
   --light-confirm-frames 2 \
   --light-red-confirm-frames 2 \
