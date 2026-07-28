@@ -13,11 +13,19 @@ def find_arduino_port(
     explicit_port: Optional[str] = None,
     ports: Optional[Sequence[Any]] = None,
 ) -> Optional[str]:
+    candidates = _arduino_port_candidates(explicit_port, ports)
+    return candidates[0] if candidates else None
+
+
+def _arduino_port_candidates(
+    explicit_port: Optional[str] = None,
+    ports: Optional[Sequence[Any]] = None,
+) -> list[str]:
     requested = (explicit_port or "").strip()
     if requested and requested.lower() != "auto":
         if requested.upper().startswith("COM") or Path(requested).exists():
-            return requested
-        return None
+            return [requested]
+        return []
     try:
         from serial.tools import list_ports
     except ImportError as exc:
@@ -57,7 +65,8 @@ def find_arduino_port(
         )
         if score:
             scored.append((score, str(getattr(port, "device", ""))))
-    return max(scored)[1] if scored else None
+    scored.sort(reverse=True)
+    return [device for _, device in scored]
 
 
 class SerialVehicle:
@@ -76,30 +85,48 @@ class SerialVehicle:
         self.port: Optional[str] = None
         self._serial = None
 
-    def connect(self) -> None:
+    def connect(
+        self,
+        *,
+        excluded_ports: Sequence[str] = (),
+    ) -> None:
         try:
             import serial
         except ImportError as exc:
             raise RuntimeError("pyserial is required") from exc
-        port = find_arduino_port(self.config.port)
-        if port is None:
+        excluded = set(excluded_ports)
+        candidates = [
+            port
+            for port in _arduino_port_candidates(self.config.port)
+            if port not in excluded
+        ]
+        if not candidates:
             raise RuntimeError(
                 "Arduino port not found; pass --serial-port explicitly"
             )
-        self._serial = serial.Serial(
-            port,
-            self.config.baudrate,
-            timeout=self.config.timeout_s,
+        failures = []
+        for port in candidates:
+            try:
+                self._serial = serial.Serial(
+                    port,
+                    self.config.baudrate,
+                    timeout=self.config.timeout_s,
+                )
+                self.port = port
+                if self.config.startup_delay_s > 0.0:
+                    time.sleep(self.config.startup_delay_s)
+                self._wait_ready()
+                return
+            except Exception as exc:
+                failures.append("%s: %s" % (port, exc))
+                if self._serial is not None:
+                    self._serial.close()
+                self._serial = None
+                self.port = None
+        raise RuntimeError(
+            "No Arduino protocol response from automatic candidates: %s"
+            % " | ".join(failures)
         )
-        self.port = port
-        if self.config.startup_delay_s > 0.0:
-            time.sleep(self.config.startup_delay_s)
-        try:
-            self._wait_ready()
-        except Exception:
-            self._serial.close()
-            self._serial = None
-            raise
 
     def send(self, command: ControlCommand) -> None:
         serial_conn = self._require_open()

@@ -21,7 +21,7 @@ from ..sensors.lidar import (
     LidarCsvRecorder,
     LidarCsvReplay,
     RplidarScanner,
-    find_lidar_port,
+    find_lidar_ports,
 )
 from ..types import ControlCommand, ParkingState
 
@@ -110,6 +110,19 @@ class TelemetryRecorder:
                 "cd_balance_error",
                 "cd_balance_span",
                 "cd_center_ready_scans",
+                "left_side_heading_deg",
+                "left_side_line_points",
+                "left_side_line_extent_mm",
+                "left_side_line_linearity",
+                "right_side_heading_deg",
+                "right_side_line_points",
+                "right_side_line_extent_mm",
+                "right_side_line_linearity",
+                "observed_slot_heading_deg",
+                "filtered_slot_heading_deg",
+                "slot_heading_span_deg",
+                "parallel_heading_ready_scans",
+                "parallel_correction_cycles",
             ),
         )
         self._writer.writeheader()
@@ -279,6 +292,69 @@ class TelemetryRecorder:
                 "cd_center_ready_scans": (
                     debug.cd_center_ready_scans
                 ),
+                "left_side_heading_deg": _optional(
+                    (
+                        observation.left_side_line.heading_deg
+                        if observation.left_side_line.valid
+                        else None
+                    )
+                ),
+                "left_side_line_points": (
+                    observation.left_side_line.point_count
+                ),
+                "left_side_line_extent_mm": _optional(
+                    (
+                        observation.left_side_line.extent_mm
+                        if observation.left_side_line.valid
+                        else None
+                    )
+                ),
+                "left_side_line_linearity": _optional(
+                    (
+                        observation.left_side_line.linearity
+                        if observation.left_side_line.valid
+                        else None
+                    )
+                ),
+                "right_side_heading_deg": _optional(
+                    (
+                        observation.right_side_line.heading_deg
+                        if observation.right_side_line.valid
+                        else None
+                    )
+                ),
+                "right_side_line_points": (
+                    observation.right_side_line.point_count
+                ),
+                "right_side_line_extent_mm": _optional(
+                    (
+                        observation.right_side_line.extent_mm
+                        if observation.right_side_line.valid
+                        else None
+                    )
+                ),
+                "right_side_line_linearity": _optional(
+                    (
+                        observation.right_side_line.linearity
+                        if observation.right_side_line.valid
+                        else None
+                    )
+                ),
+                "observed_slot_heading_deg": _optional(
+                    observation.slot_heading_deg
+                ),
+                "filtered_slot_heading_deg": _optional(
+                    debug.slot_heading_deg
+                ),
+                "slot_heading_span_deg": _optional(
+                    debug.slot_heading_span_deg
+                ),
+                "parallel_heading_ready_scans": (
+                    debug.parallel_heading_ready_scans
+                ),
+                "parallel_correction_cycles": (
+                    debug.parallel_correction_cycles
+                ),
             }
         )
         self._handle.flush()
@@ -295,6 +371,7 @@ def run(args: argparse.Namespace) -> int:
     raw_recorder: Optional[LidarCsvRecorder] = None
     telemetry: Optional[TelemetryRecorder] = None
     debug_writer = None
+    lidar_port: Optional[str] = None
     window_enabled = config.runtime.debug_window and not args.no_window
     motor_enabled = config.runtime.motor_enabled and not args.no_motor
 
@@ -302,17 +379,39 @@ def run(args: argparse.Namespace) -> int:
         raise RuntimeError("replay is read-only; add --no-motor")
 
     if replay is None:
-        lidar_port = find_lidar_port(config.lidar.port)
-        if lidar_port is None:
+        lidar_candidates = find_lidar_ports(config.lidar.port)
+        if not lidar_candidates:
             raise RuntimeError(
                 "RPLidar port not found; pass --lidar-port explicitly"
             )
-        scanner = RplidarScanner(
-            lidar_port,
-            max_buf_meas=config.lidar.input_buffer_limit_bytes,
-            scan_type=config.lidar.scan_type,
-        )
-        scanner.start()
+        lidar_failures = []
+        for candidate in lidar_candidates:
+            candidate_scanner = RplidarScanner(
+                candidate,
+                max_buf_meas=(
+                    config.lidar.input_buffer_limit_bytes
+                ),
+                scan_type=config.lidar.scan_type,
+            )
+            candidate_scanner.start()
+            if candidate_scanner.wait_for_scan(6.0):
+                scanner = candidate_scanner
+                lidar_port = candidate
+                break
+            lidar_failures.append(
+                "%s: %s"
+                % (
+                    candidate,
+                    candidate_scanner.error
+                    or "no complete scan within 6 seconds",
+                )
+            )
+            candidate_scanner.close()
+        if scanner is None or lidar_port is None:
+            raise RuntimeError(
+                "No RPLidar scan from automatic candidates: %s"
+                % " | ".join(lidar_failures)
+            )
         LOG.info("rear LiDAR: %s", lidar_port)
 
     if motor_enabled:
@@ -320,7 +419,11 @@ def run(args: argparse.Namespace) -> int:
             config.serial,
             max_steering=config.controller.actuator_max_steering,
         )
-        vehicle.connect()
+        vehicle.connect(
+            excluded_ports=(
+                (lidar_port,) if lidar_port is not None else ()
+            )
+        )
         LOG.info("Arduino: %s", vehicle.port)
 
     perception = RearLidarPerception(config.lidar)
@@ -717,6 +820,32 @@ def _show_debug(
                 cv2.LINE_AA,
             )
 
+    if observation.slot_heading_deg is not None:
+        heading_endpoint = _polar_pixel(
+            origin,
+            min(1200.0, config.runtime.display_range_mm * 0.5),
+            observation.slot_heading_deg,
+            scale,
+        )
+        cv2.line(
+            canvas,
+            origin,
+            heading_endpoint,
+            (255, 80, 255),
+            4,
+        )
+        cv2.putText(
+            canvas,
+            "SLOT HEADING %+.1f deg"
+            % observation.slot_heading_deg,
+            (heading_endpoint[0] + 8, heading_endpoint[1] - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 80, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
     pair = observation.pair
     if pair.valid:
         point_a = _polar_pixel(
@@ -1025,6 +1154,37 @@ def _show_debug(
             debug.cd_center_ready_scans,
             config.controller.cd_center_confirm_scans,
         ),
+        "SIDE LINE L=%sdeg(%dpt) R=%sdeg(%dpt)"
+        % (
+            _fmt(
+                (
+                    observation.left_side_line.heading_deg
+                    if observation.left_side_line.valid
+                    else None
+                ),
+                1,
+            ),
+            observation.left_side_line.point_count,
+            _fmt(
+                (
+                    observation.right_side_line.heading_deg
+                    if observation.right_side_line.valid
+                    else None
+                ),
+                1,
+            ),
+            observation.right_side_line.point_count,
+        ),
+        "PARALLEL observed=%sdeg filtered=%sdeg span=%s "
+        "ready=%d/%d cycles=%d"
+        % (
+            _fmt(observation.slot_heading_deg, 1),
+            _fmt(debug.slot_heading_deg, 1),
+            _fmt(debug.slot_heading_span_deg, 1),
+            debug.parallel_heading_ready_scans,
+            config.controller.parallel_heading_confirm_scans,
+            debug.parallel_correction_cycles,
+        ),
         "FOV=+/-%.0fdeg C/D limit=<%.0fmm"
         % (
             config.lidar.rear_fov_deg,
@@ -1056,9 +1216,9 @@ def _show_debug(
         cv2.putText(
             canvas,
             text,
-            (text_x, 34 + 37 * index),
+            (text_x, 30 + 32 * index),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.56,
+            0.50,
             color,
             1,
             cv2.LINE_AA,

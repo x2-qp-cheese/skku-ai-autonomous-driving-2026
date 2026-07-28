@@ -12,6 +12,7 @@ class ParkingState(str, Enum):
     PREALIGN_LEFT = "prealign_left"
     REVERSE_ALIGN = "reverse_align"
     CENTER_CHECK = "center_check"
+    PARALLEL_FORWARD = "parallel_forward"
     REVERSE_STRAIGHT = "reverse_straight"
     RECOVERY_FORWARD = "recovery_forward"
     PARKED = "parked"

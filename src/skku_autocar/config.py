@@ -50,6 +50,11 @@ class RearLidarConfig:
     tangent_cluster_min_extent_mm: float = 30.0
     tangent_distance_limit_mm: float = 2500.0
     tangent_min_angular_gap_deg: float = 15.0
+    side_line_min_angle_deg: float = 25.0
+    side_line_min_points: int = 4
+    side_line_min_extent_mm: float = 100.0
+    side_line_min_linearity: float = 5.0
+    side_line_max_disagreement_deg: float = 20.0
 
 
 @dataclass(frozen=True)
@@ -59,6 +64,7 @@ class PaperControllerConfig:
     forward_speed: int = 80
     reverse_speed: int = -80
     inside_reverse_speed: int = -50
+    parallel_forward_speed: int = 40
     # The paper's 600 mm setup threshold assumes its own lateral spacing.
     # Our prealign_distance_mm is the scaled equivalent.
     prealign_clear_confirm_scans: int = 3
@@ -81,6 +87,14 @@ class PaperControllerConfig:
     cd_center_tolerance_ratio: float = 0.025
     cd_stability_span_ratio: float = 0.04
     cd_steering_max_step: float = 1.0
+    cd_balance_steering_weight: float = 0.45
+    parallel_heading_trigger_deg: float = 14.0
+    parallel_heading_exit_deg: float = 7.0
+    parallel_heading_tolerance_deg: float = 7.0
+    parallel_heading_full_steer_deg: float = 25.0
+    parallel_heading_confirm_scans: int = 3
+    parallel_heading_missing_scans: int = 3
+    parallel_heading_stability_deg: float = 5.0
     dist_bias_cd_threshold_mm: float = 250.0
     recovery_forward_s: float = 3.0
     command_rate_hz: float = 20.0
@@ -192,6 +206,20 @@ def _validate(config: AppConfig) -> None:
         raise ValueError(
             "tangent_min_angular_gap_deg must be in (0, 180)"
         )
+    if not 0.0 <= lidar.side_line_min_angle_deg < lidar.rear_fov_deg:
+        raise ValueError(
+            "side_line_min_angle_deg must be in [0, rear_fov_deg)"
+        )
+    if lidar.side_line_min_points < 2:
+        raise ValueError("side_line_min_points must be at least 2")
+    if lidar.side_line_min_extent_mm <= 0.0:
+        raise ValueError("side_line_min_extent_mm must be positive")
+    if lidar.side_line_min_linearity <= 1.0:
+        raise ValueError("side_line_min_linearity must exceed 1")
+    if not 0.0 < lidar.side_line_max_disagreement_deg <= 90.0:
+        raise ValueError(
+            "side_line_max_disagreement_deg must be in (0, 90]"
+        )
     if controller.paper_max_steering <= 0.0:
         raise ValueError("paper_max_steering must be positive")
     if controller.actuator_max_steering <= 0:
@@ -209,6 +237,8 @@ def _validate(config: AppConfig) -> None:
         raise ValueError("reverse_speed must be negative")
     if controller.inside_reverse_speed >= 0:
         raise ValueError("inside_reverse_speed must be negative")
+    if controller.parallel_forward_speed <= 0:
+        raise ValueError("parallel_forward_speed must be positive")
     if controller.prealign_clear_confirm_scans < 1:
         raise ValueError(
             "prealign_clear_confirm_scans must be positive"
@@ -251,6 +281,42 @@ def _validate(config: AppConfig) -> None:
         )
     if controller.cd_steering_max_step <= 0.0:
         raise ValueError("cd_steering_max_step must be positive")
+    if not 0.0 < controller.cd_balance_steering_weight <= 1.0:
+        raise ValueError(
+            "cd_balance_steering_weight must be in (0, 1]"
+        )
+    if controller.parallel_heading_trigger_deg <= 0.0:
+        raise ValueError(
+            "parallel_heading_trigger_deg must be positive"
+        )
+    if not (
+        0.0
+        < controller.parallel_heading_exit_deg
+        < controller.parallel_heading_trigger_deg
+    ):
+        raise ValueError(
+            "parallel_heading_exit_deg must be below trigger"
+        )
+    if controller.parallel_heading_tolerance_deg <= 0.0:
+        raise ValueError(
+            "parallel_heading_tolerance_deg must be positive"
+        )
+    if controller.parallel_heading_full_steer_deg <= 0.0:
+        raise ValueError(
+            "parallel_heading_full_steer_deg must be positive"
+        )
+    if controller.parallel_heading_confirm_scans < 1:
+        raise ValueError(
+            "parallel_heading_confirm_scans must be positive"
+        )
+    if controller.parallel_heading_missing_scans < 1:
+        raise ValueError(
+            "parallel_heading_missing_scans must be positive"
+        )
+    if controller.parallel_heading_stability_deg <= 0.0:
+        raise ValueError(
+            "parallel_heading_stability_deg must be positive"
+        )
     if controller.finish_missing_confirm_scans < 1:
         raise ValueError(
             "finish_missing_confirm_scans must be positive"

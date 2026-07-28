@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from math import atan2, cos, degrees, hypot, radians, sin
+from math import atan2, cos, degrees, hypot, radians, sin, sqrt
 from typing import Optional, Sequence, Tuple
 
 from ..config import RearLidarConfig
@@ -40,6 +40,16 @@ class PointCluster:
 
 
 @dataclass(frozen=True)
+class SideLineEstimate:
+    valid: bool = False
+    heading_deg: float = 0.0
+    point_count: int = 0
+    extent_mm: float = 0.0
+    linearity: float = 0.0
+    score: float = 0.0
+
+
+@dataclass(frozen=True)
 class RearLidarObservation:
     timestamp: float = 0.0
     valid: bool = False
@@ -61,6 +71,9 @@ class RearLidarObservation:
     pair: TangentPair = TangentPair()
     dist_c_mm: Optional[float] = None
     dist_d_mm: Optional[float] = None
+    left_side_line: SideLineEstimate = SideLineEstimate()
+    right_side_line: SideLineEstimate = SideLineEstimate()
+    slot_heading_deg: Optional[float] = None
     reason: str = "no_scan"
 
 
@@ -144,6 +157,12 @@ class RearLidarPerception:
             self.config.side_angle_min_deg,
             self.config.side_angle_max_deg,
         )
+        left_side_line = self._side_line_estimate(points, right=False)
+        right_side_line = self._side_line_estimate(points, right=True)
+        slot_heading = self._combine_side_headings(
+            left_side_line,
+            right_side_line,
+        )
         pair = self._paper_tangent_pair(fused_pair_points)
         right_cluster = self._select_right_vehicle_cluster(points)
         right_raw = right_cluster is not None
@@ -190,6 +209,9 @@ class RearLidarPerception:
             pair=pair,
             dist_c_mm=dist_c,
             dist_d_mm=dist_d,
+            left_side_line=left_side_line,
+            right_side_line=right_side_line,
+            slot_heading_deg=slot_heading,
             reason="paper_values_available",
         )
 
@@ -509,6 +531,133 @@ class RearLidarPerception:
             < self.config.side_distance_limit_mm
         ]
         return min(distances) if distances else None
+
+    def _side_line_estimate(
+        self,
+        points: Sequence[RearPoint],
+        *,
+        right: bool,
+    ) -> SideLineEstimate:
+        """Fit the visible side of a parked vehicle with a PCA line.
+
+        C/D describe lateral position at one instant, but cannot reveal
+        whether the ego vehicle is rotated inside the slot.  A line fitted
+        to either adjacent parked vehicle supplies that missing heading.
+        """
+
+        side_points = tuple(
+            point
+            for point in points
+            if (
+                point.distance_mm
+                < self.config.side_distance_limit_mm
+                and abs(point.angle_deg)
+                >= self.config.side_line_min_angle_deg
+                and (
+                    point.x_right_mm > 0.0
+                    if right
+                    else point.x_right_mm < 0.0
+                )
+            )
+        )
+        estimates = []
+        for cluster in self._euclidean_clusters(side_points):
+            if (
+                len(cluster.points)
+                < self.config.side_line_min_points
+                or cluster.extent_mm
+                < self.config.side_line_min_extent_mm
+                or cluster.extent_mm
+                > self.config.vehicle_cluster_max_extent_mm
+            ):
+                continue
+            estimate = self._fit_cluster_line(cluster)
+            if (
+                estimate.linearity
+                < self.config.side_line_min_linearity
+            ):
+                continue
+            estimates.append(estimate)
+        if not estimates:
+            return SideLineEstimate()
+        return max(estimates, key=lambda item: item.score)
+
+    @staticmethod
+    def _fit_cluster_line(
+        cluster: PointCluster,
+    ) -> SideLineEstimate:
+        points = cluster.points
+        count = len(points)
+        mean_x = sum(point.x_right_mm for point in points) / count
+        mean_y = sum(point.y_back_mm for point in points) / count
+        variance_x = sum(
+            (point.x_right_mm - mean_x) ** 2 for point in points
+        ) / count
+        variance_y = sum(
+            (point.y_back_mm - mean_y) ** 2 for point in points
+        ) / count
+        covariance = sum(
+            (point.x_right_mm - mean_x)
+            * (point.y_back_mm - mean_y)
+            for point in points
+        ) / count
+        trace = variance_x + variance_y
+        discriminant = sqrt(
+            max(
+                0.0,
+                (variance_x - variance_y) ** 2
+                + 4.0 * covariance * covariance,
+            )
+        )
+        major = (trace + discriminant) / 2.0
+        minor = (trace - discriminant) / 2.0
+        linearity = major / max(1.0, minor)
+        # Heading is measured from the ego rear axis.  A line parallel to
+        # the vehicle is 0 degrees; positive values lean toward the right.
+        heading = 0.5 * degrees(
+            atan2(
+                2.0 * covariance,
+                variance_y - variance_x,
+            )
+        )
+        score = (
+            cluster.extent_mm
+            * sqrt(min(100.0, max(1.0, linearity)))
+        )
+        return SideLineEstimate(
+            valid=True,
+            heading_deg=heading,
+            point_count=count,
+            extent_mm=cluster.extent_mm,
+            linearity=linearity,
+            score=score,
+        )
+
+    def _combine_side_headings(
+        self,
+        left: SideLineEstimate,
+        right: SideLineEstimate,
+    ) -> Optional[float]:
+        if left.valid and right.valid:
+            if (
+                abs(left.heading_deg - right.heading_deg)
+                > self.config.side_line_max_disagreement_deg
+            ):
+                return (
+                    left.heading_deg
+                    if left.score >= right.score
+                    else right.heading_deg
+                )
+            total = left.score + right.score
+            return (
+                left.heading_deg * left.score
+                + right.heading_deg * right.score
+            ) / max(1.0, total)
+        if left.valid:
+            return left.heading_deg
+        if right.valid:
+            return right.heading_deg
+        return None
 
 
 def _wrap_degrees(angle: float) -> float:

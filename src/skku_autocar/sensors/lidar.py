@@ -133,6 +133,17 @@ def find_lidar_port(
 ) -> Optional[str]:
     """Find the RPLidar serial port, preferring macOS callout devices."""
 
+    candidates = find_lidar_ports(explicit_port, ports, exists)
+    return candidates[0] if candidates else None
+
+
+def find_lidar_ports(
+    explicit_port: Optional[str] = None,
+    ports: Optional[Sequence[Any]] = None,
+    exists: Optional[Callable[[str], bool]] = None,
+) -> List[str]:
+    """Return likely RPLidar endpoints in probe order."""
+
     exists = exists or (lambda value: Path(value).exists())
     requested = (
         None
@@ -146,13 +157,14 @@ def find_lidar_port(
         if exists(requested) or (
             upper.startswith("COM") and upper[3:].isdigit()
         ):
-            return requested
+            return [requested]
+        return []
 
     if ports is None:
         try:
             from serial.tools import list_ports
         except ImportError:
-            return None
+            return []
         ports = tuple(list_ports.comports())
 
     candidates = tuple(ports)
@@ -170,9 +182,9 @@ def find_lidar_port(
         if score > 0:
             scored.append((score, str(getattr(port, "device", ""))))
     if not scored:
-        return None
+        return []
     scored.sort(reverse=True)
-    return scored[0][1]
+    return [device for _, device in scored]
 
 
 def _score_lidar_port(port: Any) -> int:
@@ -264,6 +276,15 @@ class RplidarScanner:
     def latest(self) -> Optional[LidarScan]:
         with self._lock:
             return self._latest
+
+    def wait_for_scan(self, timeout_s: float = 5.0) -> bool:
+        deadline = time.monotonic() + max(0.1, timeout_s)
+        while time.monotonic() < deadline:
+            if self.latest() is not None:
+                return True
+            if self._stop_event.wait(0.05):
+                break
+        return self.latest() is not None
 
     @property
     def error(self) -> Optional[Exception]:

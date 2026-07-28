@@ -5,6 +5,7 @@ from .lidar import (
     LidarScan,
     RplidarScanner,
     find_lidar_port,
+    find_lidar_ports,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "LidarScan",
     "RplidarScanner",
     "find_lidar_port",
+    "find_lidar_ports",
 ]
