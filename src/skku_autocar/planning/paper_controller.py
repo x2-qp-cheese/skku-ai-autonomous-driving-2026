@@ -30,6 +30,9 @@ class PaperParkingDebug:
     slot_heading_span_deg: Optional[float] = None
     parallel_heading_ready_scans: int = 0
     parallel_correction_cycles: int = 0
+    parallel_cd_missing_scans: int = 0
+    parallel_no_improvement_scans: int = 0
+    parallel_best_heading_deg: Optional[float] = None
     prealign_near_seen: bool = False
     prealign_ready_scans: int = 0
     pair_hold_scans: int = 0
@@ -78,6 +81,12 @@ class PaperParkingController:
         self._slot_heading_missing_scans = 0
         self._parallel_heading_ready_scans = 0
         self._parallel_correction_cycles = 0
+        self._parallel_cd_missing_scans = 0
+        self._parallel_no_improvement_scans = 0
+        self._parallel_best_abs_heading: Optional[float] = None
+        self._parallel_exit_requested = False
+        self._parallel_exit_reason = ""
+        self._last_parallel_timestamp: Optional[float] = None
         self._last_slot_heading: Optional[float] = None
         self._last_heading_timestamp: Optional[float] = None
         self._last_cd_steering = 0.0
@@ -617,6 +626,17 @@ class PaperParkingController:
         self.state = ParkingState.PARALLEL_FORWARD
         self._parallel_heading_ready_scans = 0
         self._parallel_correction_cycles += 1
+        self._parallel_cd_missing_scans = 0
+        self._parallel_no_improvement_scans = 0
+        slot_heading, _ = self._filtered_slot_heading()
+        self._parallel_best_abs_heading = (
+            abs(slot_heading)
+            if slot_heading is not None
+            else None
+        )
+        self._parallel_exit_requested = False
+        self._parallel_exit_reason = ""
+        self._last_parallel_timestamp = None
         self._cd_steering_initialized = False
         return self._parallel_forward(observation, reason)
 
@@ -625,6 +645,12 @@ class PaperParkingController:
         observation: RearLidarObservation,
         transition_reason: str = "parallel_forward_alignment",
     ) -> ControlCommand:
+        if self._parallel_exit_requested:
+            return self._resume_reverse_after_parallel(
+                observation,
+                self._parallel_exit_reason,
+            )
+
         if self._is_new_scan:
             self._update_slot_heading(observation)
         slot_heading, heading_span = self._filtered_slot_heading()
@@ -636,6 +662,33 @@ class PaperParkingController:
             return self._stop(
                 "parallel_forward_waiting_for_side_line"
             )
+
+        new_parallel_scan = (
+            observation.timestamp != self._last_parallel_timestamp
+        )
+        if new_parallel_scan:
+            self._last_parallel_timestamp = observation.timestamp
+            if (
+                observation.dist_c_mm is None
+                or observation.dist_d_mm is None
+            ):
+                self._parallel_cd_missing_scans += 1
+            else:
+                self._parallel_cd_missing_scans = 0
+
+            absolute_heading = abs(slot_heading)
+            if self._parallel_best_abs_heading is None:
+                self._parallel_best_abs_heading = absolute_heading
+                self._parallel_no_improvement_scans = 0
+            elif (
+                absolute_heading
+                <= self._parallel_best_abs_heading
+                - self.config.parallel_min_improvement_deg
+            ):
+                self._parallel_best_abs_heading = absolute_heading
+                self._parallel_no_improvement_scans = 0
+            else:
+                self._parallel_no_improvement_scans += 1
 
         heading_ready = (
             abs(slot_heading)
@@ -650,10 +703,16 @@ class PaperParkingController:
             else:
                 self._parallel_heading_ready_scans = 0
 
-        desired_steering = self._h(
-            -self.config.paper_max_steering
-            * slot_heading
-            / self.config.parallel_heading_full_steer_deg
+        desired_steering = max(
+            -self.config.parallel_forward_max_steering,
+            min(
+                self.config.parallel_forward_max_steering,
+                self._h(
+                    -self.config.paper_max_steering
+                    * slot_heading
+                    / self.config.parallel_heading_full_steer_deg
+                ),
+            ),
         )
         self.debug = PaperParkingDebug(
             state=self.state,
@@ -668,6 +727,15 @@ class PaperParkingController:
             parallel_correction_cycles=(
                 self._parallel_correction_cycles
             ),
+            parallel_cd_missing_scans=(
+                self._parallel_cd_missing_scans
+            ),
+            parallel_no_improvement_scans=(
+                self._parallel_no_improvement_scans
+            ),
+            parallel_best_heading_deg=(
+                self._parallel_best_abs_heading
+            ),
             prealign_near_seen=self._prealign_near_seen,
             prealign_ready_scans=self._prealign_ready_scans,
             pair_hold_scans=self._pair_missing_scans,
@@ -679,14 +747,25 @@ class PaperParkingController:
             self._parallel_heading_ready_scans
             >= self.config.parallel_heading_confirm_scans
         ):
-            self.state = ParkingState.CENTER_CHECK
-            self._reset_center_observation()
-            self._cd_center_ready_scans = 0
-            self._cd_missing_scans = 0
-            self._cd_steering_initialized = False
-            return self._center_check(
+            return self._request_reverse_after_parallel(
                 observation,
-                "parallel_forward_complete_reverse_again",
+                "parallel_heading_aligned",
+            )
+        if (
+            self._parallel_cd_missing_scans
+            >= self.config.parallel_cd_missing_exit_scans
+        ):
+            return self._request_reverse_after_parallel(
+                observation,
+                "parallel_cd_visibility_lost",
+            )
+        if (
+            self._parallel_no_improvement_scans
+            >= self.config.parallel_no_improvement_exit_scans
+        ):
+            return self._request_reverse_after_parallel(
+                observation,
+                "parallel_heading_not_improving",
             )
 
         return ControlCommand(
@@ -706,6 +785,40 @@ class PaperParkingController:
                 self.config.parallel_heading_confirm_scans,
             ),
         )
+
+    def _request_reverse_after_parallel(
+        self,
+        observation: RearLidarObservation,
+        reason: str,
+    ) -> ControlCommand:
+        self._parallel_exit_requested = True
+        self._parallel_exit_reason = reason
+        return self._resume_reverse_after_parallel(
+            observation,
+            reason,
+        )
+
+    def _resume_reverse_after_parallel(
+        self,
+        observation: RearLidarObservation,
+        reason: str,
+    ) -> ControlCommand:
+        if not observation.pair.valid:
+            self._set_debug(
+                "%s_waiting_for_live_ab" % reason
+            )
+            return ControlCommand.stop(
+                "%s_waiting_for_live_ab" % reason
+            )
+
+        self._parallel_exit_requested = False
+        self._parallel_exit_reason = ""
+        self.state = ParkingState.REVERSE_ALIGN
+        self._reverse_motion_started = False
+        self._both_sides_seen_scans = 0
+        self._reset_pair_tracking(observation)
+        self._reset_center_observation()
+        return self._reverse_align(observation)
 
     def _reverse_straight(
         self,
@@ -864,6 +977,12 @@ class PaperParkingController:
         self._slot_heading_missing_scans = 0
         self._parallel_heading_ready_scans = 0
         self._parallel_correction_cycles = 0
+        self._parallel_cd_missing_scans = 0
+        self._parallel_no_improvement_scans = 0
+        self._parallel_best_abs_heading = None
+        self._parallel_exit_requested = False
+        self._parallel_exit_reason = ""
+        self._last_parallel_timestamp = None
         self._last_slot_heading = None
         self._last_heading_timestamp = None
         self._last_cd_steering = 0.0
@@ -1115,6 +1234,15 @@ class PaperParkingController:
             ),
             parallel_correction_cycles=(
                 self._parallel_correction_cycles
+            ),
+            parallel_cd_missing_scans=(
+                self._parallel_cd_missing_scans
+            ),
+            parallel_no_improvement_scans=(
+                self._parallel_no_improvement_scans
+            ),
+            parallel_best_heading_deg=(
+                self._parallel_best_abs_heading
             ),
             reason=reason,
         )

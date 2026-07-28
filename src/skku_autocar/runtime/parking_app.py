@@ -123,6 +123,9 @@ class TelemetryRecorder:
                 "slot_heading_span_deg",
                 "parallel_heading_ready_scans",
                 "parallel_correction_cycles",
+                "parallel_cd_missing_scans",
+                "parallel_no_improvement_scans",
+                "parallel_best_heading_deg",
             ),
         )
         self._writer.writeheader()
@@ -354,6 +357,15 @@ class TelemetryRecorder:
                 ),
                 "parallel_correction_cycles": (
                     debug.parallel_correction_cycles
+                ),
+                "parallel_cd_missing_scans": (
+                    debug.parallel_cd_missing_scans
+                ),
+                "parallel_no_improvement_scans": (
+                    debug.parallel_no_improvement_scans
+                ),
+                "parallel_best_heading_deg": _optional(
+                    debug.parallel_best_heading_deg
                 ),
             }
         )
@@ -1175,15 +1187,23 @@ def _show_debug(
             ),
             observation.right_side_line.point_count,
         ),
-        "PARALLEL observed=%sdeg filtered=%sdeg span=%s "
-        "ready=%d/%d cycles=%d"
+        "PARALLEL obs=%s filtered=%s best=%s span=%s "
+        "ready=%d/%d cycle=%d"
         % (
             _fmt(observation.slot_heading_deg, 1),
             _fmt(debug.slot_heading_deg, 1),
+            _fmt(debug.parallel_best_heading_deg, 1),
             _fmt(debug.slot_heading_span_deg, 1),
             debug.parallel_heading_ready_scans,
             config.controller.parallel_heading_confirm_scans,
             debug.parallel_correction_cycles,
+        ),
+        "PARALLEL EXIT cdMissing=%d/%d noImprove=%d/%d"
+        % (
+            debug.parallel_cd_missing_scans,
+            config.controller.parallel_cd_missing_exit_scans,
+            debug.parallel_no_improvement_scans,
+            config.controller.parallel_no_improvement_exit_scans,
         ),
         "FOV=+/-%.0fdeg C/D limit=<%.0fmm"
         % (
@@ -1216,7 +1236,7 @@ def _show_debug(
         cv2.putText(
             canvas,
             text,
-            (text_x, 30 + 32 * index),
+            (text_x, 28 + 30 * index),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.50,
             color,

@@ -64,7 +64,8 @@ class PaperControllerConfig:
     forward_speed: int = 80
     reverse_speed: int = -80
     inside_reverse_speed: int = -50
-    parallel_forward_speed: int = 40
+    parallel_forward_speed: int = 35
+    parallel_forward_max_steering: float = 4.0
     # The paper's 600 mm setup threshold assumes its own lateral spacing.
     # Our prealign_distance_mm is the scaled equivalent.
     prealign_clear_confirm_scans: int = 3
@@ -89,12 +90,15 @@ class PaperControllerConfig:
     cd_steering_max_step: float = 1.0
     cd_balance_steering_weight: float = 0.45
     parallel_heading_trigger_deg: float = 14.0
-    parallel_heading_exit_deg: float = 7.0
+    parallel_heading_exit_deg: float = 10.0
     parallel_heading_tolerance_deg: float = 7.0
     parallel_heading_full_steer_deg: float = 25.0
-    parallel_heading_confirm_scans: int = 3
+    parallel_heading_confirm_scans: int = 2
     parallel_heading_missing_scans: int = 3
-    parallel_heading_stability_deg: float = 5.0
+    parallel_heading_stability_deg: float = 6.0
+    parallel_cd_missing_exit_scans: int = 3
+    parallel_no_improvement_exit_scans: int = 10
+    parallel_min_improvement_deg: float = 0.75
     dist_bias_cd_threshold_mm: float = 250.0
     recovery_forward_s: float = 3.0
     command_rate_hz: float = 20.0
@@ -239,6 +243,15 @@ def _validate(config: AppConfig) -> None:
         raise ValueError("inside_reverse_speed must be negative")
     if controller.parallel_forward_speed <= 0:
         raise ValueError("parallel_forward_speed must be positive")
+    if not (
+        0.0
+        < controller.parallel_forward_max_steering
+        <= controller.paper_max_steering
+    ):
+        raise ValueError(
+            "parallel_forward_max_steering must be in "
+            "(0, paper_max_steering]"
+        )
     if controller.prealign_clear_confirm_scans < 1:
         raise ValueError(
             "prealign_clear_confirm_scans must be positive"
@@ -316,6 +329,18 @@ def _validate(config: AppConfig) -> None:
     if controller.parallel_heading_stability_deg <= 0.0:
         raise ValueError(
             "parallel_heading_stability_deg must be positive"
+        )
+    if controller.parallel_cd_missing_exit_scans < 1:
+        raise ValueError(
+            "parallel_cd_missing_exit_scans must be positive"
+        )
+    if controller.parallel_no_improvement_exit_scans < 1:
+        raise ValueError(
+            "parallel_no_improvement_exit_scans must be positive"
+        )
+    if controller.parallel_min_improvement_deg <= 0.0:
+        raise ValueError(
+            "parallel_min_improvement_deg must be positive"
         )
     if controller.finish_missing_confirm_scans < 1:
         raise ValueError(
