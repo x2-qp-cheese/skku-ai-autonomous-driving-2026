@@ -180,20 +180,13 @@ class PaperParkingController:
                 )
             )
 
-        prospective_steering, _, _ = self._paper_steering(pair)
+        _, entry_center_angle = self._entry_midpoint_steering(pair)
         if self._is_new_scan and observation.prealign_near:
             self._prealign_near_seen = True
 
-        near_cycle_complete = (
-            self._realigning_after_dropout
-            or (
-                self._prealign_near_seen
-                and not observation.prealign_near
-            )
-        )
         ready_now = (
-            prospective_steering > 0.0
-            and near_cycle_complete
+            abs(entry_center_angle)
+            <= self.config.entry_full_steer_angle_deg
             and not pair_held
         )
         if self._is_new_scan:
@@ -217,13 +210,12 @@ class PaperParkingController:
             ),
             (
                 "figure7_t_entry_left "
-                "nearSeen=%s nearNow=%s "
-                "nextEq5=%+.2f confirm=%d/%d"
+                "entryCenter=%+.1f target<=%.1f "
+                "confirm=%d/%d"
             )
             % (
-                self._prealign_near_seen,
-                observation.prealign_near,
-                prospective_steering,
+                entry_center_angle,
+                self.config.entry_full_steer_angle_deg,
                 self._prealign_ready_scans,
                 self.config.prealign_clear_confirm_scans,
             ),
