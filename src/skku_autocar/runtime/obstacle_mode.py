@@ -418,17 +418,12 @@ def build_lane_change_config(args: argparse.Namespace) -> LaneChangeConfig:
         target_capture_error=args.lane_change_target_capture_error,
         target_capture_frames=args.lane_change_target_capture_frames,
         allow_virtual_stabilize=args.lane_change_allow_virtual_stabilize == "on",
-        smooth_avoidance=args.lane_change_smooth_avoidance == "on",
+        smooth_avoidance=True,
         return_duration_scale=args.lane_change_return_duration_scale,
         return_steering_cap=args.lane_change_return_steering_cap,
         return_stabilizing_steering_cap=(
             args.lane_change_return_stabilizing_steering_cap
         ),
-        return_stable_lateral_error=args.lane_change_return_stable_lateral_error,
-        return_stable_near_lateral_error=(
-            args.lane_change_return_stable_near_error
-        ),
-        return_stable_required_frames=args.lane_change_return_stable_frames,
     )
 
 
@@ -687,9 +682,6 @@ def add_obstacle_arguments(parser: argparse.ArgumentParser) -> None:
         ("--lane-change-return-duration-scale", float, 1.35),
         ("--lane-change-return-steering-cap", int, 115),
         ("--lane-change-return-stabilizing-steering-cap", int, 90),
-        ("--lane-change-return-stable-lateral-error", float, 0.0),
-        ("--lane-change-return-stable-near-error", float, 0.0),
-        ("--lane-change-return-stable-frames", int, 0),
     )
     for name, value_type, default in lane_specs:
         group.add_argument(name, type=value_type, default=default)
@@ -708,12 +700,6 @@ def add_obstacle_arguments(parser: argparse.ArgumentParser) -> None:
         "--lane-change-allow-virtual-stabilize",
         choices=("on", "off"),
         default="off",
-    )
-    group.add_argument(
-        "--lane-change-smooth-avoidance",
-        choices=("on", "off"),
-        default="on",
-        help="use timed smoothstep obstacle lane changes; off uses immediate target-lane capture",
     )
 
     obstacle_specs = (

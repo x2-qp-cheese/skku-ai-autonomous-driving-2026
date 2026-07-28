@@ -46,8 +46,8 @@ class YoloLaneFollowerConfig:
     path_lateral_gain: float = 225.0
     path_heading_gain: float = 70.0
     path_derivative_gain: float = 18.0
-    path_near_weight: float = 1.60
-    path_far_weight: float = 0.45
+    path_near_weight: float = 1.25
+    path_far_weight: float = 0.70
     path_steering_rise_alpha: float = 0.55
     path_steering_release_alpha: float = 0.28
     # Recover a car that starts measurably off-center before full-speed travel
@@ -132,7 +132,7 @@ class YoloLaneFollower:
 
         raw_curve_strength = self._curve_strength_from(lane)
         curve_strength = self._smooth_curve_strength(raw_curve_strength)
-        centering_error = lane.lateral_error_norm
+        centering_error = self._centering_error(lane)
         recovery_strength = self._center_recovery_strength(centering_error)
         center_lock_active = self._center_lock_active(centering_error)
 
@@ -247,14 +247,6 @@ class YoloLaneFollower:
             raw_steering += reversal_near_guard * (
                 near_steering - raw_steering
             )
-        weak_reversal_hold = self._path_weak_reversal_hold_active(
-            lane,
-            path_error,
-            near_error,
-            raw_steering,
-        )
-        if weak_reversal_hold:
-            raw_steering = 0.0
         curve_guard_limit = self._path_curve_guard_limit(
             lane,
             path_error,
@@ -384,7 +376,7 @@ class YoloLaneFollower:
         self._path_heading_lead = heading_lead
         self._path_state = (
             "curve_transition"
-            if reversal_near_guard > 0.0 or weak_reversal_hold
+            if reversal_near_guard > 0.0
             else self._classify_path_state(
                 path_error,
                 lane.heading_error,
@@ -481,69 +473,6 @@ class YoloLaneFollower:
             and raw_steering * float(lane.heading_error) > 0.0
         )
         return coherent_path or coherent_heading
-
-    def _path_weak_reversal_hold_active(
-        self,
-        lane: LaneGeometry,
-        path_error: float,
-        near_error: float,
-        raw_steering: float,
-    ) -> bool:
-        """Suppress one-frame S-curve sign flips before geometry is committed."""
-        reason = str(lane.reason)
-        previous = float(self._last_steering)
-        if (
-            not reason.startswith("corridor_tier1")
-            or any(
-                token in reason
-                for token in ("lane_change", "crosswalk", "coast", "virtual")
-            )
-            or float(lane.confidence) < 0.75
-            or raw_steering * previous >= 0.0
-        ):
-            return False
-
-        minimum_steering = max(
-            0.0,
-            float(self.config.path_reversal_min_steering),
-        )
-        if abs(previous) < minimum_steering:
-            return False
-
-        previous_direction = 1.0 if previous >= 0.0 else -1.0
-        near_supports_previous = (
-            float(near_error) * previous_direction >= 0.0
-            or abs(float(near_error))
-            <= max(0.0, float(self.config.path_reversal_near_guard_error))
-        )
-        if not near_supports_previous:
-            return False
-
-        minimum_geometry = max(
-            0.0,
-            float(self.config.path_reversal_min_geometry),
-        )
-        strong_geometry = (
-            (
-                abs(float(path_error)) >= 2.0 * minimum_geometry
-                and raw_steering * float(path_error) > 0.0
-            )
-            or (
-                abs(float(lane.heading_error))
-                >= max(
-                    2.0 * minimum_geometry,
-                    float(self.config.path_near_conflict_heading_limit),
-                )
-                and raw_steering * float(lane.heading_error) > 0.0
-            )
-        )
-        if strong_geometry:
-            return False
-
-        return abs(float(raw_steering)) < max(
-            minimum_steering,
-            0.5 * max(0.0, float(self.config.path_reversal_output_min_steering)),
-        )
 
     def _path_reversal_near_guard_strength(
         self,
@@ -777,10 +706,9 @@ class YoloLaneFollower:
         if abs(heading) <= 1e-6:
             return 0.0
 
-        # A near/far sign split is normal at an S-curve transition. The far
-        # endpoint can still preview the next curve, but it must not overpower
-        # a reliable near-field center error because that is what keeps the
-        # car inside the lane at the reversal point.
+        # A near/far sign split is normal at an S-curve transition. Preserve
+        # heading preview when the complete path endpoint and heading agree;
+        # otherwise treat the split as incoherent geometry.
         alignment = 1.0
         if abs(reference) > 0.015 and heading * reference < 0.0:
             far_error = float(lane.lateral_error_norm)
@@ -799,26 +727,6 @@ class YoloLaneFollower:
             )
             if not coherent_far_curve:
                 alignment = 0.0
-            elif abs(near_error) > max(
-                0.0,
-                float(self.config.path_near_conflict_error_threshold),
-            ):
-                conflict_start = max(
-                    0.0,
-                    float(self.config.path_near_conflict_error_threshold),
-                )
-                conflict_full = max(
-                    conflict_start + 1e-6,
-                    float(self.config.path_reversal_near_full_error),
-                )
-                near_ratio = self._clip_float(
-                    (abs(near_error) - conflict_start)
-                    / (conflict_full - conflict_start),
-                    0.0,
-                    1.0,
-                )
-                near_ratio = near_ratio * near_ratio * (3.0 - 2.0 * near_ratio)
-                alignment *= 1.0 - 0.70 * near_ratio
 
         span = max(1e-6, float(self.config.path_heading_lead_span))
         lead = max(0.0, abs(heading) - abs(reference)) / span
@@ -1100,6 +1008,13 @@ class YoloLaneFollower:
         if not self.config.center_lock_enabled:
             return False
         return abs(lateral_error) >= self.config.center_lock_error_threshold
+
+    @staticmethod
+    def _centering_error(lane: LaneGeometry) -> float:
+        near = lane.near_lateral_error_norm
+        if near is not None and abs(near) > abs(lane.lateral_error_norm):
+            return near
+        return lane.lateral_error_norm
 
     def _apply_center_lock(self, steering: float, lateral_error: float, active: bool) -> float:
         if not active:

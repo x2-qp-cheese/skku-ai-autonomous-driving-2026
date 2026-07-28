@@ -253,7 +253,6 @@ def run(args: argparse.Namespace) -> int:
                 obstacle_mode.lane_change_state,
                 obstacle_mode.status_text,
                 obstacle_mode.frame_obstacle_masks,
-                args.path_tracking,
             )
             recorder.write(frame, display)
             if not args.headless:
@@ -269,7 +268,6 @@ def run(args: argparse.Namespace) -> int:
                             bev_mask,
                             lane,
                             fuse_masks(list(obstacle_mode.bev_obstacle_masks)),
-                            args.path_tracking,
                         ),
                     )
                 elif mask_result is not None:
@@ -324,7 +322,6 @@ def build_bev_corridor_config(args: argparse.Namespace) -> BevCorridorConfig:
         heading_gain=args.bev_heading_gain,
         center_smooth_alpha=args.bev_center_smooth,
         heading_smooth_alpha=args.bev_heading_smooth,
-        control_full_path=args.path_tracking,
         path_smooth_alpha=args.bev_path_smooth,
         path_max_step_px=args.bev_path_max_step,
         center_anchor=args.corridor_center_anchor == "on",
@@ -1537,7 +1534,6 @@ def draw_debug(
     lane_change_status: str = "off",
     obstacle_status: str = "off",
     obstacle_masks: tuple = (),
-    track_full_path: bool = False,
 ) -> Any:
     display = frame.copy()
     if mask_result is not None:
@@ -1600,7 +1596,7 @@ def draw_debug(
                     color=boundary_color,
                     thickness=2,
                 )
-            if track_full_path and lane.path_points:
+            if lane.path_points:
                 path = transformer.bev_to_frame(
                     lane.path_points,
                     (height, width),
@@ -1615,15 +1611,11 @@ def draw_debug(
                     )
             target = transformer.bev_to_frame([(lane.center_x, lane.target_y)], (height, width))[0]
             tp = (int(target[0]), int(target[1]))
-            if not track_full_path:
+            if not lane.path_points:
                 cv2.line(display, (vehicle_x, height - 1), tp, (0, 0, 255), 2)
             cv2.circle(display, tp, 9, (255, 255, 255), -1)
             cv2.circle(display, tp, 6, (0, 0, 255), -1)
-            if (
-                track_full_path
-                and lane.near_center_x is not None
-                and lane.near_target_y is not None
-            ):
+            if lane.near_center_x is not None and lane.near_target_y is not None:
                 near = transformer.bev_to_frame(
                     [(lane.near_center_x, lane.near_target_y)],
                     (height, width),
@@ -1653,10 +1645,7 @@ def draw_debug(
             if lane.near_lateral_error_norm is None
             else "%.3f" % lane.near_lateral_error_norm
         ),
-        "target=%s path_points=%d" % (
-            "path" if track_full_path else "point",
-            len(lane.path_points),
-        ),
+        "path_points=%d" % len(lane.path_points),
         "control=%s" % _control_state(command.reason),
         "fps=%.1f" % fps,
     ]
@@ -1705,7 +1694,6 @@ def draw_bev_mask_debug(
     bev_mask: Any,
     lane: LaneGeometry,
     obstacle_mask: Any = None,
-    track_full_path: bool = False,
 ) -> Any:
     """Binary BEV road mask (white=road) with the vehicle center axis, a single
     line joining it to the target point, and the tracked target dot."""
@@ -1719,7 +1707,7 @@ def draw_bev_mask_debug(
     cv2.line(canvas, (cx, 0), (cx, h), (255, 255, 0), 1)
 
     if lane is not None and lane.found:
-        if track_full_path and lane.path_points:
+        if lane.path_points:
             points = [
                 (int(round(x)), int(round(y)))
                 for x, y in lane.path_points
@@ -1733,16 +1721,12 @@ def draw_bev_mask_debug(
                     4,
                 )
         target = (int(lane.center_x), int(lane.target_y))
-        if not track_full_path:
+        if not lane.path_points:
             cv2.line(canvas, (cx, h - 1), target, (0, 0, 255), 2)
         # tracked target point: red dot with a white outline for visibility
         cv2.circle(canvas, target, 7, (255, 255, 255), -1)
         cv2.circle(canvas, target, 5, (0, 0, 255), -1)
-        if (
-            track_full_path
-            and lane.near_center_x is not None
-            and lane.near_target_y is not None
-        ):
+        if lane.near_center_x is not None and lane.near_target_y is not None:
             near = (int(lane.near_center_x), int(lane.near_target_y))
             cv2.circle(canvas, near, 5, (255, 0, 255), -1)
     return canvas

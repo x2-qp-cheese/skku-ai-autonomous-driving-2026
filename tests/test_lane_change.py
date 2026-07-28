@@ -716,34 +716,6 @@ class LaneChangeControllerTest(unittest.TestCase):
 
         self.assertEqual(returning.state, "changing_to_lane2")
 
-    def test_smooth_avoidance_does_not_jump_to_full_offset_on_commit(self):
-        self.controller = LaneChangeController(
-            LaneChangeConfig(
-                mode="external",
-                transition_seconds=0.60,
-                smooth_avoidance=True,
-                stable_required_frames=0,
-            )
-        )
-        self.assertTrue(
-            self.controller.request_avoidance("obstacle_fusion")
-        )
-
-        started = self.controller.update(
-            lane(), 150.0, 800.0, 0.0, True
-        )
-        progressing = self.controller.update(
-            lane(), 150.0, 800.0, 0.30, True
-        )
-        finished = self.controller.update(
-            lane(), 150.0, 800.0, 0.60, True
-        )
-
-        self.assertEqual(started.state, "changing_to_lane1")
-        self.assertAlmostEqual(started.offset_px, 0.0)
-        self.assertLess(abs(progressing.offset_px), 150.0)
-        self.assertEqual(finished.state, "lane1")
-
     def test_avoidance_steering_slew_is_continuous_through_stabilization(self):
         self.controller = LaneChangeController(
             LaneChangeConfig(
@@ -856,96 +828,6 @@ class LaneChangeControllerTest(unittest.TestCase):
         self.assertEqual(stabilizing.state, "stabilizing_lane1")
         self.assertEqual(adjusted.steering, 70)
         self.assertIn("lane_change_stabilize", adjusted.reason)
-
-    def test_avoidance_stabilization_rejects_countersteer_after_return(self):
-        self.controller = LaneChangeController(
-            LaneChangeConfig(
-                mode="external",
-                stabilizing_steering_min=55,
-                steering_cap=150,
-                stable_required_frames=5,
-                stable_lateral_error=0.14,
-                stable_near_lateral_error=0.20,
-            )
-        )
-        self.controller.state = "stabilizing_lane2"
-        self.controller._return_profile = "avoidance"
-        unsettled = replace(
-            lane(),
-            center_x=476.0,
-            lateral_error_px=76.0,
-            lateral_error_norm=0.19,
-            near_center_x=417.0,
-            near_lateral_error_px=17.0,
-            near_lateral_error_norm=0.043,
-            heading_error=-0.34,
-        )
-
-        result = self.controller.update(unsettled, 150.0, 800.0, 0.0, True)
-        adjusted = self.controller.apply_control_adjustments(
-            ControlCommand(speed=255, steering=-67, reason="lane"),
-            result,
-        )
-
-        self.assertEqual(result.state, "stabilizing_lane2")
-        self.assertEqual(adjusted.steering, 55)
-        self.assertIn("lane_change_stabilize", adjusted.reason)
-
-    def test_avoidance_lane1_stability_uses_general_limits_not_return_limits(self):
-        self.controller = LaneChangeController(
-            LaneChangeConfig(
-                mode="external",
-                stable_lateral_error=0.25,
-                stable_near_lateral_error=0.35,
-                stable_required_frames=1,
-                target_capture_frames=1,
-                return_stable_lateral_error=0.12,
-                return_stable_near_lateral_error=0.16,
-                return_stable_required_frames=4,
-            )
-        )
-        self.controller.request_avoidance("obstacle_fusion")
-        self.controller.update(lane(), 150.0, 800.0, 0.0, True)
-        almost_lane1 = lane_for_target_error(lateral_error_norm=0.20)
-
-        result = self.controller.update(almost_lane1, 150.0, 800.0, 1.0, True)
-
-        self.assertEqual(result.state, "lane1")
-
-    def test_avoidance_lane2_return_uses_return_stability_limits(self):
-        self.controller = LaneChangeController(
-            LaneChangeConfig(
-                mode="external",
-                stable_lateral_error=0.25,
-                stable_near_lateral_error=0.35,
-                stable_required_frames=1,
-                return_stable_lateral_error=0.12,
-                return_stable_near_lateral_error=0.16,
-                return_stable_required_frames=2,
-            )
-        )
-        self.controller.state = "stabilizing_lane2"
-        self.controller._return_profile = "avoidance"
-        loose_only = replace(
-            lane(),
-            lateral_error_norm=0.20,
-            near_lateral_error_norm=0.14,
-        )
-        tight = replace(
-            lane(),
-            lateral_error_norm=0.08,
-            near_lateral_error_norm=0.06,
-        )
-
-        still_stabilizing = self.controller.update(
-            loose_only, 150.0, 800.0, 0.0, True
-        )
-        first_tight = self.controller.update(tight, 150.0, 800.0, 0.1, True)
-        completed = self.controller.update(tight, 150.0, 800.0, 0.2, True)
-
-        self.assertEqual(still_stabilizing.state, "stabilizing_lane2")
-        self.assertEqual(first_tight.state, "stabilizing_lane2")
-        self.assertEqual(completed.state, "completed")
 
     def test_unreliable_avoidance_stabilization_uses_bounded_path_feedback(self):
         self.controller = LaneChangeController(

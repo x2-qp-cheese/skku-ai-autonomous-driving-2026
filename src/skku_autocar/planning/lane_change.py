@@ -36,9 +36,6 @@ class LaneChangeConfig:
     return_duration_scale: float = 1.0
     return_steering_cap: int = 0
     return_stabilizing_steering_cap: int = 0
-    return_stable_lateral_error: float = 0.0
-    return_stable_near_lateral_error: float = 0.0
-    return_stable_required_frames: int = 0
 
 
 @dataclass(frozen=True)
@@ -532,22 +529,12 @@ class LaneChangeController:
         )
         minimum = max(0, int(self.config.stabilizing_steering_min))
         steering = int(command.steering)
-        correction = near if abs(near) > abs(lateral) else lateral
-        if (
-            result.state == "stabilizing_lane2"
-            and self._return_profile == "avoidance"
-        ):
-            # During obstacle recovery, the first priority is settling on the
-            # target-lane center. A far-path curve heading can briefly point the
-            # opposite way immediately after the lane-change trajectory finishes.
-            direction = -1 if correction < 0.0 else 1
-            if steering * direction < 0:
-                steering = 0
-        elif steering != 0:
+        if steering != 0:
             direction = -1 if steering < 0 else 1
         else:
             # Let the normal lane follower choose the direction whenever it has
             # a signal. The position errors are only a zero-command fallback.
+            correction = near if abs(near) > abs(lateral) else lateral
             direction = -1 if correction < 0.0 else 1
         if abs(steering) < minimum:
             steering = direction * minimum
@@ -643,7 +630,7 @@ class LaneChangeController:
             self._stable_frames += 1
         else:
             self._stable_frames = 0
-        return self._stable_frames >= self._stable_required_frames()
+        return self._stable_frames >= max(1, int(self.config.stable_required_frames))
 
     def _stable_now(self, lane: LaneGeometry, lane_reliable: bool) -> bool:
         if not lane.found:
@@ -651,7 +638,6 @@ class LaneChangeController:
         if not self.config.allow_virtual_stabilize and not lane_reliable:
             return False
         if self._uses_avoidance_profile(self.state):
-            lateral_limit, near_limit = self._stable_error_limits()
             near_error = (
                 lane.near_lateral_error_norm
                 if lane.near_lateral_error_norm is not None
@@ -659,45 +645,14 @@ class LaneChangeController:
             )
             return (
                 abs(lane.lateral_error_norm)
-                <= lateral_limit
+                <= max(0.0, float(self.config.stable_lateral_error))
                 and abs(near_error)
-                <= near_limit
+                <= max(0.0, float(self.config.stable_near_lateral_error))
             )
         return (
             abs(lane.lateral_error_norm) <= max(0.0, float(self.config.stable_lateral_error))
             and abs(lane.heading_error) <= max(0.0, float(self.config.stable_heading_error))
         )
-
-    def _stable_error_limits(self) -> tuple:
-        lateral_limit = max(0.0, float(self.config.stable_lateral_error))
-        near_limit = max(0.0, float(self.config.stable_near_lateral_error))
-        if (
-            self.state == "stabilizing_lane2"
-            and self._return_profile == "avoidance"
-        ):
-            return_lateral = max(
-                0.0,
-                float(self.config.return_stable_lateral_error),
-            )
-            return_near = max(
-                0.0,
-                float(self.config.return_stable_near_lateral_error),
-            )
-            if return_lateral > 0.0:
-                lateral_limit = return_lateral
-            if return_near > 0.0:
-                near_limit = return_near
-        return lateral_limit, near_limit
-
-    def _stable_required_frames(self) -> int:
-        required = max(1, int(self.config.stable_required_frames))
-        if (
-            self.state == "stabilizing_lane2"
-            and self._return_profile == "avoidance"
-            and int(self.config.return_stable_required_frames) > 0
-        ):
-            required = int(self.config.return_stable_required_frames)
-        return required
 
     def _uses_target_arrival(self, state: str) -> bool:
         if self.config.smooth_avoidance:

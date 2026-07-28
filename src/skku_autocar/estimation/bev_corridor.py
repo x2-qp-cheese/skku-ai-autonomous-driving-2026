@@ -74,11 +74,6 @@ class BevCorridorConfig:
     heading_gain: float = 1.6
     center_smooth_alpha: float = 0.4
     heading_smooth_alpha: float = 0.4
-    # Keep the fitted path available for obstacle-to-lane association, but only
-    # derive steering targets from it when full-path control is explicitly on.
-    # Point control preserves the independently smoothed lookahead signals used
-    # by the last known-good competition setup.
-    control_full_path: bool = False
     # EMA applied to every x coordinate of the fitted center path. This gives the
     # controller a stable line, not only a stable lookahead dot.
     path_smooth_alpha: float = 0.36
@@ -503,45 +498,31 @@ class BevCorridorLaneEstimator:
         self.last_right_line_bev = self._line_points(right_fit)
         self._last_overlays = (self.last_centerline_bev, self.last_center_line_bev, self.last_right_line_bev)
 
-        if self.config.control_full_path:
-            center_x = self._clip(
-                self._path_x_at(
-                    self.last_centerline_bev,
-                    target_y,
-                    raw_center_x,
-                ),
-                0.0,
-                float(width - 1),
-            )
-            near_center_x = self._clip(
-                self._path_x_at(
-                    self.last_centerline_bev,
-                    near_target_y,
-                    raw_near_center_x,
-                ),
-                0.0,
-                float(width - 1),
-            )
-            path_heading = self._heading_from_path(
+        # The full stabilized path is the single source of truth. Deriving the
+        # target, near target, and heading from separate EMAs can make the visible
+        # line and steering disagree even though each signal looks reasonable.
+        center_x = self._clip(
+            self._path_x_at(self.last_centerline_bev, target_y, raw_center_x),
+            0.0,
+            float(width - 1),
+        )
+        near_center_x = self._clip(
+            self._path_x_at(
                 self.last_centerline_bev,
-                height,
-                raw_heading,
-            )
-            heading_error = self._smooth_heading(path_heading)
-            self._smoothed_center_x = center_x
-            self._smoothed_near_center_x = near_center_x
-        else:
-            center_x = self._clip(
-                self._smooth_center(raw_center_x),
-                0.0,
-                float(width - 1),
-            )
-            near_center_x = self._clip(
-                self._smooth_near_center(raw_near_center_x),
-                0.0,
-                float(width - 1),
-            )
-            heading_error = self._smooth_heading(raw_heading)
+                near_target_y,
+                raw_near_center_x,
+            ),
+            0.0,
+            float(width - 1),
+        )
+        path_heading = self._heading_from_path(
+            self.last_centerline_bev,
+            height,
+            raw_heading,
+        )
+        heading_error = self._smooth_heading(path_heading)
+        self._smoothed_center_x = center_x
+        self._smoothed_near_center_x = near_center_x
         lateral_error_px = center_x - vehicle_center_x
         lateral_error_norm = self._clip(lateral_error_px / (width / 2.0), -1.0, 1.0)
         near_lateral_error_px = near_center_x - vehicle_center_x
