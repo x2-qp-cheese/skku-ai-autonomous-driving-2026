@@ -1120,6 +1120,14 @@ class PaperParkingController:
         self,
         observation: RearLidarObservation,
     ) -> ControlCommand:
+        if (
+            observation.dist_c_mm is None
+            or observation.dist_d_mm is None
+        ):
+            self.state = ParkingState.PARKED
+            self._parked_started_at = self._now
+            return self._stop("paper_dist_c_or_d_none_finish")
+
         if self._is_new_scan:
             self._update_slot_heading(observation)
             self._update_parking_finish_side(

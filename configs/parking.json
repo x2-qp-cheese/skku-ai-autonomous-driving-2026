@@ -41,7 +41,7 @@
   "controller": {
     "park_hold_s": 4.0,
     "exit_speed": 100,
-    "exit_forward_s": 5.0,
+    "exit_forward_s": 3.0,
     "exit_turn_steering": 150,
     "exit_turn_right_s": 10.0,
     "first_vehicle_end_trigger_y_mm": 60.0,
