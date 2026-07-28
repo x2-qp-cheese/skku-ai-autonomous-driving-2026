@@ -86,7 +86,12 @@ class PaperParkingController:
         self._direct_reverse_started_lidar_timestamp: Optional[
             float
         ] = None
-        self._park_finish_side_clear_scans = 0
+        self._last_finish_c_mm: Optional[float] = None
+        self._last_finish_d_mm: Optional[float] = None
+        self._finish_c_cleared = False
+        self._finish_d_cleared = False
+        self._finish_c_missing_scans = 0
+        self._finish_d_missing_scans = 0
         self._cd_center_ready_scans = 0
         self._cd_missing_scans = 0
         self._slot_heading_missing_scans = 0
@@ -513,7 +518,7 @@ class PaperParkingController:
         self._direct_reverse_ready_scans = 0
         self._direct_reverse_committed = False
         self._direct_reverse_started_lidar_timestamp = None
-        self._park_finish_side_clear_scans = 0
+        self._reset_parking_finish_tracking()
         self._cd_missing_scans = 0
         self._slot_heading_missing_scans = 0
         self._cd_steering_initialized = False
@@ -608,7 +613,7 @@ class PaperParkingController:
             self._direct_reverse_started_lidar_timestamp = (
                 observation.timestamp
             )
-            self._park_finish_side_clear_scans = 0
+            self._reset_parking_finish_tracking(observation)
             self.debug = PaperParkingDebug(
                 state=self.state,
                 detected_vehicle_count=self._detected_vehicle_count,
@@ -816,7 +821,7 @@ class PaperParkingController:
             >= self.config.cd_center_confirm_scans
         ):
             self.state = ParkingState.REVERSE_STRAIGHT
-            self._park_finish_side_clear_scans = 0
+            self._reset_parking_finish_tracking(observation)
             self.debug = PaperParkingDebug(
                 state=self.state,
                 detected_vehicle_count=self._detected_vehicle_count,
@@ -1089,49 +1094,24 @@ class PaperParkingController:
         self,
         observation: RearLidarObservation,
     ) -> ControlCommand:
-        side_min_angle = (
-            90.0
-            - self.config.park_finish_side_angle_half_width_deg
-        )
-        side_max_angle = (
-            90.0
-            + self.config.park_finish_side_angle_half_width_deg
-        )
-        side_max_distance = (
-            self.config.park_finish_side_max_distance_mm
-        )
-        left_side_present = any(
-            -side_max_angle <= point.angle_deg <= -side_min_angle
-            and point.distance_mm <= side_max_distance
-            for point in observation.points
-        )
-        right_side_present = any(
-            side_min_angle <= point.angle_deg <= side_max_angle
-            and point.distance_mm <= side_max_distance
-            for point in observation.points
-        )
         if self._is_new_scan:
             self._update_slot_heading(observation)
-            if (
-                observation.valid
-                and not left_side_present
-                and not right_side_present
-            ):
-                self._park_finish_side_clear_scans += 1
-            else:
-                self._park_finish_side_clear_scans = 0
+            self._update_parking_finish_side(
+                "c",
+                observation.dist_c_mm,
+            )
+            self._update_parking_finish_side(
+                "d",
+                observation.dist_d_mm,
+            )
         if (
-            self._park_finish_side_clear_scans
-            >= self.config.park_finish_side_clear_scans
+            self._finish_c_cleared
+            and self._finish_d_cleared
         ):
             self.state = ParkingState.PARKED
             self._parked_started_at = self._now
             return self._stop(
-                "paper_both_side_90_clear_finish:%d/%d"
-                % (
-                    self._park_finish_side_clear_scans,
-                    self.config.park_finish_side_clear_scans,
-                )
+                "paper_both_side_distance_jumps_finish"
             )
         slot_heading, heading_span = self._filtered_slot_heading()
         if (
@@ -1183,7 +1163,8 @@ class PaperParkingController:
             0,
             (
                 "paper_centered_reverse heading=%s span=%s "
-                "until_side_90_clear L=%d R=%d clear=%d/%d"
+                "until_side_jump C=%d D=%d "
+                "lastC=%s lastD=%s"
             )
             % (
                 (
@@ -1196,12 +1177,81 @@ class PaperParkingController:
                     if heading_span != float("inf")
                     else "None"
                 ),
-                int(left_side_present),
-                int(right_side_present),
-                self._park_finish_side_clear_scans,
-                self.config.park_finish_side_clear_scans,
+                int(self._finish_c_cleared),
+                int(self._finish_d_cleared),
+                (
+                    "%.0f" % self._last_finish_c_mm
+                    if self._last_finish_c_mm is not None
+                    else "None"
+                ),
+                (
+                    "%.0f" % self._last_finish_d_mm
+                    if self._last_finish_d_mm is not None
+                    else "None"
+                ),
             ),
         )
+
+    def _reset_parking_finish_tracking(
+        self,
+        observation: Optional[RearLidarObservation] = None,
+    ) -> None:
+        self._last_finish_c_mm = (
+            observation.dist_c_mm
+            if observation is not None
+            else None
+        )
+        self._last_finish_d_mm = (
+            observation.dist_d_mm
+            if observation is not None
+            else None
+        )
+        self._finish_c_cleared = False
+        self._finish_d_cleared = False
+        self._finish_c_missing_scans = 0
+        self._finish_d_missing_scans = 0
+
+    def _update_parking_finish_side(
+        self,
+        side: str,
+        distance_mm: Optional[float],
+    ) -> None:
+        if side == "c":
+            last = self._last_finish_c_mm
+            cleared = self._finish_c_cleared
+            missing = self._finish_c_missing_scans
+        else:
+            last = self._last_finish_d_mm
+            cleared = self._finish_d_cleared
+            missing = self._finish_d_missing_scans
+
+        if not cleared:
+            if distance_mm is None:
+                missing += 1
+                if (
+                    missing
+                    >= self.config.park_finish_side_missing_scans
+                ):
+                    cleared = True
+            else:
+                missing = 0
+                if (
+                    last is not None
+                    and distance_mm - last
+                    >= self.config.park_finish_distance_jump_mm
+                ):
+                    cleared = True
+                else:
+                    last = distance_mm
+
+        if side == "c":
+            self._last_finish_c_mm = last
+            self._finish_c_cleared = cleared
+            self._finish_c_missing_scans = missing
+        else:
+            self._last_finish_d_mm = last
+            self._finish_d_cleared = cleared
+            self._finish_d_missing_scans = missing
 
     def _start_exit_forward(
         self,
@@ -1315,7 +1365,7 @@ class PaperParkingController:
         self._direct_reverse_ready_scans = 0
         self._direct_reverse_committed = False
         self._direct_reverse_started_lidar_timestamp = None
-        self._park_finish_side_clear_scans = 0
+        self._reset_parking_finish_tracking()
         self._cd_center_ready_scans = 0
         self._cd_missing_scans = 0
         self._slot_heading_missing_scans = 0
