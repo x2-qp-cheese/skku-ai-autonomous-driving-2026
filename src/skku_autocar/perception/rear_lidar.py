@@ -264,8 +264,6 @@ class RearLidarPerception:
             bisector = (
                 tangent_a.angle_deg + tangent_b.angle_deg
             ) / 2.0
-            if bisector < 0.0:
-                continue
             angular_gap = (
                 tangent_b.angle_deg - tangent_a.angle_deg
             )
@@ -282,16 +280,27 @@ class RearLidarPerception:
                 (
                     angular_gap,
                     free_width,
+                    bisector,
                     tangent_a,
                     tangent_b,
                 )
             )
         self._last_tangent_candidate_count = len(candidates)
         if not candidates:
-            return TangentPair(reason="right_parking_gap_not_visible")
+            return TangentPair(reason="parking_gap_not_visible")
 
-        _, _, tangent_a, tangent_b = max(
-            candidates,
+        # Before entry the target gap is on the right.  While reversing,
+        # however, the vehicle rotates through the entrance and the same
+        # gap's bisector naturally crosses 0 degrees.  Prefer a right-side
+        # candidate whenever one exists, but do not discard the only
+        # geometrically valid gap merely because it has crossed the rear
+        # centerline.
+        right_candidates = [
+            item for item in candidates if item[2] >= 0.0
+        ]
+        selection_pool = right_candidates or candidates
+        _, _, bisector, tangent_a, tangent_b = max(
+            selection_pool,
             key=lambda item: (item[0], item[1]),
         )
         return TangentPair(
@@ -300,11 +309,12 @@ class RearLidarPerception:
             angle_b_deg=tangent_b.angle_deg,
             dist_a_mm=tangent_a.distance_mm,
             dist_b_mm=tangent_b.distance_mm,
-            angle_bisector_deg=(
-                tangent_a.angle_deg + tangent_b.angle_deg
-            )
-            / 2.0,
-            reason="figure7_right_gap_cluster_tangents",
+            angle_bisector_deg=bisector,
+            reason=(
+                "figure7_right_gap_cluster_tangents"
+                if right_candidates
+                else "figure7_gap_crossed_rear_centerline"
+            ),
         )
 
     def _select_right_vehicle_cluster(

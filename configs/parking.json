@@ -13,7 +13,7 @@
     "rear_fov_deg": 110.0,
     "stale_after_s": 0.45,
     "near_distance_mm": 600.0,
-    "prealign_distance_mm": 1500.0,
+    "prealign_distance_mm": 1250.0,
     "side_angle_min_deg": 70.0,
     "side_angle_max_deg": 100.0,
     "side_distance_limit_mm": 2000.0,

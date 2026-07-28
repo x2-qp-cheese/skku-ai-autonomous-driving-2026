@@ -25,7 +25,7 @@ class RearLidarConfig:
     rear_fov_deg: float = 110.0
     stale_after_s: float = 0.45
     near_distance_mm: float = 600.0
-    prealign_distance_mm: float = 1500.0
+    prealign_distance_mm: float = 1250.0
     side_angle_min_deg: float = 70.0
     side_angle_max_deg: float = 100.0
     side_distance_limit_mm: float = 2000.0
