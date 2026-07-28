@@ -641,6 +641,31 @@ class PaperParkingController:
                 ),
                 keep_debug=True,
             )
+        parallel_forward_needed = (
+            both_sides
+            and observation.dist_c_mm
+            >= self.config.cd_direct_reverse_min_distance_mm
+            and observation.dist_d_mm
+            >= self.config.cd_direct_reverse_min_distance_mm
+            and observation.left_side_line.valid
+            and observation.right_side_line.valid
+            and (
+                abs(observation.left_side_line.heading_deg)
+                > self.config.parallel_heading_tolerance_deg
+                or abs(observation.right_side_line.heading_deg)
+                > self.config.parallel_heading_tolerance_deg
+            )
+        )
+        if (
+            self._is_new_scan
+            and self._center_scan_count
+            >= self.config.center_observation_scans
+            and parallel_forward_needed
+        ):
+            return self._start_parallel_forward(
+                observation,
+                "side_heading_requires_parallel_forward",
+            )
         if (
             self._cd_missing_scans > self.config.pair_hold_scans
             and observation.dist_c_mm is None
