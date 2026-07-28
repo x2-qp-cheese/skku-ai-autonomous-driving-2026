@@ -530,7 +530,7 @@ class PaperParkingController:
             if (
                 slot_heading is not None
                 and abs(slot_heading)
-                > self.config.parallel_heading_exit_deg
+                > self.config.parallel_heading_trigger_deg
             ):
                 return self._start_parallel_forward(
                     observation,
@@ -773,6 +773,8 @@ class PaperParkingController:
             and heading_span
             <= self.config.parallel_heading_stability_deg
             and observation.slot_heading_deg is not None
+            and observation.dist_c_mm is not None
+            and observation.dist_d_mm is not None
         )
         if self._is_new_scan:
             if heading_ready:
