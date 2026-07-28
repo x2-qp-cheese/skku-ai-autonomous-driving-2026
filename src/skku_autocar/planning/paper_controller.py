@@ -357,7 +357,7 @@ class PaperParkingController:
                 ):
                     return ControlCommand(
                         speed=self.config.reverse_speed,
-                        steering=self._apply_steering_offset(
+                        steering=self._steering_command(
                             self._paper_to_actuator(
                                 self._last_reverse_entry_steering
                             )
@@ -407,7 +407,7 @@ class PaperParkingController:
         self._reverse_motion_started = True
         return ControlCommand(
             speed=self.config.reverse_speed,
-            steering=self._apply_steering_offset(
+            steering=self._steering_command(
                 self._paper_to_actuator(entry_steering)
             ),
             reason=(
@@ -676,7 +676,7 @@ class PaperParkingController:
 
         return ControlCommand(
             speed=self.config.inside_reverse_speed,
-            steering=self._apply_steering_offset(
+            steering=self._steering_command(
                 self._paper_to_actuator(cd_steering)
             ),
             reason=(
@@ -848,7 +848,7 @@ class PaperParkingController:
 
         return ControlCommand(
             speed=self.config.parallel_forward_speed,
-            steering=self._apply_steering_offset(
+            steering=self._steering_command(
                 self._paper_to_actuator(desired_steering)
             ),
             reason=(
@@ -1338,6 +1338,13 @@ class PaperParkingController:
         )
         return max(-maximum, min(maximum, corrected))
 
+    def _steering_command(self, steering: int) -> int:
+        maximum = self.config.actuator_max_steering
+        requested = int(steering)
+        if requested == 0:
+            return self._apply_steering_offset(0)
+        return max(-maximum, min(maximum, requested))
+
     def _forward(self, reason: str) -> ControlCommand:
         return self._drive(self.config.forward_speed, 0, reason)
 
@@ -1353,7 +1360,7 @@ class PaperParkingController:
             self._set_debug(reason)
         return ControlCommand(
             speed=int(speed),
-            steering=self._apply_steering_offset(steering),
+            steering=self._steering_command(steering),
             reason=reason,
         )
 
