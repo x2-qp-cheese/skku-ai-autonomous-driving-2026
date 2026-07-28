@@ -58,6 +58,7 @@ class PaperControllerConfig:
 
     forward_speed: int = 80
     reverse_speed: int = -80
+    inside_reverse_speed: int = -50
     # The paper's 600 mm setup threshold assumes its own lateral spacing.
     # Our prealign_distance_mm is the scaled equivalent.
     prealign_clear_confirm_scans: int = 3
@@ -66,12 +67,19 @@ class PaperControllerConfig:
     pair_max_angle_jump_deg: float = 15.0
     pair_max_distance_jump_mm: float = 700.0
     center_observation_scans: int = 4
-    finish_missing_confirm_scans: int = 3
+    side_entry_confirm_scans: int = 3
+    cd_center_confirm_scans: int = 5
+    finish_missing_confirm_scans: int = 5
     paper_max_steering: float = 7.0
     actuator_max_steering: int = 150
     actuator_steering_offset: int = 0
     distance_bias_scale_mm: float = 600.0
     entry_full_steer_angle_deg: float = 30.0
+    cd_target_balance_ratio: float = -0.16
+    cd_full_steer_error_ratio: float = 0.15
+    cd_center_tolerance_ratio: float = 0.025
+    cd_stability_span_ratio: float = 0.04
+    cd_steering_max_step: float = 1.0
     dist_bias_cd_threshold_mm: float = 250.0
     recovery_forward_s: float = 3.0
     command_rate_hz: float = 20.0
@@ -198,6 +206,8 @@ def _validate(config: AppConfig) -> None:
         raise ValueError("forward_speed must be positive")
     if controller.reverse_speed >= 0:
         raise ValueError("reverse_speed must be negative")
+    if controller.inside_reverse_speed >= 0:
+        raise ValueError("inside_reverse_speed must be negative")
     if controller.prealign_clear_confirm_scans < 1:
         raise ValueError(
             "prealign_clear_confirm_scans must be positive"
@@ -218,6 +228,24 @@ def _validate(config: AppConfig) -> None:
         )
     if controller.center_observation_scans < 1:
         raise ValueError("center_observation_scans must be positive")
+    if controller.side_entry_confirm_scans < 1:
+        raise ValueError("side_entry_confirm_scans must be positive")
+    if controller.cd_center_confirm_scans < 1:
+        raise ValueError("cd_center_confirm_scans must be positive")
+    if controller.cd_full_steer_error_ratio <= 0.0:
+        raise ValueError(
+            "cd_full_steer_error_ratio must be positive"
+        )
+    if controller.cd_center_tolerance_ratio <= 0.0:
+        raise ValueError(
+            "cd_center_tolerance_ratio must be positive"
+        )
+    if controller.cd_stability_span_ratio <= 0.0:
+        raise ValueError(
+            "cd_stability_span_ratio must be positive"
+        )
+    if controller.cd_steering_max_step <= 0.0:
+        raise ValueError("cd_steering_max_step must be positive")
     if controller.finish_missing_confirm_scans < 1:
         raise ValueError(
             "finish_missing_confirm_scans must be positive"

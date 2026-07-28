@@ -22,6 +22,10 @@ class PaperParkingDebug:
     distance_term: Optional[float] = None
     distance_bias_ab_mm: Optional[float] = None
     distance_bias_cd_mm: Optional[float] = None
+    cd_balance_ratio: Optional[float] = None
+    cd_balance_error: Optional[float] = None
+    cd_balance_span: Optional[float] = None
+    cd_center_ready_scans: int = 0
     prealign_near_seen: bool = False
     prealign_ready_scans: int = 0
     pair_hold_scans: int = 0
@@ -58,6 +62,14 @@ class PaperParkingController:
         self._center_d_samples: Deque[float] = deque(
             maxlen=self.config.center_observation_scans
         )
+        self._center_ratio_samples: Deque[float] = deque(
+            maxlen=self.config.center_observation_scans
+        )
+        self._both_sides_seen_scans = 0
+        self._cd_center_ready_scans = 0
+        self._cd_missing_scans = 0
+        self._last_cd_steering = 0.0
+        self._cd_steering_initialized = False
         self._finish_missing_scans = 0
 
     def start(self) -> None:
@@ -105,7 +117,7 @@ class PaperParkingController:
         if self.state == ParkingState.REVERSE_ALIGN:
             return self._reverse_align(observation)
         if self.state == ParkingState.CENTER_CHECK:
-            return self._center_check(observation, now)
+            return self._center_check(observation)
         if self.state == ParkingState.REVERSE_STRAIGHT:
             return self._reverse_straight(observation)
         if self.state == ParkingState.RECOVERY_FORWARD:
@@ -225,16 +237,32 @@ class PaperParkingController:
         self,
         observation: RearLidarObservation,
     ) -> ControlCommand:
+        both_sides = (
+            observation.dist_c_mm is not None
+            and observation.dist_d_mm is not None
+        )
+        if self._is_new_scan:
+            if both_sides:
+                self._both_sides_seen_scans += 1
+            else:
+                self._both_sides_seen_scans = 0
+        if (
+            self._both_sides_seen_scans
+            >= self.config.side_entry_confirm_scans
+        ):
+            return self._start_cd_alignment(
+                observation,
+                "both_sides_confirmed_inside_gap",
+            )
+
         if observation.near:
             if (
                 self._reverse_motion_started
-                and observation.dist_c_mm is not None
-                and observation.dist_d_mm is not None
+                and both_sides
             ):
-                self.state = ParkingState.CENTER_CHECK
-                self._reset_center_observation()
-                return self._stop(
-                    "figure9_near_with_both_cd_stop_and_check"
+                return self._start_cd_alignment(
+                    observation,
+                    "near_with_both_sides_inside_gap",
                 )
             return self._start_lidar_realign(
                 observation,
@@ -245,13 +273,11 @@ class PaperParkingController:
         if not pair.valid:
             if (
                 self._reverse_motion_started
-                and observation.dist_c_mm is not None
-                and observation.dist_d_mm is not None
+                and both_sides
             ):
-                self.state = ParkingState.CENTER_CHECK
-                self._reset_center_observation()
-                return self._stop(
-                    "ab_left_fov_both_cd_visible_center_check"
+                return self._start_cd_alignment(
+                    observation,
+                    "ab_left_fov_both_sides_inside_gap",
                 )
 
             return self._start_lidar_realign(
@@ -301,6 +327,18 @@ class PaperParkingController:
             ),
         )
 
+    def _start_cd_alignment(
+        self,
+        observation: RearLidarObservation,
+        reason: str,
+    ) -> ControlCommand:
+        self.state = ParkingState.CENTER_CHECK
+        self._reset_center_observation()
+        self._cd_center_ready_scans = 0
+        self._cd_missing_scans = 0
+        self._cd_steering_initialized = False
+        return self._center_check(observation, reason)
+
     def _start_lidar_realign(
         self,
         observation: RearLidarObservation,
@@ -328,91 +366,203 @@ class PaperParkingController:
     def _center_check(
         self,
         observation: RearLidarObservation,
-        now: float,
+        transition_reason: str = "cd_continuous_alignment",
     ) -> ControlCommand:
+        both_sides = (
+            observation.dist_c_mm is not None
+            and observation.dist_d_mm is not None
+        )
         if self._is_new_scan:
             self._center_scan_count += 1
-            if observation.dist_c_mm is not None:
+            if both_sides:
                 self._center_c_samples.append(
                     observation.dist_c_mm
                 )
-            if observation.dist_d_mm is not None:
                 self._center_d_samples.append(
                     observation.dist_d_mm
                 )
-
-        if (
-            self._center_scan_count
-            < self.config.center_observation_scans
-        ):
-            return self._stop(
-                "paper_collecting_cd scans=%d/%d C=%d D=%d"
-                % (
-                    self._center_scan_count,
-                    self.config.center_observation_scans,
-                    len(self._center_c_samples),
-                    len(self._center_d_samples),
+                self._center_ratio_samples.append(
+                    (
+                        observation.dist_c_mm
+                        - observation.dist_d_mm
+                    )
+                    / max(
+                        1.0,
+                        observation.dist_c_mm
+                        + observation.dist_d_mm,
+                    )
                 )
-            )
+                self._cd_missing_scans = 0
+            else:
+                self._cd_missing_scans += 1
 
-        required = max(
-            2,
-            (self.config.center_observation_scans + 1) // 2,
-        )
         dist_c = (
             float(median(self._center_c_samples))
-            if len(self._center_c_samples) >= required
+            if self._center_c_samples
             else None
         )
         dist_d = (
             float(median(self._center_d_samples))
-            if len(self._center_d_samples) >= required
+            if self._center_d_samples
             else None
         )
 
         if dist_c is None or dist_d is None:
-            missing = (
-                "CD"
-                if dist_c is None and dist_d is None
-                else ("C" if dist_c is None else "D")
+            return self._stop(
+                "cd_alignment_waiting_for_both_sides"
             )
-            return self._start_recovery(
-                now,
-                None,
-                "paper_cd_not_observed_enough missing=%s" % missing,
+
+        if (
+            self._cd_missing_scans
+            > self.config.pair_hold_scans
+        ):
+            return self._stop(
+                "cd_lost_before_centered missing=%d"
+                % self._cd_missing_scans
             )
 
         bias_cd = dist_c - dist_d
-        if abs(bias_cd) < self.config.dist_bias_cd_threshold_mm:
+        balance = bias_cd / max(1.0, dist_c + dist_d)
+        balance_error = (
+            balance - self.config.cd_target_balance_ratio
+        )
+        balance_span = (
+            max(self._center_ratio_samples)
+            - min(self._center_ratio_samples)
+            if len(self._center_ratio_samples) >= 2
+            else float("inf")
+        )
+        desired_cd_steering = self._h(
+            -self.config.paper_max_steering
+            * balance_error
+            / self.config.cd_full_steer_error_ratio
+        )
+        if not self._cd_steering_initialized:
+            cd_steering = desired_cd_steering
+            self._cd_steering_initialized = True
+        elif self._is_new_scan:
+            step = self.config.cd_steering_max_step
+            delta = max(
+                -step,
+                min(
+                    step,
+                    desired_cd_steering
+                    - self._last_cd_steering,
+                ),
+            )
+            cd_steering = self._last_cd_steering + delta
+        else:
+            cd_steering = self._last_cd_steering
+        self._last_cd_steering = cd_steering
+
+        centered_now = (
+            abs(balance_error)
+            <= self.config.cd_center_tolerance_ratio
+            and len(self._center_ratio_samples)
+            >= self.config.center_observation_scans
+            and balance_span
+            <= self.config.cd_stability_span_ratio
+            and both_sides
+        )
+        if self._is_new_scan:
+            if centered_now:
+                self._cd_center_ready_scans += 1
+            else:
+                self._cd_center_ready_scans = 0
+
+        self.debug = PaperParkingDebug(
+            state=self.state,
+            detected_vehicle_count=self._detected_vehicle_count,
+            paper_steering=desired_cd_steering,
+            applied_paper_steering=cd_steering,
+            distance_bias_cd_mm=bias_cd,
+            cd_balance_ratio=balance,
+            cd_balance_error=balance_error,
+            cd_balance_span=balance_span,
+            cd_center_ready_scans=self._cd_center_ready_scans,
+            prealign_near_seen=self._prealign_near_seen,
+            prealign_ready_scans=self._prealign_ready_scans,
+            pair_hold_scans=self._pair_missing_scans,
+            center_observation_scans=self._center_scan_count,
+            reason=transition_reason,
+        )
+
+        if (
+            self._cd_center_ready_scans
+            >= self.config.cd_center_confirm_scans
+        ):
             self.state = ParkingState.REVERSE_STRAIGHT
             self.debug = PaperParkingDebug(
                 state=self.state,
                 detected_vehicle_count=self._detected_vehicle_count,
                 distance_bias_cd_mm=bias_cd,
+                cd_balance_ratio=balance,
+                cd_balance_error=balance_error,
+                cd_balance_span=balance_span,
+                cd_center_ready_scans=self._cd_center_ready_scans,
                 prealign_near_seen=self._prealign_near_seen,
                 prealign_ready_scans=self._prealign_ready_scans,
                 pair_hold_scans=self._pair_missing_scans,
                 center_observation_scans=self._center_scan_count,
-                reason="paper_dist_cd_centered",
+                reason="cd_balance_centered",
             )
             self._finish_missing_scans = 0
             return self._drive(
-                self.config.reverse_speed,
+                self.config.inside_reverse_speed,
                 0,
-                "paper_centered_reverse_straight",
+                "cd_centered_reverse_straight",
                 keep_debug=True,
             )
 
-        return self._start_recovery(
-            now,
-            bias_cd,
-            "paper_abs_dist_bias_cd_over_threshold",
+        return ControlCommand(
+            speed=self.config.inside_reverse_speed,
+            steering=self._apply_steering_offset(
+                self._paper_to_actuator(cd_steering)
+            ),
+            reason=(
+                "cd_reverse_align ratio=%+.3f target=%+.3f "
+                "error=%+.3f steer=%+.2f centered=%d/%d"
+            )
+            % (
+                balance,
+                self.config.cd_target_balance_ratio,
+                balance_error,
+                cd_steering,
+                self._cd_center_ready_scans,
+                self.config.cd_center_confirm_scans,
+            ),
         )
 
     def _reverse_straight(
         self,
         observation: RearLidarObservation,
     ) -> ControlCommand:
+        if (
+            observation.dist_c_mm is not None
+            and observation.dist_d_mm is not None
+        ):
+            balance = (
+                observation.dist_c_mm - observation.dist_d_mm
+            ) / max(
+                1.0,
+                observation.dist_c_mm + observation.dist_d_mm,
+            )
+            if (
+                abs(
+                    balance
+                    - self.config.cd_target_balance_ratio
+                )
+                > self.config.cd_center_tolerance_ratio * 1.5
+            ):
+                self.state = ParkingState.CENTER_CHECK
+                self._reset_center_observation()
+                self._cd_center_ready_scans = 0
+                self._cd_missing_scans = 0
+                return self._center_check(
+                    observation,
+                    "cd_balance_drift_realign",
+                )
+
         side_missing = (
             observation.dist_c_mm is None
             or observation.dist_d_mm is None
@@ -432,7 +582,7 @@ class PaperParkingController:
                 % self._finish_missing_scans
             )
         return self._drive(
-            self.config.reverse_speed,
+            self.config.inside_reverse_speed,
             0,
             (
                 "paper_centered_reverse_until_side_none "
@@ -499,6 +649,11 @@ class PaperParkingController:
         self._pair_outlier_rejected = False
         self._realigning_after_dropout = False
         self._reset_center_observation()
+        self._both_sides_seen_scans = 0
+        self._cd_center_ready_scans = 0
+        self._cd_missing_scans = 0
+        self._last_cd_steering = 0.0
+        self._cd_steering_initialized = False
         self._finish_missing_scans = 0
 
     def _reset_pair_tracking(
@@ -606,6 +761,7 @@ class PaperParkingController:
         self._center_scan_count = 0
         self._center_c_samples.clear()
         self._center_d_samples.clear()
+        self._center_ratio_samples.clear()
 
     def _paper_steering(
         self,

@@ -106,6 +106,10 @@ class TelemetryRecorder:
                 "dist_c_mm",
                 "dist_d_mm",
                 "distance_bias_cd_mm",
+                "cd_balance_ratio",
+                "cd_balance_error",
+                "cd_balance_span",
+                "cd_center_ready_scans",
             ),
         )
         self._writer.writeheader()
@@ -262,6 +266,18 @@ class TelemetryRecorder:
                 "dist_d_mm": _optional(observation.dist_d_mm),
                 "distance_bias_cd_mm": _optional(
                     debug.distance_bias_cd_mm
+                ),
+                "cd_balance_ratio": _optional(
+                    debug.cd_balance_ratio
+                ),
+                "cd_balance_error": _optional(
+                    debug.cd_balance_error
+                ),
+                "cd_balance_span": _optional(
+                    debug.cd_balance_span
+                ),
+                "cd_center_ready_scans": (
+                    debug.cd_center_ready_scans
                 ),
             }
         )
@@ -994,11 +1010,15 @@ def _show_debug(
             debug.pair_hold_scans,
             debug.center_observation_scans,
         ),
-        "DistC=%smm DistD=%smm biasCD=%smm"
+        "C=%s D=%s ratio=%s err=%s span=%s stable=%d/%d"
         % (
             _fmt(observation.dist_c_mm, 0),
             _fmt(observation.dist_d_mm, 0),
-            _fmt(debug.distance_bias_cd_mm, 0),
+            _fmt(debug.cd_balance_ratio, 3),
+            _fmt(debug.cd_balance_error, 3),
+            _fmt(debug.cd_balance_span, 3),
+            debug.cd_center_ready_scans,
+            config.controller.cd_center_confirm_scans,
         ),
         "FOV=+/-%.0fdeg C/D limit=<%.0fmm"
         % (
