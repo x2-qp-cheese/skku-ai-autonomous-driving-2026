@@ -57,6 +57,8 @@
     "pair_max_distance_jump_mm": 700.0,
     "center_observation_scans": 4,
     "side_entry_confirm_scans": 3,
+    "cd_direct_reverse_min_distance_mm": 600.0,
+    "park_finish_cd_missing_scans": 3,
     "cd_center_confirm_scans": 5,
     "paper_max_steering": 7.0,
     "actuator_max_steering": 150,

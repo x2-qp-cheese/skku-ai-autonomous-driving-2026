@@ -81,6 +81,12 @@ class PaperParkingController:
             maxlen=self.config.center_observation_scans
         )
         self._both_sides_seen_scans = 0
+        self._direct_reverse_ready_scans = 0
+        self._direct_reverse_committed = False
+        self._direct_reverse_started_lidar_timestamp: Optional[
+            float
+        ] = None
+        self._park_finish_cd_missing_scans = 0
         self._cd_center_ready_scans = 0
         self._cd_missing_scans = 0
         self._slot_heading_missing_scans = 0
@@ -504,6 +510,10 @@ class PaperParkingController:
         self.state = ParkingState.CENTER_CHECK
         self._reset_center_observation()
         self._cd_center_ready_scans = 0
+        self._direct_reverse_ready_scans = 0
+        self._direct_reverse_committed = False
+        self._direct_reverse_started_lidar_timestamp = None
+        self._park_finish_cd_missing_scans = 0
         self._cd_missing_scans = 0
         self._slot_heading_missing_scans = 0
         self._cd_steering_initialized = False
@@ -571,6 +581,61 @@ class PaperParkingController:
             self._update_slot_heading(observation)
 
         slot_heading, heading_span = self._filtered_slot_heading()
+        direct_reverse_ready = (
+            both_sides
+            and observation.dist_c_mm
+            >= self.config.cd_direct_reverse_min_distance_mm
+            and observation.dist_d_mm
+            >= self.config.cd_direct_reverse_min_distance_mm
+            and observation.left_side_line.valid
+            and observation.right_side_line.valid
+            and abs(observation.left_side_line.heading_deg)
+            <= self.config.parallel_heading_tolerance_deg
+            and abs(observation.right_side_line.heading_deg)
+            <= self.config.parallel_heading_tolerance_deg
+        )
+        if self._is_new_scan:
+            if direct_reverse_ready:
+                self._direct_reverse_ready_scans += 1
+            else:
+                self._direct_reverse_ready_scans = 0
+        if (
+            self._direct_reverse_ready_scans
+            >= self.config.side_entry_confirm_scans
+        ):
+            self.state = ParkingState.REVERSE_STRAIGHT
+            self._direct_reverse_committed = True
+            self._direct_reverse_started_lidar_timestamp = (
+                observation.timestamp
+            )
+            self._park_finish_cd_missing_scans = 0
+            self.debug = PaperParkingDebug(
+                state=self.state,
+                detected_vehicle_count=self._detected_vehicle_count,
+                distance_bias_cd_mm=(
+                    observation.dist_c_mm
+                    - observation.dist_d_mm
+                ),
+                slot_heading_deg=slot_heading,
+                slot_heading_span_deg=heading_span,
+                center_observation_scans=self._center_scan_count,
+                reason="cd_clear_and_both_side_lines_parallel",
+            )
+            return self._drive(
+                self.config.inside_reverse_speed,
+                0,
+                (
+                    "cd_clear_parallel_reverse_straight "
+                    "C=%.0f D=%.0f left=%+.1f right=%+.1f"
+                )
+                % (
+                    observation.dist_c_mm,
+                    observation.dist_d_mm,
+                    observation.left_side_line.heading_deg,
+                    observation.right_side_line.heading_deg,
+                ),
+                keep_debug=True,
+            )
         if (
             self._cd_missing_scans > self.config.pair_hold_scans
             and observation.dist_c_mm is None
@@ -751,6 +816,7 @@ class PaperParkingController:
             >= self.config.cd_center_confirm_scans
         ):
             self.state = ParkingState.REVERSE_STRAIGHT
+            self._park_finish_cd_missing_scans = 0
             self.debug = PaperParkingDebug(
                 state=self.state,
                 detected_vehicle_count=self._detected_vehicle_count,
@@ -1025,8 +1091,30 @@ class PaperParkingController:
     ) -> ControlCommand:
         if self._is_new_scan:
             self._update_slot_heading(observation)
+            if (
+                observation.dist_c_mm is None
+                and observation.dist_d_mm is None
+            ):
+                self._park_finish_cd_missing_scans += 1
+            else:
+                self._park_finish_cd_missing_scans = 0
+        if (
+            self._park_finish_cd_missing_scans
+            >= self.config.park_finish_cd_missing_scans
+        ):
+            self.state = ParkingState.PARKED
+            self._parked_started_at = self._now
+            return self._stop(
+                "paper_both_cd_missing_finish:%d/%d"
+                % (
+                    self._park_finish_cd_missing_scans,
+                    self.config.park_finish_cd_missing_scans,
+                )
+            )
         slot_heading, heading_span = self._filtered_slot_heading()
         if (
+            not self._direct_reverse_committed
+            and
             slot_heading is not None
             and abs(slot_heading)
             > self.config.parallel_heading_trigger_deg
@@ -1041,6 +1129,8 @@ class PaperParkingController:
                 "heading_drift_after_centering",
             )
         if (
+            not self._direct_reverse_committed
+            and
             observation.dist_c_mm is not None
             and observation.dist_d_mm is not None
         ):
@@ -1066,27 +1156,12 @@ class PaperParkingController:
                     "cd_balance_drift_realign",
                 )
 
-        if (
-            observation.c_y_back_mm is not None
-            and observation.d_y_back_mm is not None
-            and observation.c_y_back_mm > 0.0
-            and observation.d_y_back_mm > 0.0
-        ):
-            self.state = ParkingState.PARKED
-            self._parked_started_at = self._now
-            return self._stop(
-                "paper_both_cd_crossed_y0_finish C_y=%+.0f D_y=%+.0f"
-                % (
-                    observation.c_y_back_mm,
-                    observation.d_y_back_mm,
-                )
-            )
         return self._drive(
             self.config.inside_reverse_speed,
             0,
             (
                 "paper_centered_reverse heading=%s span=%s "
-                "until_both_cd_cross_y0 C_y=%s D_y=%s"
+                "until_both_cd_missing missing=%d/%d"
             )
             % (
                 (
@@ -1099,16 +1174,8 @@ class PaperParkingController:
                     if heading_span != float("inf")
                     else "None"
                 ),
-                (
-                    "%.0f" % observation.c_y_back_mm
-                    if observation.c_y_back_mm is not None
-                    else "None"
-                ),
-                (
-                    "%.0f" % observation.d_y_back_mm
-                    if observation.d_y_back_mm is not None
-                    else "None"
-                ),
+                self._park_finish_cd_missing_scans,
+                self.config.park_finish_cd_missing_scans,
             ),
         )
 
@@ -1221,6 +1288,10 @@ class PaperParkingController:
         self._realigning_after_dropout = False
         self._reset_center_observation()
         self._both_sides_seen_scans = 0
+        self._direct_reverse_ready_scans = 0
+        self._direct_reverse_committed = False
+        self._direct_reverse_started_lidar_timestamp = None
+        self._park_finish_cd_missing_scans = 0
         self._cd_center_ready_scans = 0
         self._cd_missing_scans = 0
         self._slot_heading_missing_scans = 0
