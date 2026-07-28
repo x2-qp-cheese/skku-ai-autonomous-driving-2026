@@ -96,6 +96,8 @@ class TelemetryRecorder:
                 "angle_term",
                 "distance_term",
                 "paper_steering",
+                "applied_paper_steering",
+                "entry_center_angle_deg",
                 "realigning_after_dropout",
                 "prealign_near_seen",
                 "prealign_ready_scans",
@@ -237,6 +239,12 @@ class TelemetryRecorder:
                 "angle_term": _optional(debug.angle_term),
                 "distance_term": _optional(debug.distance_term),
                 "paper_steering": _optional(debug.paper_steering),
+                "applied_paper_steering": _optional(
+                    debug.applied_paper_steering
+                ),
+                "entry_center_angle_deg": _optional(
+                    debug.entry_center_angle_deg
+                ),
                 "realigning_after_dropout": int(
                     debug.realigning_after_dropout
                 ),
@@ -972,11 +980,11 @@ def _show_debug(
             _fmt(gap_center_angle, 1),
             control_pair.reason,
         ),
-        "angleTerm=%s distTerm=%s paperSteer=%s"
+        "Eq5=%s entrySteer=%s entryCenter=%sdeg"
         % (
-            _fmt(debug.angle_term, 2),
-            _fmt(debug.distance_term, 2),
             _fmt(debug.paper_steering, 2),
+            _fmt(debug.applied_paper_steering, 2),
+            _fmt(debug.entry_center_angle_deg, 1),
         ),
         "dropoutRealign=%s" % debug.realigning_after_dropout,
         "setupNearSeen=%s readyScans=%d pairHold=%d centerScans=%d"

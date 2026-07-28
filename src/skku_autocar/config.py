@@ -71,6 +71,7 @@ class PaperControllerConfig:
     actuator_max_steering: int = 150
     actuator_steering_offset: int = 0
     distance_bias_scale_mm: float = 600.0
+    entry_full_steer_angle_deg: float = 30.0
     dist_bias_cd_threshold_mm: float = 250.0
     recovery_forward_s: float = 3.0
     command_rate_hz: float = 20.0
@@ -210,6 +211,10 @@ def _validate(config: AppConfig) -> None:
     if controller.pair_max_distance_jump_mm <= 0.0:
         raise ValueError(
             "pair_max_distance_jump_mm must be positive"
+        )
+    if not 0.0 < controller.entry_full_steer_angle_deg <= 90.0:
+        raise ValueError(
+            "entry_full_steer_angle_deg must be in (0, 90]"
         )
     if controller.center_observation_scans < 1:
         raise ValueError("center_observation_scans must be positive")

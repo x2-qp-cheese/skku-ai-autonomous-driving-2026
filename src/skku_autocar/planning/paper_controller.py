@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from math import atan2, cos, degrees, radians, sin
 from statistics import median
 from typing import Deque, Optional, Tuple
 
@@ -15,6 +16,8 @@ class PaperParkingDebug:
     state: ParkingState = ParkingState.IDLE
     detected_vehicle_count: int = 0
     paper_steering: Optional[float] = None
+    applied_paper_steering: Optional[float] = None
+    entry_center_angle_deg: Optional[float] = None
     angle_term: Optional[float] = None
     distance_term: Optional[float] = None
     distance_bias_ab_mm: Optional[float] = None
@@ -267,11 +270,16 @@ class PaperParkingController:
         paper_steering, angle_term, distance_term = (
             self._paper_steering(pair)
         )
+        entry_steering, entry_center_angle = (
+            self._entry_midpoint_steering(pair)
+        )
         bias_ab = pair.dist_a_mm - pair.dist_b_mm
         self.debug = PaperParkingDebug(
             state=self.state,
             detected_vehicle_count=self._detected_vehicle_count,
             paper_steering=paper_steering,
+            applied_paper_steering=entry_steering,
+            entry_center_angle_deg=entry_center_angle,
             angle_term=angle_term,
             distance_term=distance_term,
             distance_bias_ab_mm=bias_ab,
@@ -281,21 +289,21 @@ class PaperParkingController:
             realigning_after_dropout=(
                 self._realigning_after_dropout
             ),
-            reason="equation_5_reverse",
+            reason="gap_midpoint_reverse",
         )
         self._reverse_motion_started = True
         return ControlCommand(
             speed=self.config.reverse_speed,
             steering=self._apply_steering_offset(
-                self._paper_to_actuator(paper_steering)
+                self._paper_to_actuator(entry_steering)
             ),
             reason=(
-                "eq5_reverse bisector=%+.1f biasAB=%+.0f "
-                "paperSteer=%+.2f pair=%s"
+                "gap_midpoint_reverse center=%+.1f "
+                "entrySteer=%+.2f eq5=%+.2f pair=%s"
             )
             % (
-                pair.angle_bisector_deg,
-                bias_ab,
+                entry_center_angle,
+                entry_steering,
                 paper_steering,
                 "held" if pair_held else "filtered",
             ),
@@ -616,6 +624,28 @@ class PaperParkingController:
         angle_term = self._g(-pair.angle_bisector_deg)
         steering = self._h(angle_term + distance_term)
         return steering, angle_term, distance_term
+
+    def _entry_midpoint_steering(
+        self,
+        pair: TangentPair,
+    ) -> Tuple[float, float]:
+        angle_a = radians(pair.angle_a_deg)
+        angle_b = radians(pair.angle_b_deg)
+        center_x = (
+            sin(angle_a) * pair.dist_a_mm
+            + sin(angle_b) * pair.dist_b_mm
+        ) / 2.0
+        center_y = (
+            cos(angle_a) * pair.dist_a_mm
+            + cos(angle_b) * pair.dist_b_mm
+        ) / 2.0
+        center_angle = degrees(atan2(center_x, center_y))
+        steering = self._h(
+            self.config.paper_max_steering
+            * center_angle
+            / self.config.entry_full_steer_angle_deg
+        )
+        return steering, center_angle
 
     def _f(self, value_mm: float) -> float:
         maximum = self.config.paper_max_steering

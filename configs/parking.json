@@ -47,6 +47,7 @@
     "actuator_max_steering": 150,
     "actuator_steering_offset": -29,
     "distance_bias_scale_mm": 1200.0,
+    "entry_full_steer_angle_deg": 30.0,
     "dist_bias_cd_threshold_mm": 250.0,
     "recovery_forward_s": 3.0,
     "command_rate_hz": 20.0
