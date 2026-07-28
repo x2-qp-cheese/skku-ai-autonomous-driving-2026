@@ -272,6 +272,83 @@ class YoloLaneGeometryTest(unittest.TestCase):
         self.assertGreater(command.steering, -120)
         self.assertLess(command.steering, 0)
 
+    def test_path_near_conflict_corrects_large_local_drift_on_curve(self):
+        follower = YoloLaneFollower(
+            YoloLaneFollowerConfig(
+                path_tracking=True,
+                path_near_conflict_error_threshold=0.035,
+                path_near_conflict_heading_limit=0.18,
+                path_curve_guard_near_error=0.10,
+                path_curve_guard_release_error=0.24,
+            )
+        )
+        lane = lane_geometry(
+            lateral_error_norm=-0.60,
+            heading_error=-0.50,
+            near_lateral_error_norm=0.17,
+            reason="corridor_tier1",
+        )
+
+        strength = follower._path_near_conflict_strength(
+            lane,
+            near_error=0.17,
+            raw_steering=-120.0,
+        )
+
+        self.assertAlmostEqual(strength, 0.50, places=2)
+
+    def test_path_near_conflict_preserves_curve_entry_for_small_local_error(self):
+        follower = YoloLaneFollower(
+            YoloLaneFollowerConfig(
+                path_tracking=True,
+                path_near_conflict_error_threshold=0.035,
+                path_near_conflict_heading_limit=0.18,
+                path_curve_guard_near_error=0.10,
+                path_curve_guard_release_error=0.24,
+            )
+        )
+        lane = lane_geometry(
+            lateral_error_norm=-0.30,
+            heading_error=-0.50,
+            near_lateral_error_norm=0.09,
+            reason="corridor_tier1",
+        )
+
+        strength = follower._path_near_conflict_strength(
+            lane,
+            near_error=0.09,
+            raw_steering=-90.0,
+        )
+
+        self.assertEqual(strength, 0.0)
+
+    def test_path_near_conflict_does_not_override_crosswalk_or_lane_change(self):
+        follower = YoloLaneFollower(
+            YoloLaneFollowerConfig(
+                path_tracking=True,
+                path_near_conflict_error_threshold=0.035,
+                path_curve_guard_near_error=0.10,
+                path_curve_guard_release_error=0.24,
+            )
+        )
+
+        for reason in (
+            "corridor_tier1:crosswalk_priority_hold",
+            "corridor_tier1:lane_change",
+        ):
+            lane = lane_geometry(
+                lateral_error_norm=-0.60,
+                heading_error=-0.50,
+                near_lateral_error_norm=0.20,
+                reason=reason,
+            )
+            strength = follower._path_near_conflict_strength(
+                lane,
+                near_error=0.20,
+                raw_steering=-120.0,
+            )
+            self.assertEqual(strength, 0.0)
+
     def test_path_reversal_waits_for_near_center_before_opposite_turn(self):
         follower = YoloLaneFollower(
             YoloLaneFollowerConfig(

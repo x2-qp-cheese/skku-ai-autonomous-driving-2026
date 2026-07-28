@@ -69,9 +69,9 @@ class YoloLaneFollowerConfig:
     # as the near error approaches the center instead of being forced at once.
     path_reversal_near_guard_error: float = 0.025
     path_reversal_near_full_error: float = 0.12
-    # Near-field disagreement is blended into the whole-path command only on
-    # almost-straight geometry. It must not switch the command off at a binary
-    # threshold while coherent curve heading is available.
+    # Near-field disagreement is blended into the whole-path command. On a
+    # curve, require a larger local displacement before overriding heading
+    # preview so entry timing is preserved while boundary drift is corrected.
     path_near_conflict_error_threshold: float = 0.01
     path_near_conflict_release_alpha: float = 0.90
     path_near_conflict_heading_limit: float = 0.18
@@ -557,7 +557,7 @@ class YoloLaneFollower:
         )
         heading = abs(float(lane.heading_error))
         if heading_limit <= 1e-6:
-            heading_strength = 1.0 if heading <= 1e-6 else 0.0
+            heading_ratio = 0.0 if heading <= 1e-6 else 1.0
         else:
             heading_ratio = self._clip_float(
                 heading / heading_limit,
@@ -567,7 +567,6 @@ class YoloLaneFollower:
             heading_ratio = heading_ratio * heading_ratio * (
                 3.0 - 2.0 * heading_ratio
             )
-            heading_strength = 1.0 - heading_ratio
 
         error_span = max(threshold, 0.02)
         error_ratio = self._clip_float(
@@ -578,7 +577,31 @@ class YoloLaneFollower:
         error_strength = error_ratio * error_ratio * (
             3.0 - 2.0 * error_ratio
         )
-        return heading_strength * error_strength
+
+        curve_start = max(
+            threshold,
+            float(self.config.path_curve_guard_near_error),
+        )
+        curve_release = max(
+            curve_start + 1e-6,
+            float(self.config.path_curve_guard_release_error),
+        )
+        curve_ratio = self._clip_float(
+            (magnitude - curve_start) / (curve_release - curve_start),
+            0.0,
+            1.0,
+        )
+        curve_strength = curve_ratio * curve_ratio * (
+            3.0 - 2.0 * curve_ratio
+        )
+
+        # Keep the sensitive near-field correction on straights. As heading
+        # grows, continuously hand over to the wider curve displacement band
+        # instead of disabling correction at one heading threshold.
+        return (
+            (1.0 - heading_ratio) * error_strength
+            + heading_ratio * curve_strength
+        )
 
     def _path_curve_guard_limit(
         self,
