@@ -5,6 +5,8 @@ from skku_autocar.config import PaperControllerConfig, RearLidarConfig
 from skku_autocar.perception.rear_lidar import (
     RearLidarObservation,
     RearLidarPerception,
+    SideLineEstimate,
+    TangentPair,
 )
 from skku_autocar.planning.paper_controller import PaperParkingController
 from skku_autocar.sensors.lidar import LidarPoint, LidarScan
@@ -12,6 +14,68 @@ from skku_autocar.types import ParkingState
 
 
 class TimedExitTest(unittest.TestCase):
+    def test_nonparallel_center_check_uses_paper_three_second_recovery(self):
+        config = replace(
+            PaperControllerConfig(),
+            actuator_steering_offset=-28,
+            center_observation_scans=4,
+            parallel_heading_tolerance_deg=7.0,
+            recovery_forward_s=3.0,
+        )
+        controller = PaperParkingController(config)
+        controller.state = ParkingState.CENTER_CHECK
+        side_line = SideLineEstimate(
+            valid=True,
+            heading_deg=10.0,
+            point_count=8,
+            extent_mm=300.0,
+            linearity=10.0,
+        )
+
+        command = None
+        for scan in range(1, 5):
+            command = controller.update(
+                RearLidarObservation(
+                    timestamp=float(scan),
+                    valid=True,
+                    dist_c_mm=650.0,
+                    dist_d_mm=680.0,
+                    left_side_line=side_line,
+                    right_side_line=side_line,
+                    slot_heading_deg=10.0,
+                ),
+                float(scan),
+            )
+
+        self.assertEqual(controller.state, ParkingState.RECOVERY_FORWARD)
+        self.assertEqual((command.speed, command.steering), (80, -28))
+
+        command = controller.update(
+            RearLidarObservation(timestamp=5.9, valid=True),
+            6.9,
+        )
+        self.assertEqual(controller.state, ParkingState.RECOVERY_FORWARD)
+        self.assertEqual((command.speed, command.steering), (80, -28))
+
+        command = controller.update(
+            RearLidarObservation(
+                timestamp=7.0,
+                valid=True,
+                pair=TangentPair(
+                    valid=True,
+                    angle_a_deg=20.0,
+                    angle_b_deg=40.0,
+                    dist_a_mm=900.0,
+                    dist_b_mm=950.0,
+                    angle_bisector_deg=30.0,
+                    reason="test_pair",
+                ),
+            ),
+            7.0,
+        )
+        self.assertEqual(controller.state, ParkingState.REVERSE_ALIGN)
+        self.assertEqual(command.speed, config.reverse_speed)
+
     def test_perception_preserves_closest_cd_y_coordinates(self):
         perception = RearLidarPerception(RearLidarConfig())
         observation = perception.observe(

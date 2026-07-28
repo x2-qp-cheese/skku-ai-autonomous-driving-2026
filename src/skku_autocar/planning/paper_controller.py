@@ -641,7 +641,7 @@ class PaperParkingController:
                 ),
                 keep_debug=True,
             )
-        parallel_forward_needed = (
+        paper_recovery_needed = (
             both_sides
             and observation.dist_c_mm
             >= self.config.cd_direct_reverse_min_distance_mm
@@ -660,11 +660,12 @@ class PaperParkingController:
             self._is_new_scan
             and self._center_scan_count
             >= self.config.center_observation_scans
-            and parallel_forward_needed
+            and paper_recovery_needed
         ):
-            return self._start_parallel_forward(
-                observation,
-                "side_heading_requires_parallel_forward",
+            return self._start_recovery(
+                self._now,
+                observation.dist_c_mm - observation.dist_d_mm,
+                "paper_side_heading_misaligned_forward_3s",
             )
         if (
             self._cd_missing_scans > self.config.pair_hold_scans
