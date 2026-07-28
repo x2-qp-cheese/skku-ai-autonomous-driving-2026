@@ -197,8 +197,8 @@ class PaperParkingController:
             self._prealign_near_seen = True
 
         ready_now = (
-            abs(entry_center_angle)
-            <= self.config.entry_full_steer_angle_deg
+            0.0 < entry_center_angle
+            <= self.config.entry_start_angle_deg
             and not pair_held
         )
         if self._is_new_scan:
@@ -227,7 +227,7 @@ class PaperParkingController:
             )
             % (
                 entry_center_angle,
-                self.config.entry_full_steer_angle_deg,
+                self.config.entry_start_angle_deg,
                 self._prealign_ready_scans,
                 self.config.prealign_clear_confirm_scans,
             ),

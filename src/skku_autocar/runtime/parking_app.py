@@ -1002,6 +1002,11 @@ def _show_debug(
             _fmt(debug.applied_paper_steering, 2),
             _fmt(debug.entry_center_angle_deg, 1),
         ),
+        "ENTRY start<=%.1fdeg fullSteer@%.1fdeg"
+        % (
+            config.controller.entry_start_angle_deg,
+            config.controller.entry_full_steer_angle_deg,
+        ),
         "dropoutRealign=%s" % debug.realigning_after_dropout,
         "setupNearSeen=%s readyScans=%d pairHold=%d centerScans=%d"
         % (
@@ -1119,7 +1124,22 @@ def _config_with_overrides(
         if args.lidar_port
         else config.lidar
     )
-    return replace(config, serial=serial, lidar=lidar)
+    controller = config.controller
+    if args.entry_start_angle is not None:
+        if not 0.0 < args.entry_start_angle <= 90.0:
+            raise ValueError(
+                "--entry-start-angle must be in (0, 90]"
+            )
+        controller = replace(
+            controller,
+            entry_start_angle_deg=args.entry_start_angle,
+        )
+    return replace(
+        config,
+        serial=serial,
+        lidar=lidar,
+        controller=controller,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1134,6 +1154,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lidar-port")
     parser.add_argument("--lidar-csv")
     parser.add_argument("--record-dir")
+    parser.add_argument(
+        "--entry-start-angle",
+        type=float,
+        help=(
+            "A/B gap-center bearing that ends left-forward setup "
+            "and starts reverse entry"
+        ),
+    )
     parser.add_argument("--no-motor", action="store_true")
     parser.add_argument("--auto-start", action="store_true")
     parser.add_argument("--no-window", action="store_true")

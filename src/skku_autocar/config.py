@@ -74,6 +74,7 @@ class PaperControllerConfig:
     actuator_max_steering: int = 150
     actuator_steering_offset: int = 0
     distance_bias_scale_mm: float = 600.0
+    entry_start_angle_deg: float = 30.0
     entry_full_steer_angle_deg: float = 30.0
     cd_target_balance_ratio: float = -0.16
     cd_full_steer_error_ratio: float = 0.15
@@ -225,6 +226,10 @@ def _validate(config: AppConfig) -> None:
     if not 0.0 < controller.entry_full_steer_angle_deg <= 90.0:
         raise ValueError(
             "entry_full_steer_angle_deg must be in (0, 90]"
+        )
+    if not 0.0 < controller.entry_start_angle_deg <= 90.0:
+        raise ValueError(
+            "entry_start_angle_deg must be in (0, 90]"
         )
     if controller.center_observation_scans < 1:
         raise ValueError("center_observation_scans must be positive")
