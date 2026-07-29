@@ -106,6 +106,97 @@ class YoloLaneGeometryTest(unittest.TestCase):
 
         self.assertEqual(reversed_command.steering, -20)
 
+    def test_path_timing_two_half_updates_match_one_reference_update(self):
+        config = YoloLaneFollowerConfig(
+            path_tracking=True,
+            path_lateral_gain=100.0,
+            path_heading_gain=0.0,
+            path_derivative_gain=0.0,
+            path_heading_lead_gain=0.0,
+            path_integral_gain=0.0,
+            path_center_recovery_error_threshold=1.0,
+            path_steering_rise_alpha=0.5,
+            path_steering_release_alpha=0.5,
+            steering_rate_limit=500,
+            min_steering_rate_limit=500,
+            steering_release_rate_limit=500,
+            max_steering=500,
+        )
+        lane = lane_geometry(
+            lateral_error_norm=0.40,
+            heading_error=0.0,
+            near_lateral_error_norm=0.40,
+        )
+        reference = YoloLaneFollower(config)
+        half_rate = YoloLaneFollower(config)
+
+        reference_command = reference.plan(lane, time_scale=1.0)
+        half_rate.plan(lane, time_scale=0.5)
+        half_rate_command = half_rate.plan(lane, time_scale=0.5)
+
+        self.assertAlmostEqual(
+            half_rate_command.steering,
+            reference_command.steering,
+            delta=1,
+        )
+
+    def test_default_path_timing_preserves_legacy_reference_frame(self):
+        config = YoloLaneFollowerConfig(
+            path_tracking=True,
+            path_lateral_gain=100.0,
+            path_heading_gain=0.0,
+            path_derivative_gain=0.0,
+            path_heading_lead_gain=0.0,
+            path_integral_gain=0.0,
+            path_center_recovery_error_threshold=1.0,
+            path_steering_rise_alpha=0.5,
+            steering_rate_limit=500,
+            min_steering_rate_limit=500,
+            max_steering=500,
+        )
+        lane = lane_geometry(
+            lateral_error_norm=-0.40,
+            heading_error=0.0,
+            near_lateral_error_norm=-0.40,
+        )
+
+        implicit = YoloLaneFollower(config).plan(lane)
+        explicit = YoloLaneFollower(config).plan(lane, time_scale=1.0)
+
+        self.assertEqual(implicit, explicit)
+
+    def test_path_timing_scales_steering_slew_per_elapsed_time(self):
+        config = YoloLaneFollowerConfig(
+            path_tracking=True,
+            path_lateral_gain=200.0,
+            path_heading_gain=0.0,
+            path_derivative_gain=0.0,
+            path_heading_lead_gain=0.0,
+            path_integral_gain=0.0,
+            path_center_recovery_error_threshold=1.0,
+            path_steering_rise_alpha=1.0,
+            path_steering_release_alpha=1.0,
+            steering_rate_limit=40,
+            min_steering_rate_limit=40,
+            steering_release_rate_limit=40,
+            max_steering=500,
+        )
+        lane = lane_geometry(
+            lateral_error_norm=0.50,
+            heading_error=0.0,
+            near_lateral_error_norm=0.50,
+        )
+        reference = YoloLaneFollower(config)
+        half_rate = YoloLaneFollower(config)
+
+        reference_command = reference.plan(lane, time_scale=1.0)
+        first_half = half_rate.plan(lane, time_scale=0.5)
+        second_half = half_rate.plan(lane, time_scale=0.5)
+
+        self.assertEqual(reference_command.steering, 40)
+        self.assertEqual(first_half.steering, 20)
+        self.assertEqual(second_half.steering, reference_command.steering)
+
     def test_path_center_recovery_acts_immediately_on_reliable_straight(self):
         follower = YoloLaneFollower(
             YoloLaneFollowerConfig(
