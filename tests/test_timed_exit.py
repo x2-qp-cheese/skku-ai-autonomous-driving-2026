@@ -91,6 +91,102 @@ class TimedExitTest(unittest.TestCase):
         self.assertAlmostEqual(observation.c_y_back_mm, 173.65, places=2)
         self.assertAlmostEqual(observation.d_y_back_mm, 173.65, places=2)
 
+    def test_direct_reverse_applies_bounded_heading_correction(self):
+        config = replace(
+            PaperControllerConfig(),
+            actuator_steering_offset=-28,
+        )
+        controller = PaperParkingController(config)
+        controller.state = ParkingState.REVERSE_STRAIGHT
+        controller._direct_reverse_committed = True
+        side_line = SideLineEstimate(
+            valid=True,
+            heading_deg=5.0,
+            point_count=8,
+            extent_mm=300.0,
+            linearity=10.0,
+        )
+
+        command = None
+        for scan in range(1, 3):
+            command = controller.update(
+                RearLidarObservation(
+                    timestamp=float(scan),
+                    valid=True,
+                    dist_c_mm=650.0,
+                    dist_d_mm=850.0,
+                    left_side_line=side_line,
+                    right_side_line=side_line,
+                    slot_heading_deg=5.0,
+                ),
+                float(scan),
+            )
+
+        self.assertEqual(controller.state, ParkingState.REVERSE_STRAIGHT)
+        self.assertEqual(command.speed, config.inside_reverse_speed)
+        self.assertEqual(command.steering, -7)
+        self.assertIn("paper_centered_reverse", command.reason)
+
+    def test_direct_reverse_does_not_steer_from_one_side_line(self):
+        config = replace(
+            PaperControllerConfig(),
+            actuator_steering_offset=-28,
+        )
+        controller = PaperParkingController(config)
+        controller.state = ParkingState.REVERSE_STRAIGHT
+        controller._direct_reverse_committed = True
+        left_line = SideLineEstimate(
+            valid=True,
+            heading_deg=5.0,
+            point_count=8,
+            extent_mm=300.0,
+            linearity=10.0,
+        )
+
+        command = controller.update(
+            RearLidarObservation(
+                timestamp=1.0,
+                valid=True,
+                dist_c_mm=650.0,
+                dist_d_mm=850.0,
+                left_side_line=left_line,
+                slot_heading_deg=5.0,
+            ),
+            1.0,
+        )
+
+        self.assertEqual(
+            (command.speed, command.steering),
+            (config.inside_reverse_speed, -28),
+        )
+        self.assertIn("paper_centered_reverse", command.reason)
+
+    def test_non_direct_reverse_keeps_existing_straight_command(self):
+        config = replace(
+            PaperControllerConfig(),
+            actuator_steering_offset=-28,
+        )
+        controller = PaperParkingController(config)
+        controller.state = ParkingState.REVERSE_STRAIGHT
+
+        command = controller.update(
+            RearLidarObservation(
+                timestamp=1.0,
+                valid=True,
+                dist_c_mm=650.0,
+                dist_d_mm=850.0,
+                slot_heading_deg=5.0,
+            ),
+            1.0,
+        )
+
+        self.assertEqual(controller.state, ParkingState.REVERSE_STRAIGHT)
+        self.assertEqual(
+            (command.speed, command.steering),
+            (config.inside_reverse_speed, -28),
+        )
+        self.assertIn("paper_centered_reverse", command.reason)
+
     def test_both_side_distance_jumps_finish_parking(self):
         config = PaperControllerConfig()
         controller = PaperParkingController(config)

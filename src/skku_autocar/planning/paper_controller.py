@@ -1192,9 +1192,27 @@ class PaperParkingController:
                     "cd_balance_drift_realign",
                 )
 
+        reverse_steering = 0
+        if self._direct_reverse_committed:
+            heading_is_reliable = (
+                observation.slot_heading_deg is not None
+                and observation.left_side_line.valid
+                and observation.right_side_line.valid
+                and heading_span
+                <= self.config.parallel_heading_stability_deg
+            )
+            paper_steering = (
+                self._direct_reverse_micro_steering(
+                    slot_heading if heading_is_reliable else None
+                )
+            )
+            reverse_steering = self._apply_steering_offset(
+                self._paper_to_actuator(paper_steering)
+            )
+
         return self._drive(
             self.config.inside_reverse_speed,
-            0,
+            reverse_steering,
             (
                 "paper_centered_reverse heading=%s span=%s "
                 "until_side_jump C=%d D=%d "
@@ -1610,6 +1628,49 @@ class PaperParkingController:
             else float("inf")
         )
         return heading, span
+
+    def _direct_reverse_micro_steering(
+        self,
+        slot_heading: Optional[float],
+    ) -> float:
+        if slot_heading is None:
+            self._last_cd_steering = 0.0
+            return 0.0
+
+        maximum = min(
+            self.config.parallel_forward_max_steering,
+            self.config.cd_steering_max_step,
+            (
+                self.config.paper_max_steering
+                * self.config.parallel_heading_tolerance_deg
+                / self.config.parallel_heading_full_steer_deg
+            ),
+        )
+        desired = max(
+            -maximum,
+            min(
+                maximum,
+                (
+                    self.config.paper_max_steering
+                    * slot_heading
+                    / self.config.parallel_heading_full_steer_deg
+                ),
+            ),
+        )
+        previous = max(
+            -maximum,
+            min(maximum, self._last_cd_steering),
+        )
+        if not self._is_new_scan:
+            return previous
+
+        step = self.config.cd_steering_max_step
+        applied = previous + max(
+            -step,
+            min(step, desired - previous),
+        )
+        self._last_cd_steering = applied
+        return applied
 
     def _paper_steering(
         self,
