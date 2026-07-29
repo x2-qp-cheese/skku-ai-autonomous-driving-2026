@@ -89,6 +89,10 @@ class YoloLaneFollowerConfig:
     path_heading_lead_coherent_gain: float = 195.0
     path_heading_lead_span: float = 0.15
     path_heading_lead_max_steering: float = 36.0
+    # Optional direction-specific trim. Keep 1.0 for the obstacle follower;
+    # the ordinary follower may soften its only right turn without weakening
+    # the preceding left-hand part of the S-curve.
+    path_right_steering_scale: float = 1.0
     # A bounded integral term removes persistent mechanical/camera centering
     # bias, but only while two physical boundaries describe a stable straight.
     path_integral_gain: float = 45.0
@@ -407,6 +411,13 @@ class YoloLaneFollower:
             -self.config.max_steering,
             self.config.max_steering,
         )
+        if steering > 0:
+            right_scale = self._clip_float(
+                float(self.config.path_right_steering_scale),
+                0.0,
+                1.0,
+            )
+            steering = int(round(float(steering) * right_scale))
 
         speed = int(
             round(

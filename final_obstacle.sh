@@ -29,6 +29,7 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-near-weight 1.75 \
   --path-far-weight 0.55 \
   --normal-path-far-weight 0.55 \
+  --normal-path-right-steering-scale 0.95 \
   --path-steering-rise-alpha 0.72 \
   --path-steering-release-alpha 0.28 \
   --normal-path-steering-release-alpha 0.30 \
