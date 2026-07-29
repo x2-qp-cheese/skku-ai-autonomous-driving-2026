@@ -503,28 +503,10 @@ def build_normal_follower_config(
         if args.normal_path_far_weight < 0.0
         else args.normal_path_far_weight
     )
-    max_steering = (
-        obstacle_config.max_steering
-        if args.normal_max_steering < 0
-        else args.normal_max_steering
-    )
-    reversal_alpha = (
-        obstacle_config.path_reversal_alpha
-        if args.normal_path_reversal_alpha < 0.0
-        else args.normal_path_reversal_alpha
-    )
-    reversal_minimum = (
-        obstacle_config.path_reversal_output_min_steering
-        if args.normal_path_reversal_output_min_steering < 0.0
-        else args.normal_path_reversal_output_min_steering
-    )
     return replace(
         obstacle_config,
-        max_steering=max_steering,
         path_steering_release_alpha=release_alpha,
         path_far_weight=far_weight,
-        path_reversal_alpha=reversal_alpha,
-        path_reversal_output_min_steering=reversal_minimum,
     )
 
 
@@ -610,19 +592,12 @@ def log_effective_config(
     )
     normal_config = build_normal_follower_config(args, follower_config)
     LOG.info(
-        "normal path tuning=max_steer %d far_weight %.3f release_alpha %.2f "
-        "reversal=%.2f/min%.0f; obstacle path preserved=max_steer %d "
-        "far_weight %.2f release_alpha %.2f reversal=%.2f/min%.0f lookahead %.2f",
-        normal_config.max_steering,
+        "normal path tuning=far_weight %.2f release_alpha %.2f; "
+        "obstacle path preserved=far_weight %.2f release_alpha %.2f lookahead %.2f",
         normal_config.path_far_weight,
         normal_config.path_steering_release_alpha,
-        normal_config.path_reversal_alpha,
-        normal_config.path_reversal_output_min_steering,
-        follower_config.max_steering,
         follower_config.path_far_weight,
         follower_config.path_steering_release_alpha,
-        follower_config.path_reversal_alpha,
-        follower_config.path_reversal_output_min_steering,
         corridor_config.lookahead_y_ratio,
     )
     LOG.info(
@@ -1339,24 +1314,6 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         type=float,
         default=-1.0,
         help="ordinary-driving far-path weight; negative reuses --path-far-weight. Obstacle control always keeps the shared value",
-    )
-    parser.add_argument(
-        "--normal-max-steering",
-        type=int,
-        default=-1,
-        help="ordinary-driving absolute steering cap; negative reuses --max-steering. Obstacle control always keeps the shared value",
-    )
-    parser.add_argument(
-        "--normal-path-reversal-alpha",
-        type=float,
-        default=-1.0,
-        help="ordinary-driving S-curve reversal EMA; negative reuses --path-reversal-alpha. Obstacle control always keeps the shared value",
-    )
-    parser.add_argument(
-        "--normal-path-reversal-output-min-steering",
-        type=float,
-        default=-1.0,
-        help="ordinary-driving minimum coherent S-curve reversal steering; negative reuses the shared value. Obstacle control always keeps the shared value",
     )
     parser.add_argument(
         "--path-center-recovery-error-threshold",

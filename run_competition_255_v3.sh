@@ -28,7 +28,6 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-near-weight 1.60 \
   --path-far-weight 0.55 \
   --normal-path-far-weight 0.575 \
-  --normal-max-steering 135 \
   --path-steering-rise-alpha 0.72 \
   --path-steering-release-alpha 0.28 \
   --normal-path-steering-release-alpha 0.30 \
@@ -41,8 +40,6 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-reversal-min-steering 25 \
   --path-reversal-min-geometry 0.05 \
   --path-reversal-output-min-steering 70 \
-  --normal-path-reversal-alpha 0.82 \
-  --normal-path-reversal-output-min-steering 60 \
   --path-reversal-rate-limit 80 \
   --path-reversal-near-guard-error 0.015 \
   --path-reversal-near-full-error 0.08 \
