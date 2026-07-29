@@ -55,7 +55,7 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-integral-gain 45 \
   --path-integral-limit 0.25 \
   --path-integral-decay 0.65 \
-  --bev-lookahead 0.32 \
+  --bev-lookahead 0.36 \
   --bev-center-smooth 0.32 \
   --bev-heading-smooth 1.0 \
   --bev-path-smooth 0.65 \
