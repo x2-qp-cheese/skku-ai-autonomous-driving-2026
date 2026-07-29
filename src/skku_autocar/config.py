@@ -86,6 +86,8 @@ class PaperControllerConfig:
     park_finish_side_missing_scans: int = 3
     cd_center_confirm_scans: int = 5
     paper_max_steering: float = 7.0
+    reverse_align_max_steering: float = 6.0
+    reverse_align_steering_max_step: float = 1.0
     actuator_max_steering: int = 150
     actuator_steering_offset: int = 0
     distance_bias_scale_mm: float = 600.0
@@ -234,6 +236,19 @@ def _validate(config: AppConfig) -> None:
         )
     if controller.paper_max_steering <= 0.0:
         raise ValueError("paper_max_steering must be positive")
+    if not (
+        0.0
+        < controller.reverse_align_max_steering
+        <= controller.paper_max_steering
+    ):
+        raise ValueError(
+            "reverse_align_max_steering must be in "
+            "(0, paper_max_steering]"
+        )
+    if controller.reverse_align_steering_max_step <= 0.0:
+        raise ValueError(
+            "reverse_align_steering_max_step must be positive"
+        )
     if controller.actuator_max_steering <= 0:
         raise ValueError("actuator_max_steering must be positive")
     if (

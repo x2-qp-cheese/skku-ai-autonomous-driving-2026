@@ -67,6 +67,7 @@ class PaperParkingController:
         self._pair_outlier_rejected = False
         self._pair_reacquiring = False
         self._realigning_after_dropout = False
+        self._last_pair_timestamp: Optional[float] = None
         self._center_scan_count = 0
         self._center_c_samples: Deque[float] = deque(
             maxlen=self.config.center_observation_scans
@@ -358,6 +359,7 @@ class PaperParkingController:
         ):
             self._realigning_after_dropout = False
             self.state = ParkingState.REVERSE_ALIGN
+            self._last_reverse_entry_steering = None
             return self._reverse_align(observation)
 
         return self._drive(
@@ -443,7 +445,7 @@ class PaperParkingController:
                     return ControlCommand(
                         speed=self.config.reverse_speed,
                         steering=self._steering_command(
-                            self._paper_to_actuator(
+                            self._paper_to_actuator_around_neutral(
                                 self._last_reverse_entry_steering
                             )
                         ),
@@ -462,20 +464,21 @@ class PaperParkingController:
                 "ab_dropout_not_inside_gap",
             )
 
-        paper_steering, angle_term, distance_term = (
+        desired_steering, angle_term, distance_term = (
             self._paper_steering(pair)
         )
-        entry_steering, entry_center_angle = (
-            self._entry_midpoint_steering(pair)
+        applied_steering = self._slew_reverse_align_steering(
+            desired_steering
         )
-        self._last_reverse_entry_steering = entry_steering
+        _, entry_center_angle = self._entry_midpoint_steering(pair)
+        self._last_reverse_entry_steering = applied_steering
         self._reverse_pair_dropout_scans = 0
         bias_ab = pair.dist_a_mm - pair.dist_b_mm
         self.debug = PaperParkingDebug(
             state=self.state,
             detected_vehicle_count=self._detected_vehicle_count,
-            paper_steering=paper_steering,
-            applied_paper_steering=entry_steering,
+            paper_steering=desired_steering,
+            applied_paper_steering=applied_steering,
             entry_center_angle_deg=entry_center_angle,
             angle_term=angle_term,
             distance_term=distance_term,
@@ -493,16 +496,20 @@ class PaperParkingController:
         return ControlCommand(
             speed=self.config.reverse_speed,
             steering=self._steering_command(
-                self._paper_to_actuator(entry_steering)
+                self._paper_to_actuator_around_neutral(
+                    applied_steering
+                )
             ),
             reason=(
-                "gap_midpoint_reverse center=%+.1f "
-                "entrySteer=%+.2f eq5=%+.2f pair=%s"
+                "paper_eq5_adapted_reverse bisector=%+.1f "
+                "desired=%+.2f applied=%+.2f center=%+.1f "
+                "pair=%s"
             )
             % (
+                pair.angle_bisector_deg,
+                desired_steering,
+                applied_steering,
                 entry_center_angle,
-                entry_steering,
-                paper_steering,
                 "held" if pair_held else "filtered",
             ),
         )
@@ -1111,6 +1118,7 @@ class PaperParkingController:
         self._parallel_exit_reason = ""
         self.state = ParkingState.REVERSE_ALIGN
         self._reverse_motion_started = False
+        self._last_reverse_entry_steering = None
         self._both_sides_seen_scans = 0
         self._reset_pair_tracking(observation)
         self._reset_center_observation()
@@ -1392,6 +1400,7 @@ class PaperParkingController:
             )
         self.state = ParkingState.REVERSE_ALIGN
         self._reverse_motion_started = False
+        self._last_reverse_entry_steering = None
         self._both_sides_seen_scans = 0
         self._reset_center_observation()
         self._reset_pair_tracking(observation)
@@ -1678,9 +1687,29 @@ class PaperParkingController:
     ) -> Tuple[float, float, float]:
         distance_bias_ab = pair.dist_a_mm - pair.dist_b_mm
         distance_term = self._f(distance_bias_ab)
-        angle_term = self._g(-pair.angle_bisector_deg)
-        steering = self._h(angle_term + distance_term)
+        angle_term = self._g(pair.angle_bisector_deg)
+        maximum = self.config.reverse_align_max_steering
+        steering = max(
+            -maximum,
+            min(maximum, angle_term + distance_term),
+        )
         return steering, angle_term, distance_term
+
+    def _slew_reverse_align_steering(
+        self,
+        desired: float,
+    ) -> float:
+        previous = self._last_reverse_entry_steering
+        if previous is None:
+            previous = 0.0
+        if not self._is_new_scan:
+            return previous
+
+        step = self.config.reverse_align_steering_max_step
+        return previous + max(
+            -step,
+            min(step, desired - previous),
+        )
 
     def _entry_midpoint_steering(
         self,
@@ -1712,11 +1741,10 @@ class PaperParkingController:
 
     def _g(self, value_deg: float) -> float:
         maximum = self.config.paper_max_steering
-        if value_deg > maximum:
-            return maximum
-        if value_deg < -maximum:
-            return -maximum
-        return maximum * value_deg / 20.0
+        return max(
+            -maximum,
+            min(maximum, maximum * value_deg / 20.0),
+        )
 
     def _h(self, value: float) -> float:
         maximum = self.config.paper_max_steering
@@ -1728,6 +1756,22 @@ class PaperParkingController:
         )
         return int(
             round(normalized * self.config.actuator_max_steering)
+        )
+
+    def _paper_to_actuator_around_neutral(
+        self,
+        paper_steering: float,
+    ) -> int:
+        maximum = self.config.actuator_max_steering
+        neutral = self.config.actuator_steering_offset
+        normalized = min(
+            1.0,
+            abs(paper_steering)
+            / self.config.paper_max_steering,
+        )
+        target = maximum if paper_steering >= 0.0 else -maximum
+        return int(
+            round(neutral + normalized * (target - neutral))
         )
 
     def _apply_steering_offset(self, steering: int) -> int:

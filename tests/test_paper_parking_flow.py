@@ -108,18 +108,49 @@ class PaperParkingFlowTest(unittest.TestCase):
         )
 
         self.assertEqual(command.speed, controller.config.reverse_speed)
-        self.assertEqual(command.steering, 149)
-        self.assertIn("paper_eq5_reverse", command.reason)
+        self.assertEqual(command.steering, -3)
+        self.assertIn("paper_eq5_adapted_reverse", command.reason)
         self.assertAlmostEqual(
             controller.debug.paper_steering,
-            6.9513888889,
+            6.0,
         )
-        self.assertEqual(
+        self.assertAlmostEqual(
             controller.debug.applied_paper_steering,
-            controller.debug.paper_steering,
+            1.0,
         )
 
     def test_reverse_steers_toward_detected_right_entry(self):
+        controller = self.make_controller()
+        controller.state = ParkingState.REVERSE_ALIGN
+        command = None
+        for scan in range(1, 7):
+            command = controller.update(
+                RearLidarObservation(
+                    timestamp=float(scan),
+                    valid=True,
+                    near=False,
+                    pair=TangentPair(
+                        valid=True,
+                        angle_a_deg=16.0,
+                        angle_b_deg=52.0,
+                        dist_a_mm=2791.0,
+                        dist_b_mm=1584.0,
+                        angle_bisector_deg=34.0,
+                        reason="recorded_right_entry",
+                    ),
+                ),
+                float(scan),
+            )
+
+        self.assertEqual(command.speed, controller.config.reverse_speed)
+        self.assertEqual(command.steering, 125)
+        self.assertEqual(controller.debug.paper_steering, 6.0)
+        self.assertEqual(
+            controller.debug.applied_paper_steering,
+            6.0,
+        )
+
+    def test_reverse_paper_equation_preserves_vehicle_signs(self):
         controller = self.make_controller()
         controller.state = ParkingState.REVERSE_ALIGN
         command = controller.update(
@@ -129,23 +160,22 @@ class PaperParkingFlowTest(unittest.TestCase):
                 near=False,
                 pair=TangentPair(
                     valid=True,
-                    angle_a_deg=16.0,
-                    angle_b_deg=52.0,
-                    dist_a_mm=2791.0,
-                    dist_b_mm=1584.0,
-                    angle_bisector_deg=34.0,
-                    reason="recorded_right_entry",
+                    angle_a_deg=-40.0,
+                    angle_b_deg=-20.0,
+                    dist_a_mm=950.0,
+                    dist_b_mm=900.0,
+                    angle_bisector_deg=-30.0,
+                    reason="recorded_left_entry",
                 ),
             ),
             1.0,
         )
 
-        self.assertEqual(command.speed, controller.config.reverse_speed)
-        self.assertEqual(command.steering, 150)
-        self.assertEqual(controller.debug.paper_steering, 7.0)
+        self.assertLess(command.steering, -28)
+        self.assertEqual(controller.debug.paper_steering, -6.0)
         self.assertEqual(
             controller.debug.applied_paper_steering,
-            7.0,
+            -1.0,
         )
 
     def test_one_cd_none_finishes_after_centered_reverse(self):
