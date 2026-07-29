@@ -147,7 +147,7 @@ def run(args: argparse.Namespace) -> int:
     running = bool(args.auto_start)
     last_command_at = 0.0
     last_log_at = 0.0
-    last_frame_at: Optional[float] = None
+    last_frame_at = time.monotonic()
     fps = 0.0
     command = ControlCommand.stop("paused")
 
@@ -199,13 +199,7 @@ def run(args: argparse.Namespace) -> int:
                 else wall_now
             )
             obstacle_mode.update_serial(vehicle, control_now)
-            if last_frame_at is None:
-                # There is no elapsed frame interval on the first update. Use
-                # one calibrated reference interval instead of the tiny setup
-                # interval, which would otherwise weaken the first turn.
-                dt = 1.0 / max(1e-6, args.normal_control_reference_fps)
-            else:
-                dt = max(1e-6, wall_now - last_frame_at)
+            dt = max(1e-6, wall_now - last_frame_at)
             fps = 0.9 * fps + 0.1 * (1.0 / dt) if fps else 1.0 / dt
             last_frame_at = wall_now
 
@@ -249,17 +243,7 @@ def run(args: argparse.Namespace) -> int:
                 # curve state, and last actuator command are already continuous.
                 obstacle_command = obstacle_follower.plan(lane)
                 if normal_control:
-                    normal_time_scale = max(
-                        args.normal_control_time_scale_min,
-                        min(
-                            args.normal_control_time_scale_max,
-                            dt * args.normal_control_reference_fps,
-                        ),
-                    )
-                    planned_command = normal_follower.plan(
-                        lane,
-                        time_scale=normal_time_scale,
-                    )
+                    planned_command = normal_follower.plan(lane)
                 else:
                     normal_follower.reset()
                     planned_command = obstacle_command
@@ -615,13 +599,6 @@ def log_effective_config(
         follower_config.path_far_weight,
         follower_config.path_steering_release_alpha,
         corridor_config.lookahead_y_ratio,
-    )
-    LOG.info(
-        "normal control clock=%.1ffps scale=%.2f..%.2f; "
-        "obstacle control clock=legacy_per_frame",
-        args.normal_control_reference_fps,
-        args.normal_control_time_scale_min,
-        args.normal_control_time_scale_max,
     )
     LOG.info(
         "traffic_light=%s confirm_frames=%d stop_line_y=%.3f contact_min_row_width=%.2f",
@@ -1337,24 +1314,6 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         type=float,
         default=-1.0,
         help="ordinary-driving far-path weight; negative reuses --path-far-weight. Obstacle control always keeps the shared value",
-    )
-    parser.add_argument(
-        "--normal-control-reference-fps",
-        type=float,
-        default=12.0,
-        help="reference FPS used to time-normalize ordinary-driving filters; obstacle control keeps legacy per-frame timing",
-    )
-    parser.add_argument(
-        "--normal-control-time-scale-min",
-        type=float,
-        default=0.65,
-        help="minimum elapsed-time multiplier for one ordinary-driving update",
-    )
-    parser.add_argument(
-        "--normal-control-time-scale-max",
-        type=float,
-        default=1.50,
-        help="maximum elapsed-time multiplier for one ordinary-driving update",
     )
     parser.add_argument(
         "--path-center-recovery-error-threshold",

@@ -121,18 +121,8 @@ class YoloLaneFollower:
         self._path_state = "straight"
         self._path_heading_lead = 0.0
         self._path_error_integral = 0.0
-        self._time_scale = 1.0
 
-    def plan(
-        self,
-        lane: LaneGeometry,
-        time_scale: float = 1.0,
-    ) -> ControlCommand:
-        # The original controller constants are calibrated per reference frame.
-        # A caller may scale one update by elapsed wall time so EMA, derivative,
-        # integral, and slew behavior remain consistent when inference FPS moves.
-        # The default preserves the legacy frame-based behavior exactly.
-        self._time_scale = self._clip_float(float(time_scale), 0.25, 4.0)
+    def plan(self, lane: LaneGeometry) -> ControlCommand:
         if not lane.found or lane.confidence < self.config.min_confidence:
             return self._hold_last_direction(lane)
 
@@ -364,7 +354,6 @@ class YoloLaneFollower:
                     1.0,
                 ),
             )
-        alpha = self._time_adjusted_alpha(alpha)
         filtered = (
             float(self._last_steering)
             + alpha * (raw_steering - float(self._last_steering))
@@ -948,8 +937,7 @@ class YoloLaneFollower:
             if self._path_error_integral * path_error < 0.0:
                 self._path_error_integral *= 0.5
             self._path_error_integral = self._clip_float(
-                self._path_error_integral
-                + float(path_error) * self._time_scale,
+                self._path_error_integral + float(path_error),
                 -limit,
                 limit,
             )
@@ -959,7 +947,7 @@ class YoloLaneFollower:
                 0.0,
                 1.0,
             )
-            self._path_error_integral *= decay ** self._time_scale
+            self._path_error_integral *= decay
             if abs(self._path_error_integral) < 1e-4:
                 self._path_error_integral = 0.0
         return (
@@ -1136,14 +1124,11 @@ class YoloLaneFollower:
         self._path_heading_lead = 0.0
         self._path_error_integral = 0.0
 
-    def _derivative(
-        self,
-        value: float,
-        previous: Optional[float],
-    ) -> float:
+    @staticmethod
+    def _derivative(value: float, previous: Optional[float]) -> float:
         if previous is None:
             return 0.0
-        return (value - previous) / max(0.25, self._time_scale)
+        return value - previous
 
     def _effective_heading_error(
         self,
@@ -1170,16 +1155,8 @@ class YoloLaneFollower:
             alpha = self.config.curve_strength_alpha
         else:
             alpha = self.config.curve_strength_release_alpha
-        alpha = self._time_adjusted_alpha(alpha)
         self._curve_strength = alpha * value + (1.0 - alpha) * self._curve_strength
         return self._curve_strength
-
-    def _time_adjusted_alpha(self, alpha: float) -> float:
-        """Convert a reference-frame EMA alpha to the current elapsed time."""
-        bounded = self._clip_float(float(alpha), 0.0, 1.0)
-        if bounded <= 0.0 or bounded >= 1.0:
-            return bounded
-        return 1.0 - (1.0 - bounded) ** self._time_scale
 
     def _steering_scale(self, curve_strength: float) -> float:
         low = self.config.straight_steering_scale
@@ -1255,7 +1232,6 @@ class YoloLaneFollower:
             limit = max(limit, recovery_limit)
         if self._is_releasing_steering(steering) and not fast_release:
             limit = min(limit, self.config.steering_release_rate_limit)
-        limit = max(1, int(round(float(limit) * self._time_scale)))
         if delta > limit:
             return self._last_steering + limit
         if delta < -limit:

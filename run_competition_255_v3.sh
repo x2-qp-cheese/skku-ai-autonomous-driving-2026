@@ -31,9 +31,6 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-steering-rise-alpha 0.72 \
   --path-steering-release-alpha 0.28 \
   --normal-path-steering-release-alpha 0.30 \
-  --normal-control-reference-fps 12.0 \
-  --normal-control-time-scale-min 0.65 \
-  --normal-control-time-scale-max 1.50 \
   --path-center-recovery-error-threshold 0.07 \
   --path-center-recovery-heading-limit 0.12 \
   --path-center-recovery-min-steering 80 \
