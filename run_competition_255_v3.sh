@@ -27,10 +27,10 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-derivative-gain 18 \
   --path-near-weight 1.60 \
   --path-far-weight 0.55 \
-  --normal-path-far-weight 0.55 \
+  --normal-path-far-weight 0.575 \
   --path-steering-rise-alpha 0.72 \
   --path-steering-release-alpha 0.28 \
-  --normal-path-steering-release-alpha 0.28 \
+  --normal-path-steering-release-alpha 0.30 \
   --path-center-recovery-error-threshold 0.07 \
   --path-center-recovery-heading-limit 0.12 \
   --path-center-recovery-min-steering 80 \
