@@ -27,6 +27,21 @@ def slanted_line_mask(x_at_target: float, slope: float, shape=(100, 200)) -> np.
     return mask
 
 
+def cubic_s_mask(
+    center_x: float,
+    amplitude: float = 28.0,
+    shape=(100, 200),
+) -> np.ndarray:
+    mask = np.zeros(shape, dtype=np.uint8)
+    half_h = max(1.0, 0.5 * float(shape[0]))
+    for y in range(shape[0]):
+        u = (float(y) - half_h) / half_h
+        x = int(round(center_x + amplitude * (u ** 3 - 0.55 * u)))
+        if 0 <= x < shape[1] - 3:
+            mask[y, x : x + 4] = 255
+    return mask
+
+
 def crosswalk_mask(shape=(100, 200)) -> np.ndarray:
     mask = np.zeros(shape, dtype=np.uint8)
     mask[40:60, :] = 255
@@ -518,7 +533,7 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
         self.assertAlmostEqual(lane.center_x, 86.5, delta=0.2)
         self.assertLess(lane.center_x, 111.5)
 
-    def test_trusted_two_boundary_curve_bypasses_scalar_center_jump(self):
+    def test_high_confidence_two_boundary_curve_still_requires_confirmation(self):
         estimator = BevCorridorLaneEstimator(
             BevCorridorConfig(
                 lane_width_px=60.0,
@@ -542,7 +557,7 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
             )
         )
 
-        curved = estimator.estimate(
+        pending = estimator.estimate(
             BevClassMasks(
                 center=[line_mask(90)],
                 side=[line_mask(150)],
@@ -551,9 +566,127 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
                 shape=(100, 200),
             )
         )
+        curved = estimator.estimate(
+            BevClassMasks(
+                center=[line_mask(91)],
+                side=[line_mask(151)],
+                center_conf=1.0,
+                side_conf=1.0,
+                shape=(100, 200),
+            )
+        )
 
+        self.assertTrue(pending.reason.startswith("coast:center_jump"))
         self.assertEqual(curved.reason, "corridor_tier1")
         self.assertNotIn("center_jump", curved.reason)
+
+    def test_right_boundary_selection_preserves_previous_physical_identity(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lane_width_px=60.0,
+                min_lane_width_px=40.0,
+                max_lane_width_px=120.0,
+                center_smooth_alpha=1.0,
+                heading_smooth_alpha=1.0,
+                path_smooth_alpha=1.0,
+                vehicle_center_x_offset_ratio=0.0,
+            )
+        )
+        before = estimator.estimate(
+            BevClassMasks(
+                center=[line_mask(50)],
+                side=[line_mask(110)],
+                center_conf=1.0,
+                side_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+        after = estimator.estimate(
+            BevClassMasks(
+                center=[line_mask(50)],
+                # The nearest-at-one-row rule picked 82 and pulled the control
+                # path inward. Full-curve/width continuity must keep 111.
+                side=[line_mask(82), line_mask(111)],
+                center_conf=1.0,
+                side_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+
+        self.assertEqual(after.reason, "corridor_tier1")
+        self.assertAlmostEqual(after.center_x, before.center_x, delta=1.0)
+
+    def test_center_anchor_uses_right_boundary_only_as_scalar_width(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lane_width_px=70.0,
+                min_lane_width_px=40.0,
+                max_lane_width_px=120.0,
+                center_anchor=True,
+                center_smooth_alpha=1.0,
+                heading_smooth_alpha=1.0,
+                path_smooth_alpha=1.0,
+                vehicle_center_x_offset_ratio=0.0,
+            )
+        )
+        lane = estimator.estimate(
+            BevClassMasks(
+                center=[line_mask(50)],
+                side=[cubic_s_mask(120.0, amplitude=18.0)],
+                center_conf=1.0,
+                side_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+        xs = np.asarray([x for x, _ in lane.path_points])
+
+        self.assertEqual(lane.reason, "corridor_tier1")
+        self.assertLess(float(xs.max() - xs.min()), 1.0)
+
+    def test_cubic_fit_preserves_one_s_curve_inflection(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                poly_degree=3,
+                lane_width_px=60.0,
+                center_smooth_alpha=1.0,
+                heading_smooth_alpha=1.0,
+                path_smooth_alpha=1.0,
+                vehicle_center_x_offset_ratio=0.0,
+            )
+        )
+        fit = estimator._fit_line(
+            [cubic_s_mask(80.0, amplitude=32.0)],
+            (100, 200),
+        )
+
+        self.assertIsNotNone(fit)
+        derivative = np.polyder(fit["fit"])
+        far_slope = float(np.polyval(derivative, 20.0))
+        middle_slope = float(np.polyval(derivative, 50.0))
+        near_slope = float(np.polyval(derivative, 80.0))
+        self.assertGreater(far_slope, 0.0)
+        self.assertLess(middle_slope, 0.0)
+        self.assertGreater(near_slope, 0.0)
+
+    def test_tier1_confidence_includes_both_boundary_detections(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lane_width_px=60.0,
+                center_smooth_alpha=1.0,
+                vehicle_center_x_offset_ratio=0.0,
+            )
+        )
+        lane = estimator.estimate(
+            BevClassMasks(
+                center=[line_mask(50)],
+                side=[line_mask(110)],
+                center_conf=0.99,
+                side_conf=0.55,
+                shape=(100, 200),
+            )
+        )
+
+        self.assertLessEqual(lane.confidence, 0.55)
 
     def test_virtual_hold_preserves_last_curve_direction(self):
         estimator = BevCorridorLaneEstimator(

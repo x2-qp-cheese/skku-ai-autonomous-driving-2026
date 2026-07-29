@@ -53,12 +53,14 @@ class BevCorridorConfig:
     sample_bottom_y_ratio: float = 0.98
     num_samples: int = 24
     band_height_ratio: float = 0.02
-    # Quadratic. An S-curve (inflection) never appears whole in this low camera's
-    # BEV window -- only single left/right curves do -- so degree 2 is enough and
-    # is more rigid/stable on sparse dashed lines than a cubic. (Raise with
-    # --poly-degree only if a real S ever fits in one BEV frame.)
-    poly_degree: int = 2
+    # A cubic is the lowest-order curve that can represent the one inflection
+    # visible during the competition track's S transition. Robust row tracing
+    # and residual filtering below keep sparse dashed-line outliers from making
+    # the extra degree oscillate.
+    poly_degree: int = 3
     min_line_area_ratio: float = 0.0003
+    fit_outlier_sigma: float = 3.5
+    fit_min_outlier_px: float = 3.0
 
     # The camera is mounted slightly left of the car's true centerline, but the
     # full-speed S-curve runs showed x=0.585 over-biases the reference and makes
@@ -177,9 +179,9 @@ class BevCorridorConfig:
     jump_confirm_frames: int = 2
     jump_confirm_path_delta_px: float = 34.0
     jump_confirm_heading_delta: float = 0.20
-    # Tier 1 contains both physical lane boundaries. At high confidence it is a
-    # stronger observation than a stale temporal cache, especially when a fast
-    # curve legitimately moves the path farther than the scalar jump gate.
+    # Kept for CLI/config compatibility. Detection confidence alone never
+    # bypasses the geometric jump gate: it says that YOLO recognized a class,
+    # not that the fitted boundary kept the same physical identity.
     trusted_tier1_min_confidence: float = 0.80
     max_coast_frames: int = 10
     coast_confidence_decay: float = 0.8
@@ -438,7 +440,18 @@ class BevCorridorLaneEstimator:
             if self._crosswalk_active:
                 self.last_lane_width_px = self.config.crosswalk_lane_width_px
 
-        center_fit = self._fit_line(bev.center, bev.shape)
+        previous_center = (
+            self._last_overlays[1]
+            if len(self._last_overlays) >= 2
+            else []
+        )
+        center_seed_x = vehicle_center_x - 0.5 * self._corridor_lane_width()
+        center_fit = self._fit_line(
+            bev.center,
+            bev.shape,
+            reference_points=previous_center,
+            seed_x=center_seed_x,
+        )
         side_fits = [f for f in (self._fit_line([m], bev.shape) for m in bev.side) if f]
 
         resolved = self._resolve(center_fit, side_fits, bev, vehicle_center_x, target_y)
@@ -473,21 +486,18 @@ class BevCorridorLaneEstimator:
             and tier in (1, 2)
             and float(det_conf) >= 0.45
         )
-        trusted_tier1_measurement = (
-            tier == 1
-            and float(det_conf)
-            >= float(self.config.trusted_tier1_min_confidence)
-        )
-        trusted_measurement = (
-            trusted_recovery_measurement
-            or trusted_tier1_measurement
-        )
+        # Never use class confidence to waive path continuity. In the failure
+        # videos center confidence stayed at 0.95+ while the selected side-line
+        # instance and the resulting S-curve path changed identity.
+        trusted_measurement = trusted_recovery_measurement
         jump_reason: Optional[str] = None
         if not trusted_measurement:
             if self._is_center_jump(raw_center_x):
                 jump_reason = "center_jump"
             elif self._is_heading_jump(raw_heading):
                 jump_reason = "heading_jump"
+            elif self._is_path_jump(current_path):
+                jump_reason = "path_jump"
         if jump_reason is not None:
             if not self._confirm_consistent_jump(current_path, raw_heading):
                 held = self._hold_crosswalk_lane_if_available(jump_reason)
@@ -548,7 +558,17 @@ class BevCorridorLaneEstimator:
         # Confidence is driven by the YOLO detection confidence of the class the
         # corridor was built from, scaled by tier reliability and row coverage --
         # not by corridor width.
-        confidence = self._clip(det_conf * tier_base * (0.5 + 0.5 * row_coverage), 0.0, 1.0)
+        residual = max(0.0, float(centerline_fit.get("residual", 0.0)))
+        residual_scale = max(1.0, 0.04 * float(width))
+        residual_quality = 1.0 / (1.0 + residual / residual_scale)
+        confidence = self._clip(
+            det_conf
+            * tier_base
+            * (0.5 + 0.5 * row_coverage)
+            * residual_quality,
+            0.0,
+            1.0,
+        )
 
         lane = LaneGeometry(
             found=True,
@@ -602,7 +622,11 @@ class BevCorridorLaneEstimator:
         # Tier 1: center line + a real right-side line.
         if center_fit is not None and side_fits:
             center_x = self._x_at(center_fit, target_y)
-            right = self._select_right_side(side_fits, center_x, target_y)
+            right = self._select_right_side(
+                side_fits,
+                center_fit,
+                target_y,
+            )
             if right is not None:
                 if self._crosswalk_active:
                     # Through a crosswalk: trust the center line but build the
@@ -612,20 +636,36 @@ class BevCorridorLaneEstimator:
                     right_boundary = self._offset(center_fit, width_px)
                     name = "crosswalk-virtual-center"
                 else:
-                    width_px = self._update_width(self._x_at(right, target_y) - center_x)
+                    measured_width = self._measured_lane_width(
+                        center_fit,
+                        right,
+                    )
+                    width_px = self._update_width(measured_width)
                     # centerline = center line offset by half the smoothed width;
-                    # the real side line only refines the width (via _update_width)
-                    # so its jitter does not reach the centerline. Overlay still
-                    # shows the real detected side.
+                    # the real side line only supplies one robust scalar width.
+                    # Never splice the detected curve point-by-point into the
+                    # control boundary: a side-instance switch in an S would
+                    # otherwise bend the path even with a perfect center mask.
+                    effective_width = min(
+                        max(float(self.config.side_min_gap_px), measured_width),
+                        width_px,
+                    )
                     right_boundary = (
-                        self._bounded_right_boundary(center_fit, right, width_px)
+                        self._offset(center_fit, effective_width)
                         if self.config.center_anchor
                         else right
                     )
                     name = "center+right-side"
                 midline = self._midline(center_fit, right_boundary)
                 if midline is not None:
-                    return midline, center_fit, right_boundary, 1, name, bev.center_conf
+                    return (
+                        midline,
+                        center_fit,
+                        right_boundary,
+                        1,
+                        name,
+                        min(float(bev.center_conf), float(bev.side_conf)),
+                    )
 
         # Tier 2: center line only -> virtual parallel right boundary.
         if center_fit is not None:
@@ -670,18 +710,118 @@ class BevCorridorLaneEstimator:
 
         return None
 
-    def _select_right_side(self, side_fits: List[dict], center_x: float, target_y: float) -> Optional[dict]:
+    def _select_right_side(
+        self,
+        side_fits: List[dict],
+        center_fit: dict,
+        target_y: float,
+    ) -> Optional[dict]:
+        """Select one physical right boundary by full-curve association.
+
+        The old selector compared only one x value at target_y. On an S-curve,
+        two correctly segmented side-line instances can swap their one-row
+        ordering, which teleports the chosen boundary. Score the whole common
+        span against the expected lane width and the previously accepted right
+        boundary instead.
+        """
+        import numpy as np
+
+        previous_right = (
+            self._last_overlays[2]
+            if len(self._last_overlays) >= 3
+            else []
+        )
+        previous_ys = np.asarray(
+            [float(y) for _, y in previous_right],
+            dtype=float,
+        )
+        previous_xs = np.asarray(
+            [float(x) for x, _ in previous_right],
+            dtype=float,
+        )
+        expected_width = max(
+            float(self.config.side_min_gap_px),
+            float(self._corridor_lane_width()),
+        )
         candidates = []
         for fit in side_fits:
-            side_x = self._x_at(fit, target_y)
-            gap = side_x - center_x
-            if gap < self.config.side_min_gap_px:
+            y0 = max(float(center_fit["min_y"]), float(fit["min_y"]))
+            y1 = min(float(center_fit["max_y"]), float(fit["max_y"]))
+            if y1 - y0 < 1.0:
                 continue
-            candidates.append((gap, fit))
+            ys = np.linspace(y0, y1, max(6, int(self.config.num_samples)))
+            center_xs = np.polyval(center_fit["fit"], ys)
+            side_xs = np.polyval(fit["fit"], ys)
+            gaps = side_xs - center_xs
+            valid = gaps >= float(self.config.side_min_gap_px)
+            if float(np.mean(valid)) < 0.70:
+                continue
+            valid_gaps = gaps[valid]
+            measured_width = float(np.median(valid_gaps))
+            minimum_physical_width = max(
+                float(self.config.side_min_gap_px),
+                0.75 * float(self.config.min_lane_width_px),
+            )
+            if measured_width < minimum_physical_width:
+                continue
+            width_spread = float(
+                np.percentile(valid_gaps, 90)
+                - np.percentile(valid_gaps, 10)
+            )
+            width_cost = abs(measured_width - expected_width)
+            target_gap = self._x_at(fit, target_y) - self._x_at(
+                center_fit,
+                target_y,
+            )
+            target_cost = abs(target_gap - expected_width)
+
+            continuity_cost = 0.0
+            if previous_ys.size >= 2:
+                common = (
+                    (ys >= float(previous_ys.min()))
+                    & (ys <= float(previous_ys.max()))
+                )
+                if np.any(common):
+                    previous_at_y = np.interp(
+                        ys[common],
+                        previous_ys,
+                        previous_xs,
+                    )
+                    continuity_cost = float(
+                        np.median(
+                            np.abs(side_xs[common] - previous_at_y)
+                        )
+                    )
+
+            # Continuity owns identity; width and shape break close ties.
+            score = (
+                continuity_cost
+                + 0.35 * width_cost
+                + 0.20 * target_cost
+                + 0.20 * width_spread
+            )
+            candidates.append((score, width_cost, fit))
         if not candidates:
             return None
-        # Nearest line to the right of the center line = the boundary of our lane.
-        return min(candidates, key=lambda item: item[0])[1]
+        return min(candidates, key=lambda item: (item[0], item[1]))[2]
+
+    def _measured_lane_width(self, center_fit: dict, right_fit: dict) -> float:
+        """Robust physical gap over the complete common visible span."""
+        import numpy as np
+
+        y0 = max(float(center_fit["min_y"]), float(right_fit["min_y"]))
+        y1 = min(float(center_fit["max_y"]), float(right_fit["max_y"]))
+        if y1 - y0 < 1.0:
+            return self._x_at(right_fit, y0) - self._x_at(center_fit, y0)
+        ys = np.linspace(y0, y1, max(6, int(self.config.num_samples)))
+        gaps = (
+            np.polyval(right_fit["fit"], ys)
+            - np.polyval(center_fit["fit"], ys)
+        )
+        valid = gaps >= float(self.config.side_min_gap_px)
+        if not np.any(valid):
+            return self._corridor_lane_width()
+        return float(np.median(gaps[valid]))
 
     def _select_crosswalk_right_side(
         self,
@@ -723,7 +863,14 @@ class BevCorridorLaneEstimator:
     # ------------------------------------------------------------------
     # line fitting / geometry
     # ------------------------------------------------------------------
-    def _fit_line(self, masks: List[Any], bev_shape: Tuple[int, int], apply_span_filter: bool = True) -> Optional[dict]:
+    def _fit_line(
+        self,
+        masks: List[Any],
+        bev_shape: Tuple[int, int],
+        apply_span_filter: bool = True,
+        reference_points: Optional[List[Tuple[float, float]]] = None,
+        seed_x: Optional[float] = None,
+    ) -> Optional[dict]:
         import numpy as np
 
         if not masks:
@@ -749,27 +896,122 @@ class BevCorridorLaneEstimator:
         sample_ys = np.linspace(top, bottom, self.config.num_samples).astype(int)
         max_span = width * self.config.max_line_span_ratio if apply_span_filter else None
 
-        xs: List[float] = []
-        ys: List[float] = []
+        reference_points = reference_points or []
+        reference_ys = np.asarray(
+            [float(y) for _, y in reference_points],
+            dtype=float,
+        )
+        reference_xs = np.asarray(
+            [float(x) for x, _ in reference_points],
+            dtype=float,
+        )
+        rows: List[Tuple[float, List[float]]] = []
         for y in sample_ys:
             y0 = max(0, y - band_half)
             y1 = min(height, y + band_half + 1)
             columns = np.where(binary[y0:y1, :].any(axis=0))[0]
             if len(columns) == 0:
                 continue
-            # A crosswalk stripe / white blob spans much wider than a lane line;
-            # drop those rows so they can't skew the line fit.
-            if max_span is not None and (columns[-1] - columns[0]) > max_span:
+            split_at = np.where(np.diff(columns) > 1)[0] + 1
+            runs = np.split(columns, split_at)
+            midpoints = [
+                float((run[0] + run[-1]) / 2.0)
+                for run in runs
+                if len(run) > 0
+                and (
+                    max_span is None
+                    or float(run[-1] - run[0]) <= max_span
+                )
+            ]
+            if not midpoints:
                 continue
-            # Midpoint of the (thin) line's span at this row.
-            xs.append(float((columns[0] + columns[-1]) / 2.0))
-            ys.append(float(y))
+            rows.append((float(y), midpoints))
+        if len(rows) < 2:
+            return None
+
+        # Trace one continuous physical line from the near field upward. When
+        # more than one correctly segmented line occupies a row, do not average
+        # the outermost pixels into a point that lies on no line at all.
+        selected: List[Tuple[float, float]] = []
+        for y, midpoints in reversed(rows):
+            reference_x: Optional[float] = None
+            if reference_ys.size >= 2 and (
+                float(reference_ys.min()) <= y <= float(reference_ys.max())
+            ):
+                reference_x = float(
+                    np.interp(y, reference_ys, reference_xs)
+                )
+
+            predicted_x: Optional[float] = None
+            if selected:
+                predicted_x = selected[-1][0]
+                if len(selected) >= 2:
+                    x1, y1 = selected[-1]
+                    x0, y0 = selected[-2]
+                    if abs(y1 - y0) > 1e-6:
+                        predicted_x = x1 + (x1 - x0) * (
+                            (y - y1) / (y1 - y0)
+                        )
+            elif seed_x is not None:
+                predicted_x = float(seed_x)
+
+            def point_cost(x: float) -> float:
+                cost = 0.0
+                if reference_x is not None:
+                    cost += abs(float(x) - reference_x)
+                if predicted_x is not None:
+                    weight = 0.35 if reference_x is not None else 1.0
+                    cost += weight * abs(float(x) - predicted_x)
+                return cost
+
+            chosen = min(midpoints, key=point_cost)
+            selected.append((float(chosen), y))
+
+        selected.reverse()
+        xs = [x for x, _ in selected]
+        ys = [y for _, y in selected]
         if len(xs) < 2:
             return None
 
         degree = min(self.config.poly_degree, len(xs) - 1)
-        fit = np.polyfit(np.array(ys), np.array(xs), degree)
-        return {"fit": fit, "min_y": min(ys), "max_y": max(ys), "n": len(xs)}
+        ys_array = np.asarray(ys, dtype=float)
+        xs_array = np.asarray(xs, dtype=float)
+        fit = np.polyfit(ys_array, xs_array, degree)
+
+        # A correctly traced dashed line is smooth. Refit without isolated row
+        # outliers so one segmented blob cannot rotate an otherwise valid cubic.
+        for _ in range(2):
+            residuals = np.abs(xs_array - np.polyval(fit, ys_array))
+            median = float(np.median(residuals))
+            mad = float(np.median(np.abs(residuals - median)))
+            robust_sigma = 1.4826 * mad
+            threshold = max(
+                float(self.config.fit_min_outlier_px),
+                float(self.config.fit_outlier_sigma) * robust_sigma,
+            )
+            inliers = residuals <= threshold
+            if int(np.count_nonzero(inliers)) < degree + 1:
+                break
+            if bool(np.all(inliers)):
+                break
+            ys_array = ys_array[inliers]
+            xs_array = xs_array[inliers]
+            fit = np.polyfit(ys_array, xs_array, degree)
+
+        residual = float(
+            np.sqrt(
+                np.mean(
+                    (xs_array - np.polyval(fit, ys_array)) ** 2
+                )
+            )
+        )
+        return {
+            "fit": fit,
+            "min_y": float(np.min(ys_array)),
+            "max_y": float(np.max(ys_array)),
+            "n": len(xs),
+            "residual": residual,
+        }
 
     def _midline(self, a: dict, b: dict) -> Optional[dict]:
         import numpy as np
@@ -786,34 +1028,16 @@ class BevCorridorLaneEstimator:
         degree = min(self.config.poly_degree, len(ys) - 1)
         fit = np.polyfit(ys, xc, degree)
         points = [(float(x), float(y)) for x, y in zip(xc, ys)]
-        return {"fit": fit, "min_y": float(y0), "max_y": float(y1), "n": len(ys), "points": points}
-
-    def _bounded_right_boundary(self, center_fit: dict, right_fit: dict, width_px: float) -> dict:
-        import numpy as np
-
-        y0 = max(center_fit["min_y"], right_fit["min_y"])
-        y1 = min(center_fit["max_y"], right_fit["max_y"])
-        if y1 - y0 < 1.0:
-            return self._offset(center_fit, width_px)
-
-        ys = np.linspace(y0, y1, self.config.num_samples)
-        center_x = np.polyval(center_fit["fit"], ys)
-        virtual_right_x = center_x + max(0.0, float(width_px))
-        detected_right_x = np.polyval(right_fit["fit"], ys)
-        min_right_x = center_x + max(1.0, float(self.config.side_min_gap_px))
-        bounded_x = np.maximum(
-            min_right_x,
-            np.minimum(virtual_right_x, detected_right_x),
-        )
-        degree = min(self.config.poly_degree, len(ys) - 1)
-        fit = np.polyfit(ys, bounded_x, degree)
-        points = [(float(x), float(y)) for x, y in zip(bounded_x, ys)]
         return {
             "fit": fit,
             "min_y": float(y0),
             "max_y": float(y1),
             "n": len(ys),
             "points": points,
+            "residual": max(
+                float(a.get("residual", 0.0)),
+                float(b.get("residual", 0.0)),
+            ),
         }
 
     def _line_points(self, fit_info: Optional[dict], num: int = 20) -> List[Tuple[float, float]]:
@@ -830,7 +1054,13 @@ class BevCorridorLaneEstimator:
 
         fit = np.array(fit_info["fit"], dtype=float).copy()
         fit[-1] += dx  # horizontal shift of x = f(y)
-        return {"fit": fit, "min_y": fit_info["min_y"], "max_y": fit_info["max_y"], "n": fit_info.get("n", 0)}
+        return {
+            "fit": fit,
+            "min_y": fit_info["min_y"],
+            "max_y": fit_info["max_y"],
+            "n": fit_info.get("n", 0),
+            "residual": float(fit_info.get("residual", 0.0)),
+        }
 
     def _heading_error(self, fit: Any, height: int) -> float:
         import numpy as np
@@ -910,6 +1140,39 @@ class BevCorridorLaneEstimator:
             > max(0.0, float(max_jump))
         )
 
+    def _is_path_jump(
+        self,
+        path: List[Tuple[float, float]],
+    ) -> bool:
+        """Catch a control-segment branch switch missed by scalar gates.
+
+        Anchors above lookahead are debug-only preview. At full speed they move
+        quickly in vehicle coordinates and must not block a valid curve merely
+        because the unused horizon changed.
+        """
+        previous = (
+            self._last_overlays[0]
+            if self._last_overlays
+            else []
+        )
+        if not previous or len(previous) != len(path):
+            return False
+        limit = max(0.0, float(self.config.max_center_jump_px))
+        max_y = max(float(y) for _, y in path)
+        height = max_y / max(
+            1e-6,
+            float(self.config.sample_bottom_y_ratio),
+        )
+        target_y = height * float(self.config.lookahead_y_ratio)
+        for (x, y), (previous_x, previous_y) in zip(path, previous):
+            if float(y) < target_y:
+                continue
+            if abs(float(y) - float(previous_y)) > 1.0:
+                return True
+            if abs(float(x) - float(previous_x)) > limit:
+                return True
+        return False
+
     def _confirm_consistent_jump(
         self,
         path: List[Tuple[float, float]],
@@ -964,10 +1227,18 @@ class BevCorridorLaneEstimator:
         )
         if abs(float(heading) - self._pending_jump_heading) > max_heading_delta:
             return False
+        max_y = max(float(y) for _, y in path)
+        height = max_y / max(
+            1e-6,
+            float(self.config.sample_bottom_y_ratio),
+        )
+        target_y = height * float(self.config.lookahead_y_ratio)
         for (x, y), (previous_x, previous_y) in zip(
             path,
             self._pending_jump_path,
         ):
+            if float(y) < target_y:
+                continue
             if abs(float(y) - float(previous_y)) > 1.0:
                 return False
             if abs(float(x) - float(previous_x)) > max_path_delta:
