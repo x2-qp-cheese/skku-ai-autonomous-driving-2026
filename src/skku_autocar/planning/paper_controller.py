@@ -45,13 +45,19 @@ class PaperParkingDebug:
 class PaperParkingController:
     """Figure-9 controller with scan-confirmed paper measurements."""
 
-    def __init__(self, config: PaperControllerConfig):
+    def __init__(
+        self,
+        config: PaperControllerConfig,
+        steering_plus: bool = False,
+    ):
         self.config = config
+        self._steering_plus = steering_plus
         self.state = ParkingState.IDLE
         self.debug = PaperParkingDebug()
         self.control_pair = TangentPair()
         self._detected_vehicle_count = 0
         self._recovery_started_at = 0.0
+        self._recovery_steering = 0
         self._reverse_motion_started = False
         self._last_lidar_timestamp: Optional[float] = None
         self._is_new_scan = False
@@ -760,6 +766,7 @@ class PaperParkingController:
                 self._now,
                 bias_cd,
                 "paper_cd_bias_exceeds_threshold_forward_3s",
+                directional=self._steering_plus,
             )
         balance = bias_cd / max(1.0, dist_c + dist_d)
         balance_error = (
@@ -1363,10 +1370,24 @@ class PaperParkingController:
         now: float,
         bias_cd: Optional[float],
         reason: str,
+        *,
+        directional: bool = False,
     ) -> ControlCommand:
         self.state = ParkingState.RECOVERY_FORWARD
         self._reverse_motion_started = False
         self._recovery_started_at = now
+        self._recovery_steering = 0
+        if directional and bias_cd is not None:
+            paper_steering = (
+                self.config.parallel_forward_max_steering
+                if bias_cd < 0.0
+                else -self.config.parallel_forward_max_steering
+            )
+            self._recovery_steering = (
+                self._paper_to_actuator_around_neutral(
+                    paper_steering
+                )
+            )
         self.debug = PaperParkingDebug(
             state=self.state,
             detected_vehicle_count=self._detected_vehicle_count,
@@ -1380,7 +1401,7 @@ class PaperParkingController:
         )
         return self._drive(
             self.config.forward_speed,
-            0,
+            self._recovery_steering,
             "paper_recovery_forward_3_seconds",
             keep_debug=True,
         )
@@ -1394,7 +1415,7 @@ class PaperParkingController:
         if elapsed < self.config.recovery_forward_s:
             return self._drive(
                 self.config.forward_speed,
-                0,
+                self._recovery_steering,
                 "paper_recovery_forward:%.2f/%.2fs"
                 % (elapsed, self.config.recovery_forward_s),
             )

@@ -8,19 +8,26 @@ from skku_autocar.perception.rear_lidar import (
     TangentPair,
 )
 from skku_autocar.planning.paper_controller import PaperParkingController
+from skku_autocar.runtime.parking_app import build_parser
 from skku_autocar.sensors.lidar import LidarPoint, LidarScan
 from skku_autocar.types import ParkingState
 
 
 class PaperParkingFlowTest(unittest.TestCase):
-    def make_controller(self) -> PaperParkingController:
+    def make_controller(
+        self,
+        steering_plus: bool = False,
+    ) -> PaperParkingController:
         config = replace(
             PaperControllerConfig(),
             actuator_steering_offset=-28,
             dist_bias_cd_threshold_mm=220.0,
             recovery_forward_s=3.0,
         )
-        controller = PaperParkingController(config)
+        controller = PaperParkingController(
+            config,
+            steering_plus=steering_plus,
+        )
         controller.state = ParkingState.CENTER_CHECK
         return controller
 
@@ -58,6 +65,73 @@ class PaperParkingFlowTest(unittest.TestCase):
         self.assertEqual(
             (command.speed, command.steering),
             (controller.config.forward_speed, -28),
+        )
+
+    def test_steering_plus_uses_cd_bias_direction(self):
+        disabled = self.make_controller()
+        for timestamp in range(1, 5):
+            straight = disabled.update(
+                RearLidarObservation(
+                    timestamp=float(timestamp),
+                    valid=True,
+                    dist_c_mm=600.0,
+                    dist_d_mm=900.0,
+                    slot_heading_deg=0.0,
+                ),
+                float(timestamp),
+            )
+        self.assertEqual(straight.steering, -28)
+
+        left_close = self.make_controller(steering_plus=True)
+        for timestamp in range(1, 5):
+            steer_right = left_close.update(
+                RearLidarObservation(
+                    timestamp=float(timestamp),
+                    valid=True,
+                    dist_c_mm=600.0,
+                    dist_d_mm=900.0,
+                    slot_heading_deg=0.0,
+                ),
+                float(timestamp),
+            )
+        self.assertEqual(
+            left_close.state,
+            ParkingState.RECOVERY_FORWARD,
+        )
+        self.assertGreater(steer_right.steering, -28)
+
+        held = left_close.update(
+            RearLidarObservation(timestamp=5.0, valid=True),
+            5.0,
+        )
+        self.assertEqual(held.steering, steer_right.steering)
+
+        right_close = self.make_controller(steering_plus=True)
+        for timestamp in range(1, 5):
+            steer_left = right_close.update(
+                RearLidarObservation(
+                    timestamp=float(timestamp),
+                    valid=True,
+                    dist_c_mm=900.0,
+                    dist_d_mm=600.0,
+                    slot_heading_deg=0.0,
+                ),
+                float(timestamp),
+            )
+        self.assertEqual(
+            right_close.state,
+            ParkingState.RECOVERY_FORWARD,
+        )
+        self.assertLess(steer_left.steering, -28)
+
+    def test_steering_plus_cli_is_opt_in(self):
+        parser = build_parser()
+        self.assertEqual(parser.parse_args([]).steering_plus, "off")
+        self.assertEqual(
+            parser.parse_args(
+                ["--steering_plus", "on"]
+            ).steering_plus,
+            "on",
         )
 
     def test_both_cd_none_starts_paper_recovery(self):

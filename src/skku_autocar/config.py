@@ -71,7 +71,7 @@ class PaperControllerConfig:
     reverse_speed: int = -80
     inside_reverse_speed: int = -50
     parallel_forward_speed: int = 35
-    parallel_forward_max_steering: float = 4.0
+    parallel_forward_max_steering: float = 3.0
     # The paper's 600 mm setup threshold assumes its own lateral spacing.
     # Our prealign_distance_mm is the scaled equivalent.
     prealign_clear_confirm_scans: int = 3

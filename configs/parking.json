@@ -49,7 +49,7 @@
     "reverse_speed": -80,
     "inside_reverse_speed": -50,
     "parallel_forward_speed": 35,
-    "parallel_forward_max_steering": 4.0,
+    "parallel_forward_max_steering": 3.0,
     "prealign_clear_confirm_scans": 3,
     "pair_filter_scans": 3,
     "pair_hold_scans": 3,

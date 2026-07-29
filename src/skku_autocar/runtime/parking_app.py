@@ -451,7 +451,10 @@ def run(args: argparse.Namespace) -> int:
         LOG.info("Arduino: %s", vehicle.port)
 
     perception = RearLidarPerception(config.lidar)
-    controller = PaperParkingController(config.controller)
+    controller = PaperParkingController(
+        config.controller,
+        steering_plus=args.steering_plus == "on",
+    )
     if config.runtime.auto_start or args.auto_start:
         controller.start()
 
@@ -1358,6 +1361,12 @@ def build_parser() -> argparse.ArgumentParser:
             "A/B gap-center bearing that ends left-forward setup "
             "and starts reverse entry"
         ),
+    )
+    parser.add_argument(
+        "--steering_plus",
+        choices=("on", "off"),
+        default="off",
+        help="enable signed C/D recovery steering",
     )
     parser.add_argument("--no-motor", action="store_true")
     parser.add_argument("--auto-start", action="store_true")
