@@ -12,6 +12,7 @@ from skku_autocar.runtime.yolo_drive_app import (
     DrivePriorityController,
     build_bev_corridor_config,
     build_follower_config,
+    build_normal_follower_config,
     parse_args,
 )
 from skku_autocar.types import ControlCommand
@@ -1478,6 +1479,27 @@ class YoloLaneGeometryTest(unittest.TestCase):
         self.assertAlmostEqual(config.path_curve_guard_near_error, 0.07)
         self.assertAlmostEqual(config.path_curve_guard_release_error, 0.21)
         self.assertAlmostEqual(config.path_curve_guard_steering_limit, 108.0)
+
+    def test_normal_path_tuning_does_not_mutate_obstacle_follower_config(self):
+        args = parse_args(
+            [
+                "--path-far-weight",
+                "0.55",
+                "--path-steering-release-alpha",
+                "0.28",
+                "--normal-path-far-weight",
+                "0.65",
+                "--normal-path-steering-release-alpha",
+                "0.36",
+            ]
+        )
+        obstacle = build_follower_config(args)
+        normal = build_normal_follower_config(args, obstacle)
+
+        self.assertAlmostEqual(obstacle.path_far_weight, 0.55)
+        self.assertAlmostEqual(obstacle.path_steering_release_alpha, 0.28)
+        self.assertAlmostEqual(normal.path_far_weight, 0.65)
+        self.assertAlmostEqual(normal.path_steering_release_alpha, 0.36)
 
     def test_crosswalk_cache_defaults_hold_preliminary_run_geometry(self):
         args = parse_args([])

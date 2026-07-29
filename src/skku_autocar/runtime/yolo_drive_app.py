@@ -4,6 +4,7 @@ import argparse
 import logging
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -55,7 +56,12 @@ def run(args: argparse.Namespace) -> int:
     corridor_config = build_bev_corridor_config(args)
     corridor_estimator = BevCorridorLaneEstimator(corridor_config)
     follower_config = build_follower_config(args)
-    follower = YoloLaneFollower(follower_config)
+    obstacle_follower = YoloLaneFollower(follower_config)
+    normal_follower_config = build_normal_follower_config(
+        args,
+        follower_config,
+    )
+    normal_follower = YoloLaneFollower(normal_follower_config)
     command_filter = CommandSafetyFilter(args)
     drive_policy = DrivePriorityController(
         command_filter,
@@ -218,6 +224,11 @@ def run(args: argparse.Namespace) -> int:
                 control_now,
                 running,
             )
+            normal_control = (
+                not obstacle_mode.enabled
+                or obstacle_mode.lane_change_state
+                in ("off", "lane2", "completed")
+            )
             stop_crosswalk_masks = (
                 class_masks.crosswalk
                 if class_masks.crosswalk_conf >= args.light_crosswalk_min_conf
@@ -226,7 +237,18 @@ def run(args: argparse.Namespace) -> int:
             if obstacle_mode.blocks_light_stop:
                 stop_crosswalk_masks = ()
             light_observation = traffic_light.update(frame, light_masks, stop_crosswalk_masks)
-            planned_command = follower.plan(lane) if running else ControlCommand.stop("paused")
+            if running:
+                # Keep the proven obstacle follower warm on every ordinary
+                # frame. If an obstacle transition starts, its path derivative,
+                # curve state, and last actuator command are already continuous.
+                obstacle_command = obstacle_follower.plan(lane)
+                if normal_control:
+                    planned_command = normal_follower.plan(lane)
+                else:
+                    normal_follower.reset()
+                    planned_command = obstacle_command
+            else:
+                planned_command = ControlCommand.stop("paused")
             command = drive_policy.apply(
                 planned_command,
                 mask_result,
@@ -238,7 +260,8 @@ def run(args: argparse.Namespace) -> int:
             # The follower's temporal filter must reflect what the actuator
             # actually receives. Traffic-light braking and mission guards may
             # replace a planned steering value with zero.
-            follower.accept_applied_command(command, running)
+            obstacle_follower.accept_applied_command(command, running)
+            normal_follower.accept_applied_command(command, running)
 
             if vehicle is not None and wall_now - last_command_at >= 1.0 / args.command_rate:
                 serial_lines = vehicle.send(command)
@@ -465,6 +488,28 @@ def build_follower_config(args: argparse.Namespace) -> YoloLaneFollowerConfig:
     )
 
 
+def build_normal_follower_config(
+    args: argparse.Namespace,
+    obstacle_config: YoloLaneFollowerConfig,
+) -> YoloLaneFollowerConfig:
+    """Tune ordinary path tracking without changing obstacle control values."""
+    release_alpha = (
+        obstacle_config.path_steering_release_alpha
+        if args.normal_path_steering_release_alpha < 0.0
+        else args.normal_path_steering_release_alpha
+    )
+    far_weight = (
+        obstacle_config.path_far_weight
+        if args.normal_path_far_weight < 0.0
+        else args.normal_path_far_weight
+    )
+    return replace(
+        obstacle_config,
+        path_steering_release_alpha=release_alpha,
+        path_far_weight=far_weight,
+    )
+
+
 def log_effective_config(
     args: argparse.Namespace,
     corridor_config: BevCorridorConfig,
@@ -544,6 +589,16 @@ def log_effective_config(
         args.virtual_lane_min_reliable_frames,
         args.virtual_lane_bootstrap_speed_cap,
         args.lane_lost_speed_cap,
+    )
+    normal_config = build_normal_follower_config(args, follower_config)
+    LOG.info(
+        "normal path tuning=far_weight %.2f release_alpha %.2f; "
+        "obstacle path preserved=far_weight %.2f release_alpha %.2f lookahead %.2f",
+        normal_config.path_far_weight,
+        normal_config.path_steering_release_alpha,
+        follower_config.path_far_weight,
+        follower_config.path_steering_release_alpha,
+        corridor_config.lookahead_y_ratio,
     )
     LOG.info(
         "traffic_light=%s confirm_frames=%d stop_line_y=%.3f contact_min_row_width=%.2f",
@@ -1247,6 +1302,18 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         "--path-steering-release-alpha",
         type=float,
         default=YoloLaneFollowerConfig.path_steering_release_alpha,
+    )
+    parser.add_argument(
+        "--normal-path-steering-release-alpha",
+        type=float,
+        default=-1.0,
+        help="ordinary-driving steering release EMA; negative reuses --path-steering-release-alpha. Obstacle control always keeps the shared value",
+    )
+    parser.add_argument(
+        "--normal-path-far-weight",
+        type=float,
+        default=-1.0,
+        help="ordinary-driving far-path weight; negative reuses --path-far-weight. Obstacle control always keeps the shared value",
     )
     parser.add_argument(
         "--path-center-recovery-error-threshold",
