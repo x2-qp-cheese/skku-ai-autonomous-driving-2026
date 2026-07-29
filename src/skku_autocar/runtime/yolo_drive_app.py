@@ -1135,7 +1135,7 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         "--corridor-trusted-tier1-confidence",
         type=float,
         default=BevCorridorConfig.trusted_tier1_min_confidence,
-        help=argparse.SUPPRESS,
+        help="[--bev-corridor] accept a two-physical-boundary corridor above this confidence even during a fast curve transition",
     )
     parser.add_argument(
         "--corridor-max-coast-frames",

@@ -385,7 +385,7 @@ def parse_args(argv):
     parser.add_argument("--virtual-hold-recenter", type=float, default=BevCorridorConfig.virtual_hold_recenter_alpha,
                         help="[--corridor] per-frame easing of the held center toward the vehicle axis (0=freeze, 1=snap straight)")
     parser.add_argument("--poly-degree", type=int, default=BevCorridorConfig.poly_degree,
-                        help="[--corridor] polynomial degree for the robust BEV line/centerline fit (default 3 supports one S-curve inflection)")
+                        help="[--corridor] polynomial degree for the BEV line/centerline fit (3 = follows S-curves; 2 = smoother on straights)")
     parser.add_argument("--centerline-bias", type=float, default=BevCorridorConfig.centerline_bias,
                         help="[--corridor] driving line position between boundaries: 0=center line, 0.5=midpoint, 1=outer side line. Raise if the car rides too far inside")
     # Plan D: run the controller offline.
