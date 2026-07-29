@@ -25,7 +25,7 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-lateral-gain 225 \
   --path-heading-gain 65 \
   --path-derivative-gain 18 \
-  --path-near-weight 1.45 \
+  --path-near-weight 1.60 \
   --path-far-weight 0.55 \
   --path-steering-rise-alpha 0.72 \
   --path-steering-release-alpha 0.28 \
