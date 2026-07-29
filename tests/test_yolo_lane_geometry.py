@@ -1491,15 +1491,39 @@ class YoloLaneGeometryTest(unittest.TestCase):
                 "0.65",
                 "--normal-path-steering-release-alpha",
                 "0.36",
+                "--max-steering",
+                "150",
+                "--normal-max-steering",
+                "135",
+                "--path-reversal-alpha",
+                "0.90",
+                "--normal-path-reversal-alpha",
+                "0.82",
+                "--path-reversal-output-min-steering",
+                "70",
+                "--normal-path-reversal-output-min-steering",
+                "60",
             ]
         )
         obstacle = build_follower_config(args)
         normal = build_normal_follower_config(args, obstacle)
 
+        self.assertEqual(obstacle.max_steering, 150)
         self.assertAlmostEqual(obstacle.path_far_weight, 0.55)
         self.assertAlmostEqual(obstacle.path_steering_release_alpha, 0.28)
+        self.assertAlmostEqual(obstacle.path_reversal_alpha, 0.90)
+        self.assertAlmostEqual(
+            obstacle.path_reversal_output_min_steering,
+            70.0,
+        )
+        self.assertEqual(normal.max_steering, 135)
         self.assertAlmostEqual(normal.path_far_weight, 0.65)
         self.assertAlmostEqual(normal.path_steering_release_alpha, 0.36)
+        self.assertAlmostEqual(normal.path_reversal_alpha, 0.82)
+        self.assertAlmostEqual(
+            normal.path_reversal_output_min_steering,
+            60.0,
+        )
 
     def test_crosswalk_cache_defaults_hold_preliminary_run_geometry(self):
         args = parse_args([])
