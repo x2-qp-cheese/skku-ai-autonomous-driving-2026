@@ -392,11 +392,20 @@ class LaneChangeController:
             unreliable_age,
         )
         assist_released = self._transition_timed_out(now)
-        if not lane_reliable or assist_released:
-            # Never force the old transition direction from a cached path. The
-            # bounded lane-follower command may bridge a short dropout. A long
-            # but still reliable transition also falls back to path feedback
-            # instead of holding a directional steering minimum forever.
+        directional_dropout_hold = (
+            not lane_reliable
+            and direction != 0
+            and self._uses_target_arrival(self.state)
+            and unreliable_age
+            < max(0.0, float(self.config.unreliable_hold_seconds))
+        )
+        if assist_released or (
+            not lane_reliable and not directional_dropout_hold
+        ):
+            # During a short avoidance dropout the obstacle has commonly hidden
+            # a lane boundary. Preserve only the already-committed transition
+            # direction; never steer from the rejected geometry itself. Normal
+            # changes and stale dropouts still release directional assistance.
             direction = 0
         return LaneChangeResult(
             lane=shifted,
@@ -555,17 +564,22 @@ class LaneChangeController:
             and self._hold_unreliable_target_active(result.state)
         ):
             adjusted = command
-            if (
+            directional_hold = (
                 (
                     self.config.smooth_avoidance
                     or self._uses_target_arrival(result.state)
                 )
                 and result.direction != 0
-            ):
+            )
+            if directional_hold:
                 adjusted = self._apply_unreliable_directional_steering(
                     adjusted,
                     result,
                 )
+                # A confirmed obstacle lane change must not decay to zero merely
+                # because the obstacle itself briefly occludes the lane mask.
+                # The update stage bounds this hold by unreliable_hold_seconds.
+                return self._cap_unreliable_steering(adjusted)
             adjusted = self._release_unreliable_steering(adjusted, result)
             return self._cap_unreliable_steering(adjusted)
         if self._uses_avoidance_profile(result.state):
@@ -680,6 +694,13 @@ class LaneChangeController:
             cap = min(cap, max(0, int(self.config.steering_cap)))
         minimum = min(max(0, int(self.config.steering_min)), cap) if cap > 0 else 0
         steering = int(command.steering)
+        previous = self._last_output_steering
+        if previous is not None and previous * direction > 0:
+            previous_magnitude = abs(int(previous))
+            if cap > 0:
+                previous_magnitude = min(previous_magnitude, cap)
+            if abs(steering) < previous_magnitude:
+                steering = direction * previous_magnitude
         if steering * direction <= 0 or abs(steering) < minimum:
             steering = direction * minimum
         if cap > 0:

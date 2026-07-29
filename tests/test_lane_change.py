@@ -1282,15 +1282,17 @@ class LaneChangeControllerTest(unittest.TestCase):
         )
         self.assertLess(max_path_slope, 0.50)
 
-    def test_unreliable_transition_releases_steering_then_keeps_speed_255(self):
+    def test_avoidance_dropout_holds_direction_then_keeps_speed_255(self):
         controller = LaneChangeController(
             LaneChangeConfig(
                 mode="external",
                 transition_seconds=0.85,
                 target_lane_width_px=160.0,
                 smooth_avoidance=True,
-                unreliable_hold_seconds=0.25,
-                unreliable_steering_cap=90,
+                steering_min=80,
+                steering_cap=150,
+                unreliable_hold_seconds=0.45,
+                unreliable_steering_cap=120,
             )
         )
         controller.request_avoidance("obstacle")
@@ -1301,6 +1303,10 @@ class LaneChangeControllerTest(unittest.TestCase):
             0.0,
             True,
         )
+        controller.apply_steering_assist(
+            ControlCommand(speed=255, steering=-150, reason="path"),
+            reliable,
+        )
         short_dropout = controller.update(
             replace(lane_with_path(), reason="coast:heading_jump"),
             160.0,
@@ -1310,14 +1316,14 @@ class LaneChangeControllerTest(unittest.TestCase):
             lane_reliable=False,
         )
         released = controller.apply_steering_assist(
-            ControlCommand(speed=255, steering=-100, reason="path"),
+            ControlCommand(speed=255, steering=40, reason="path"),
             short_dropout,
         )
         long_dropout = controller.update(
             replace(lane_with_path(), reason="virtual_hold:heading_jump"),
             160.0,
             800.0,
-            0.26,
+            0.46,
             True,
             lane_reliable=False,
         )
@@ -1329,18 +1335,18 @@ class LaneChangeControllerTest(unittest.TestCase):
             lane_with_path(),
             160.0,
             800.0,
-            0.36,
+            0.56,
             True,
             lane_reliable=True,
         )
 
-        self.assertEqual(short_dropout.direction, 0)
+        self.assertEqual(short_dropout.direction, -1)
         self.assertAlmostEqual(
             short_dropout.lane.center_x,
             reliable.lane.center_x,
         )
         self.assertEqual(released.speed, 255)
-        self.assertEqual(released.steering, -60)
+        self.assertEqual(released.steering, -120)
         self.assertFalse(released.brake)
         self.assertEqual(neutral.speed, 255)
         self.assertEqual(neutral.steering, 0)

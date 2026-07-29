@@ -55,7 +55,7 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-integral-gain 45 \
   --path-integral-limit 0.25 \
   --path-integral-decay 0.65 \
-  --bev-lookahead 0.36 \
+  --bev-lookahead 0.34 \
   --bev-center-smooth 0.32 \
   --bev-heading-smooth 1.0 \
   --bev-path-smooth 0.65 \
@@ -89,7 +89,7 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --obstacle-visual-commit-confidence 0.90 \
   --obstacle-visual-commit-frame-y 0.40 \
   --obstacle-range-visual-fallback on \
-  --obstacle-range-visual-confidence 0.90 \
+  --obstacle-range-visual-confidence 0.82 \
   --lane-change-target-width-px 160 \
   --lane-change-target-capture-error 0.10 \
   --lane-change-steering-override off \
@@ -97,11 +97,11 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --lane-change-steering-boost 25 \
   --lane-change-steering-cap 150 \
   --lane-change-steering-slew-limit 35 \
-  --lane-change-unreliable-steering-cap 90 \
+  --lane-change-unreliable-steering-cap 120 \
   --lane-change-stabilizing-steering-min 0 \
   --lane-change-transition-seconds 0.85 \
   --lane-change-spatial-lead 0.10 \
-  --lane-change-unreliable-hold-seconds 0.25 \
+  --lane-change-unreliable-hold-seconds 0.45 \
   --lane-change-max-transition-seconds 4.0 \
   --lane-change-return-duration-scale 1.35 \
   --lane-change-return-steering-cap 115 \
