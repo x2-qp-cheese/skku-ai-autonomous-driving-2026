@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Final launcher with traffic-light and obstacle missions enabled.
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${PYTHON_BIN:-}" ]]; then
   :
@@ -27,8 +28,7 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-derivative-gain 18 \
   --path-near-weight 1.75 \
   --path-far-weight 0.55 \
-  --normal-path-far-weight 0.575 \
-  --normal-path-right-steering-scale 0.95 \
+  --normal-path-far-weight 0.55 \
   --path-steering-rise-alpha 0.72 \
   --path-steering-release-alpha 0.28 \
   --normal-path-steering-release-alpha 0.30 \
@@ -42,7 +42,7 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-reversal-min-geometry 0.05 \
   --path-reversal-output-min-steering 70 \
   --path-reversal-rate-limit 80 \
-  --path-reversal-near-guard-error 0.015 \
+  --path-reversal-near-guard-error 0.025 \
   --path-reversal-near-full-error 0.08 \
   --path-near-conflict-error-threshold 0.035 \
   --path-near-conflict-release-alpha 0.90 \

@@ -503,16 +503,10 @@ def build_normal_follower_config(
         if args.normal_path_far_weight < 0.0
         else args.normal_path_far_weight
     )
-    right_steering_scale = (
-        obstacle_config.path_right_steering_scale
-        if args.normal_path_right_steering_scale < 0.0
-        else args.normal_path_right_steering_scale
-    )
     return replace(
         obstacle_config,
         path_steering_release_alpha=release_alpha,
         path_far_weight=far_weight,
-        path_right_steering_scale=right_steering_scale,
     )
 
 
@@ -598,14 +592,12 @@ def log_effective_config(
     )
     normal_config = build_normal_follower_config(args, follower_config)
     LOG.info(
-        "normal path tuning=far_weight %.2f release_alpha %.2f right_scale %.2f; "
-        "obstacle path preserved=far_weight %.2f release_alpha %.2f right_scale %.2f lookahead %.2f",
+        "normal path tuning=far_weight %.2f release_alpha %.2f; "
+        "obstacle path preserved=far_weight %.2f release_alpha %.2f lookahead %.2f",
         normal_config.path_far_weight,
         normal_config.path_steering_release_alpha,
-        normal_config.path_right_steering_scale,
         follower_config.path_far_weight,
         follower_config.path_steering_release_alpha,
-        follower_config.path_right_steering_scale,
         corridor_config.lookahead_y_ratio,
     )
     LOG.info(
@@ -1322,12 +1314,6 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         type=float,
         default=-1.0,
         help="ordinary-driving far-path weight; negative reuses --path-far-weight. Obstacle control always keeps the shared value",
-    )
-    parser.add_argument(
-        "--normal-path-right-steering-scale",
-        type=float,
-        default=-1.0,
-        help="ordinary-driving positive/right steering scale; negative reuses the obstacle value (normally 1.0)",
     )
     parser.add_argument(
         "--path-center-recovery-error-threshold",
