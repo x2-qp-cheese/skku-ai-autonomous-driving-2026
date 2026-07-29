@@ -88,7 +88,8 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --obstacle-visual-commit on \
   --obstacle-visual-commit-confidence 0.90 \
   --obstacle-visual-commit-frame-y 0.40 \
-  --obstacle-range-visual-fallback off \
+  --obstacle-range-visual-fallback on \
+  --obstacle-range-visual-confidence 0.90 \
   --lane-change-target-width-px 160 \
   --lane-change-target-capture-error 0.10 \
   --lane-change-steering-override off \
