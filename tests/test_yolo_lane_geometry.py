@@ -523,6 +523,46 @@ class YoloLaneGeometryTest(unittest.TestCase):
         self.assertGreater(guarded, 0.95)
         self.assertEqual(released, 0.0)
 
+    def test_path_reversal_near_guard_survives_small_unwound_command(self):
+        follower = YoloLaneFollower(
+            YoloLaneFollowerConfig(
+                path_tracking=True,
+                path_reversal_min_steering=25.0,
+                path_reversal_min_geometry=0.05,
+                path_reversal_near_guard_error=0.015,
+                path_reversal_near_full_error=0.08,
+            )
+        )
+        follower.accept_applied_command(
+            ControlCommand(speed=255, steering=-20, reason="unwinding_curve")
+        )
+        transition = lane_geometry(
+            lateral_error_norm=0.16,
+            heading_error=0.36,
+            near_lateral_error_norm=-0.08,
+            reason="corridor_tier1",
+        )
+
+        strength = follower._path_reversal_near_guard_strength(
+            transition,
+            near_error=-0.08,
+            raw_steering=50.0,
+        )
+
+        self.assertGreater(strength, 0.99)
+
+        command = follower.plan(
+            lane_geometry(
+                lateral_error_norm=0.23,
+                heading_error=0.43,
+                near_lateral_error_norm=-0.052,
+                reason="corridor_tier1",
+            )
+        )
+
+        self.assertLessEqual(command.steering, 0)
+        self.assertIn("curve_transition", command.reason)
+
     def test_heading_lead_uses_195_only_for_coherent_curve(self):
         follower = YoloLaneFollower(
             YoloLaneFollowerConfig(

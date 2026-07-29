@@ -266,6 +266,14 @@ class YoloLaneFollower:
             raw_steering += reversal_near_guard * (
                 near_steering - raw_steering
             )
+            # A fractional blend can still cross zero while the measured
+            # near-field path remains on the old side (the 115931 S-curve did
+            # so at near=-0.052, producing +18 steering). Preserve the near
+            # sign until the configured zero band is reached.  The magnitude
+            # remains proportional to near_error, so this approaches zero
+            # continuously instead of holding a fixed old steering command.
+            if raw_steering * float(near_error) < 0.0:
+                raw_steering = near_steering
         curve_guard_limit = self._path_curve_guard_limit(
             lane,
             path_error,
@@ -560,8 +568,12 @@ class YoloLaneFollower:
                 for token in ("lane_change", "crosswalk", "coast", "virtual")
             )
             or float(lane.confidence) < 0.75
-            or abs(previous)
-            < max(0.0, float(self.config.path_reversal_min_steering))
+            # Do not drop the near-field veto merely because the old command
+            # has almost unwound to zero.  At full speed that opened a short
+            # window where the far S-curve preview could start the opposite
+            # turn while the car was still displaced toward the outer line.
+            # The guarded near-error band already rejects zero-crossing noise.
+            or abs(previous) < 1.0
             or raw_steering * previous >= 0.0
             or raw_steering * float(near_error) >= 0.0
             or abs(heading) < minimum_geometry

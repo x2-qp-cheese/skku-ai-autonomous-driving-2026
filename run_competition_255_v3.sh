@@ -31,7 +31,7 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-steering-release-alpha 0.28 \
   --path-center-recovery-error-threshold 0.07 \
   --path-center-recovery-heading-limit 0.12 \
-  --path-center-recovery-min-steering 60 \
+  --path-center-recovery-min-steering 80 \
   --path-center-recovery-alpha 0.90 \
   --path-center-recovery-rate-limit 120 \
   --path-reversal-alpha 0.90 \
@@ -39,8 +39,8 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-reversal-min-geometry 0.05 \
   --path-reversal-output-min-steering 70 \
   --path-reversal-rate-limit 80 \
-  --path-reversal-near-guard-error 0.025 \
-  --path-reversal-near-full-error 0.12 \
+  --path-reversal-near-guard-error 0.015 \
+  --path-reversal-near-full-error 0.08 \
   --path-near-conflict-error-threshold 0.035 \
   --path-near-conflict-release-alpha 0.90 \
   --path-near-conflict-heading-limit 0.18 \
@@ -90,7 +90,7 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --obstacle-visual-commit-frame-y 0.40 \
   --obstacle-range-visual-fallback off \
   --lane-change-target-width-px 160 \
-  --lane-change-target-capture-error 0.30 \
+  --lane-change-target-capture-error 0.10 \
   --lane-change-steering-override off \
   --lane-change-steering-min 80 \
   --lane-change-steering-boost 25 \
