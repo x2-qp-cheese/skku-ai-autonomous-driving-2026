@@ -3,8 +3,8 @@
 ## Do not tune
 
 Do not change gains, BEV calibration, lane width, model weights, camera
-resolution, or Arduino firmware at the venue. The validated launcher is
-`run_competition_255_v3.sh`.
+resolution, or Arduino firmware at the venue. The mission launcher is
+`final_obstacle.sh`; the driving-only launcher is `final.sh`.
 
 ## Before placing the car
 
@@ -28,16 +28,13 @@ about 10--15 control frames/s.
 4. For the two-lap time trial, disable mission triggers:
 
    ```bash
-   ./run_competition_255_v3.sh \
-     --serial-port /dev/cu.usbmodem21101 \
-     --traffic-light off \
-     --obstacle-avoidance off
+   ./final.sh --serial-port /dev/cu.usbmodem21101
    ```
 
    For the obstacle plus traffic-light mission, use:
 
    ```bash
-   ./run_competition_255_v3.sh --serial-port /dev/cu.usbmodem21101
+   ./final_obstacle.sh --serial-port /dev/cu.usbmodem21101
    ```
 
 5. Confirm the terminal prints `serial connected`, the correct port,
