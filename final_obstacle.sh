@@ -63,7 +63,7 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --bev-heading-smooth 1.0 \
   --bev-path-smooth 0.65 \
   --bev-path-max-step 55 \
-  --vehicle-center-offset 0.040 \
+  --vehicle-center-offset 0.025 \
   --corridor-centerline-bias 0.525 \
   --corridor-crosswalk-option a \
   --center-lock off \

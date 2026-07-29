@@ -1533,6 +1533,31 @@ class YoloLaneGeometryTest(unittest.TestCase):
         self.assertEqual(right.steering, 20)
         self.assertEqual(left.steering, -40)
 
+    def test_right_steering_scale_keeps_straight_center_recovery_full_strength(self):
+        config = YoloLaneFollowerConfig(
+            path_tracking=True,
+            path_lateral_gain=100.0,
+            path_heading_gain=0.0,
+            path_derivative_gain=0.0,
+            path_heading_lead_gain=0.0,
+            path_integral_gain=0.0,
+            path_center_recovery_error_threshold=1.0,
+            path_steering_rise_alpha=1.0,
+            path_steering_release_alpha=1.0,
+            steering_rate_limit=500,
+            min_steering_rate_limit=500,
+            steering_release_rate_limit=500,
+            max_steering=500,
+            path_right_steering_scale=0.5,
+        )
+
+        straight = YoloLaneFollower(config).plan(
+            lane_geometry(0.05, 0.0, near_lateral_error_norm=0.05)
+        )
+
+        self.assertEqual(straight.steering, 5)
+        self.assertIn(":straight", straight.reason)
+
     def test_crosswalk_cache_defaults_hold_preliminary_run_geometry(self):
         args = parse_args([])
 

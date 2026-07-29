@@ -410,7 +410,20 @@ class YoloLaneFollower:
             -self.config.max_steering,
             self.config.max_steering,
         )
-        if steering > 0:
+        preview_transition = (
+            heading_preview_permission < 1.0
+            and float(lane.heading_error) * float(near_error) < 0.0
+        )
+        path_state = (
+            "curve_transition"
+            if reversal_near_guard > 0.0 or preview_transition
+            else self._classify_path_state(
+                path_error,
+                lane.heading_error,
+                heading_lead,
+            )
+        )
+        if steering > 0 and path_state != "straight":
             right_scale = self._clip_float(
                 float(self.config.path_right_steering_scale),
                 0.0,
@@ -435,19 +448,7 @@ class YoloLaneFollower:
         self._last_heading_error = lane.heading_error
         self._last_path_error = path_error
         self._path_heading_lead = heading_lead
-        preview_transition = (
-            heading_preview_permission < 1.0
-            and float(lane.heading_error) * float(near_error) < 0.0
-        )
-        self._path_state = (
-            "curve_transition"
-            if reversal_near_guard > 0.0 or preview_transition
-            else self._classify_path_state(
-                path_error,
-                lane.heading_error,
-                heading_lead,
-            )
-        )
+        self._path_state = path_state
         command = ControlCommand(
             speed=speed,
             steering=steering,
