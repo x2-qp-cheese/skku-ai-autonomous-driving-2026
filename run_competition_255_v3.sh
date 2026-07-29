@@ -47,7 +47,7 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --path-curve-guard-heading-threshold 0.25 \
   --path-curve-guard-near-error 0.10 \
   --path-curve-guard-release-error 0.24 \
-  --path-curve-guard-steering-limit 105 \
+  --path-curve-guard-steering-limit 115 \
   --path-heading-lead-gain 170 \
   --path-heading-lead-coherent-gain 195 \
   --path-heading-lead-span 0.16 \
@@ -91,7 +91,9 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --obstacle-range-visual-fallback on \
   --obstacle-range-visual-confidence 0.90 \
   --lane-change-target-width-px 160 \
+  --lane-change-target-approach-error 0.10 \
   --lane-change-target-capture-error 0.10 \
+  --lane-change-target-capture-frames 3 \
   --lane-change-steering-override off \
   --lane-change-steering-min 80 \
   --lane-change-steering-boost 25 \
