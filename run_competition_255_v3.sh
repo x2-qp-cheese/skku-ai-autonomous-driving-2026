@@ -123,4 +123,5 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --light-min-color-pixels 300 \
   --light-max-mask-area-ratio 0.06 \
   --obstacle-emergency-stop off \
+  --no-show-mask \
   "$@"

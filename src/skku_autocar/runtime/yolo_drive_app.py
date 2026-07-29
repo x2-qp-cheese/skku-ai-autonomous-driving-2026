@@ -1509,7 +1509,12 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     )
     parser.add_argument("--command-rate", type=float, default=20.0)
     parser.add_argument("--log-interval", type=float, default=0.5)
-    parser.add_argument("--show-mask", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--show-mask",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="open a second BEV mask window; the camera-overlay YOLO Drive window is always shown unless --headless is set",
+    )
     parser.add_argument("--record", choices=("on", "off"), default="on")
     parser.add_argument("--record-dir", default="data/raw/drive_recordings")
     parser.add_argument("--record-fps", type=float, default=30.0)

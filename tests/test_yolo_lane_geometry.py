@@ -1611,6 +1611,7 @@ class YoloLaneGeometryTest(unittest.TestCase):
         bev_config = build_bev_corridor_config(args)
         follower_config = build_follower_config(args)
 
+        self.assertFalse(args.show_mask)
         self.assertEqual(args.fixed_speed_brake_policy, "red-light-only")
         self.assertAlmostEqual(bev_config.lookahead_y_ratio, 0.45)
         self.assertAlmostEqual(bev_config.centerline_bias, 0.46)
@@ -1632,6 +1633,9 @@ class YoloLaneGeometryTest(unittest.TestCase):
         self.assertTrue(follower_config.center_lock_enabled)
         self.assertAlmostEqual(follower_config.center_lock_error_threshold, 0.055)
         self.assertEqual(follower_config.center_lock_min_steering, 75)
+
+    def test_bev_mask_window_can_be_enabled_explicitly(self):
+        self.assertTrue(parse_args(["--show-mask"]).show_mask)
 
     def test_lane_change_cli_defaults_are_external_ready_and_aggressive(self):
         args = parse_args([])
