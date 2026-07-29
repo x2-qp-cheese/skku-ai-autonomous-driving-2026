@@ -72,6 +72,9 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --steering-release-rate-limit 55 \
   --corridor-max-center-jump 65 \
   --corridor-max-heading-jump 0.45 \
+  --corridor-jump-confirm-frames 2 \
+  --corridor-jump-confirm-path-delta 34 \
+  --corridor-jump-confirm-heading-delta 0.20 \
   --corridor-max-coast-frames 7 \
   --obstacle-local-map off \
   --obstacle-trigger-mm 2900 \

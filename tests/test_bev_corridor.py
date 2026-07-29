@@ -236,6 +236,87 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
         self.assertTrue(outlier.reason.startswith("coast:heading_jump"))
         self.assertEqual(estimator.last_class_name, "coast")
 
+    def test_repeated_consistent_heading_jump_is_promoted_without_teleport(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lane_width_px=60.0,
+                center_smooth_alpha=1.0,
+                heading_smooth_alpha=1.0,
+                path_smooth_alpha=0.65,
+                path_max_step_px=10.0,
+                max_center_jump_px=5.0,
+                max_heading_jump=0.08,
+                jump_confirm_frames=2,
+                jump_confirm_path_delta_px=12.0,
+                jump_confirm_heading_delta=0.10,
+                vehicle_center_x_offset_ratio=0.0,
+            )
+        )
+        before = estimator.estimate(bev_at(50, crosswalk=False))
+        pending = estimator.estimate(
+            BevClassMasks(
+                center=[slanted_line_mask(90.0, 0.25)],
+                center_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+        promoted = estimator.estimate(
+            BevClassMasks(
+                center=[slanted_line_mask(92.0, 0.27)],
+                center_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+
+        self.assertTrue(pending.reason.startswith("coast:"))
+        self.assertEqual(pending.path_points, before.path_points)
+        self.assertEqual(promoted.reason, "corridor_tier2")
+        self.assertTrue(
+            all(
+                abs(current[0] - previous[0]) <= 10.0 + 1e-9
+                for previous, current in zip(
+                    before.path_points,
+                    promoted.path_points,
+                )
+            )
+        )
+
+    def test_inconsistent_second_jump_cannot_replace_tracked_path(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lane_width_px=60.0,
+                center_smooth_alpha=1.0,
+                heading_smooth_alpha=1.0,
+                path_smooth_alpha=1.0,
+                max_center_jump_px=5.0,
+                max_heading_jump=0.08,
+                jump_confirm_frames=2,
+                jump_confirm_path_delta_px=8.0,
+                jump_confirm_heading_delta=0.05,
+                vehicle_center_x_offset_ratio=0.0,
+            )
+        )
+        before = estimator.estimate(bev_at(50, crosswalk=False))
+        first = estimator.estimate(
+            BevClassMasks(
+                center=[slanted_line_mask(90.0, 0.25)],
+                center_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+        second = estimator.estimate(
+            BevClassMasks(
+                center=[slanted_line_mask(130.0, -0.25)],
+                center_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+
+        self.assertTrue(first.reason.startswith("coast:"))
+        self.assertTrue(second.reason.startswith("coast:"))
+        self.assertEqual(first.path_points, before.path_points)
+        self.assertEqual(second.path_points, before.path_points)
+
     def test_crosswalk_option_b_follows_right_boundary_offset(self):
         estimator = BevCorridorLaneEstimator(
             BevCorridorConfig(

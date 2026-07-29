@@ -327,6 +327,9 @@ def build_bev_corridor_config(args: argparse.Namespace) -> BevCorridorConfig:
         center_anchor=args.corridor_center_anchor == "on",
         max_center_jump_px=args.corridor_max_center_jump,
         max_heading_jump=args.corridor_max_heading_jump,
+        jump_confirm_frames=args.corridor_jump_confirm_frames,
+        jump_confirm_path_delta_px=args.corridor_jump_confirm_path_delta,
+        jump_confirm_heading_delta=args.corridor_jump_confirm_heading_delta,
         trusted_tier1_min_confidence=args.corridor_trusted_tier1_confidence,
         max_coast_frames=args.corridor_max_coast_frames,
         max_width_jump_px=args.corridor_max_width_jump,
@@ -1054,6 +1057,24 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         type=float,
         default=0.45,
         help="[--bev-corridor] reject and coast a frame whose heading jumps more than this normalized amount",
+    )
+    parser.add_argument(
+        "--corridor-jump-confirm-frames",
+        type=int,
+        default=BevCorridorConfig.jump_confirm_frames,
+        help="[--bev-corridor] consecutive mutually consistent full-path candidates required before accepting a large center/heading innovation",
+    )
+    parser.add_argument(
+        "--corridor-jump-confirm-path-delta",
+        type=float,
+        default=BevCorridorConfig.jump_confirm_path_delta_px,
+        help="[--bev-corridor] maximum per-anchor BEV px difference between consecutive candidates that confirm the same large path innovation",
+    )
+    parser.add_argument(
+        "--corridor-jump-confirm-heading-delta",
+        type=float,
+        default=BevCorridorConfig.jump_confirm_heading_delta,
+        help="[--bev-corridor] maximum heading difference between consecutive candidates that confirm the same large path innovation",
     )
     parser.add_argument(
         "--corridor-trusted-tier1-confidence",

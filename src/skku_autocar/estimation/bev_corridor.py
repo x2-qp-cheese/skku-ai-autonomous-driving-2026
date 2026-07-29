@@ -168,6 +168,15 @@ class BevCorridorConfig:
     # each held frame.
     max_center_jump_px: float = 80.0
     max_heading_jump: float = 0.32
+    # A scalar center/heading jump is ambiguous: it can be one bad YOLO fit or a
+    # real fast curve. Do not switch the tracked path on the first such frame.
+    # Promote it only after consecutive candidate paths agree with each other at
+    # every fixed longitudinal anchor. Once promoted, _smooth_path still applies
+    # the per-anchor innovation limit, so confirmation can never teleport the
+    # control path.
+    jump_confirm_frames: int = 2
+    jump_confirm_path_delta_px: float = 34.0
+    jump_confirm_heading_delta: float = 0.20
     # Tier 1 contains both physical lane boundaries. At high confidence it is a
     # stronger observation than a stale temporal cache, especially when a fast
     # curve legitimately moves the path farther than the scalar jump gate.
@@ -271,6 +280,9 @@ class BevCorridorLaneEstimator:
         self._last_raw_center_x: Optional[float] = None
         self._last_raw_heading: Optional[float] = None
         self._last_overlays: Tuple[list, list, list] = ([], [], [])
+        self._pending_jump_path: List[Tuple[float, float]] = []
+        self._pending_jump_heading: Optional[float] = None
+        self._pending_jump_frames: int = 0
 
         # Vehicle-width virtual-lane hold state.
         self._virtual_hold_frames: int = 0
@@ -431,6 +443,7 @@ class BevCorridorLaneEstimator:
 
         resolved = self._resolve(center_fit, side_fits, bev, vehicle_center_x, target_y)
         if resolved is None:
+            self._clear_pending_jump()
             held = self._hold_crosswalk_lane_if_available("no_corridor")
             if held is not None:
                 return held
@@ -441,6 +454,7 @@ class BevCorridorLaneEstimator:
         raw_center_x = float(np.polyval(centerline_fit["fit"], target_y))
         raw_near_center_x = float(np.polyval(centerline_fit["fit"], near_target_y))
         raw_heading = self._heading_error(centerline_fit["fit"], height)
+        current_path = self._fixed_path_points(centerline_fit, bev.shape)
 
         crosswalk_reject = self._crosswalk_reject_reason(
             raw_center_x,
@@ -468,22 +482,20 @@ class BevCorridorLaneEstimator:
             trusted_recovery_measurement
             or trusted_tier1_measurement
         )
-        if (
-            self._is_center_jump(raw_center_x)
-            and not trusted_measurement
-        ):
-            held = self._hold_crosswalk_lane_if_available("center_jump")
-            if held is not None:
-                return held
-            return self._coast_or_lost(bev.shape, "center_jump")
-        if (
-            self._is_heading_jump(raw_heading)
-            and not trusted_measurement
-        ):
-            held = self._hold_crosswalk_lane_if_available("heading_jump")
-            if held is not None:
-                return held
-            return self._coast_or_lost(bev.shape, "heading_jump")
+        jump_reason: Optional[str] = None
+        if not trusted_measurement:
+            if self._is_center_jump(raw_center_x):
+                jump_reason = "center_jump"
+            elif self._is_heading_jump(raw_heading):
+                jump_reason = "heading_jump"
+        if jump_reason is not None:
+            if not self._confirm_consistent_jump(current_path, raw_heading):
+                held = self._hold_crosswalk_lane_if_available(jump_reason)
+                if held is not None:
+                    return held
+                return self._coast_or_lost(bev.shape, jump_reason)
+        else:
+            self._clear_pending_jump()
 
         self._coast_frames = 0
         self._virtual_hold_frames = 0
@@ -492,7 +504,6 @@ class BevCorridorLaneEstimator:
         self._last_raw_heading = raw_heading
         self.last_class_name = class_name
         self.last_tier = tier
-        current_path = self._fixed_path_points(centerline_fit, bev.shape)
         self.last_centerline_bev = self._smooth_path(current_path)
         self.last_center_line_bev = self._line_points(left_fit)
         self.last_right_line_bev = self._line_points(right_fit)
@@ -898,6 +909,75 @@ class BevCorridorLaneEstimator:
             abs(raw_heading - self._last_raw_heading)
             > max(0.0, float(max_jump))
         )
+
+    def _confirm_consistent_jump(
+        self,
+        path: List[Tuple[float, float]],
+        heading: float,
+    ) -> bool:
+        """Confirm a large innovation by full-path agreement across frames.
+
+        A real curve persists and moves coherently. A one-frame segmentation
+        error normally does not. This tracker therefore compares the complete
+        fixed-anchor path, not just one lookahead dot, before advancing the
+        accepted lane identity.
+        """
+        required = max(1, int(self.config.jump_confirm_frames))
+        if required <= 1:
+            self._clear_pending_jump()
+            return True
+
+        consistent = self._pending_jump_matches(path, heading)
+        if consistent:
+            self._pending_jump_frames += 1
+        else:
+            self._pending_jump_frames = 1
+        self._pending_jump_path = [
+            (float(x), float(y))
+            for x, y in path
+        ]
+        self._pending_jump_heading = float(heading)
+
+        if self._pending_jump_frames < required:
+            return False
+        self._clear_pending_jump()
+        return True
+
+    def _pending_jump_matches(
+        self,
+        path: List[Tuple[float, float]],
+        heading: float,
+    ) -> bool:
+        if (
+            not self._pending_jump_path
+            or self._pending_jump_heading is None
+            or len(path) != len(self._pending_jump_path)
+        ):
+            return False
+        max_path_delta = max(
+            0.0,
+            float(self.config.jump_confirm_path_delta_px),
+        )
+        max_heading_delta = max(
+            0.0,
+            float(self.config.jump_confirm_heading_delta),
+        )
+        if abs(float(heading) - self._pending_jump_heading) > max_heading_delta:
+            return False
+        for (x, y), (previous_x, previous_y) in zip(
+            path,
+            self._pending_jump_path,
+        ):
+            if abs(float(y) - float(previous_y)) > 1.0:
+                return False
+            if abs(float(x) - float(previous_x)) > max_path_delta:
+                return False
+        return True
+
+    def _clear_pending_jump(self) -> None:
+        self._pending_jump_path = []
+        self._pending_jump_heading = None
+        self._pending_jump_frames = 0
 
     def _coast_or_lost(self, bev_shape: Tuple[int, int], reason: str) -> LaneGeometry:
         had_last = self._last_lane is not None
@@ -1452,6 +1532,7 @@ class BevCorridorLaneEstimator:
         self._smoothed_heading = None
         self._smoothed_path = []
         self._last_overlays = ([], [], [])
+        self._clear_pending_jump()
         self._virtual_hold_frames = 0
         self._virtual_center_x = None
 
