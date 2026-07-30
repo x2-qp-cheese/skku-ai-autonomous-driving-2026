@@ -22,6 +22,18 @@
 | 수상 | 동상 |
 | 개발 기간 | 2026년 7월, 약 1개월 |
 
+## Team F23
+
+| 역할 | 이름 | GitHub |
+| --- | --- | --- |
+| 팀장 | 박건우 | [`@x2-qp-cheese`](https://github.com/x2-qp-cheese) |
+| 팀원 | 정철주 | `@cjfwn44` |
+| 팀원 | 전상영 | [`@noreasonmaden`](https://github.com/noreasonmaden) |
+| 팀원 | 권희승 | [`@k-heeseung`](https://github.com/k-heeseung) |
+
+> `@cjfwn44`는 저장소의 커밋 작성자 정보에 기록된 GitHub
+> 아이디입니다.
+
 ## Final Branches
 
 | 브랜치 | 역할 | 주요 기술 |
@@ -128,8 +140,8 @@ tests/                   하드웨어 독립 단위 테스트
 
 ## Acknowledgements
 
-한 달 동안 차량을 함께 제작하고 반복해서 실차 테스트한 Team F23
-팀원들에게 감사드립니다.
+한 달 동안 차량을 함께 제작하고 반복해서 실차 테스트한 Team F23의
+정철주, 전상영, 권희승 팀원에게 감사드립니다.
 
 주차 로직은 다음 논문의 접근을 참고했습니다.
 
